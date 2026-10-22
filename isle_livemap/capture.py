@@ -30,6 +30,8 @@ from .tracking import MovementTracker, Vitals, VitalsObservation, VitalsTracker
 
 GAME_PROCESS_NAME = "TheIsleClient-Win64-Shipping"  # without .exe
 
+GAME_PROCESS_PREFIX = "TheIsleClient"  # fallback for renamed shipping builds
+
 INBOUND = "inbound"  # server -> game
 OUTBOUND = "outbound"  # game -> server
 
@@ -77,6 +79,41 @@ def parse_udp_owner_table(buffer: bytes, pid: int) -> set[int]:
     return ports
 
 
+def pick_game_process(
+    processes: Iterable[tuple[int, str]], name: str = GAME_PROCESS_NAME, prefix: str = GAME_PROCESS_PREFIX
+) -> tuple[int, str] | None:
+    """Choose the game from (pid, exe_file_name) pairs: exact name first, then
+    any exe starting with ``prefix``. Case-insensitive; '.exe' optional."""
+    exact, fallback = None, None
+    want, pre = name.lower(), prefix.lower()
+    for pid, exe in processes:
+        low = exe.lower()
+        stem = low[:-4] if low.endswith(".exe") else low
+        if stem == want:
+            exact = exact or (pid, exe)
+        elif stem.startswith(pre):
+            fallback = fallback or (pid, exe)
+    return exact or fallback
+
+
+def isle_like_names(processes: Iterable[tuple[int, str]]) -> list[str]:
+    """Sorted unique exe names containing 'isle' (case-insensitive)."""
+    return sorted({exe for _pid, exe in processes if "isle" in exe.lower()}, key=str.lower)
+
+
+def status_text(status: str, counts: dict, has_position: bool) -> str:
+    """Human-readable live status. ``status`` is the supervisor stage."""
+    if has_position or status == "tracking":
+        return "tracking"
+    if status != "capturing":
+        return status  # "waiting for game", "game running, no UDP socket yet", "replay", ...
+    if not counts.get("udp_total", 0):
+        return "capturing, 0 packets yet (wrong interface?)"
+    if not (counts.get("outbound", 0) or counts.get("inbound", 0)):
+        return "capturing, UDP seen but none on the game's ports"
+    return "game packets arriving, no position decoded yet"
+
+
 @dataclass(frozen=True, slots=True)
 class Datagram:
     observed_at: float
@@ -110,7 +147,7 @@ class TelemetryPipeline:
         self._vitals = VitalsTracker()
         self._server: str | None = None
         self._on_update = on_update
-        self._counts = {"outbound": 0, "inbound": 0, "dropped": 0}
+        self._counts = {"outbound": 0, "inbound": 0, "dropped": 0, "udp_total": 0, "decoded": 0}
         self.latest = Telemetry()
 
     def set_status(self, status: str) -> None:
@@ -130,6 +167,17 @@ class TelemetryPipeline:
     def note_dropped(self, n: int = 1) -> None:
         self._counts["dropped"] += n
 
+    def note_udp(self, n: int = 1) -> None:
+        """Count every UDP packet the sniffer sees (before port filtering)."""
+        self._counts["udp_total"] += n
+
+    def counts(self) -> dict:
+        return dict(self._counts)
+
+    def status_text(self) -> str:
+        cur = self.latest
+        return status_text(cur.status, self._counts, cur.position is not None)
+
     def handle(self, d: Datagram) -> Telemetry | None:
         """Decode one datagram; returns the new snapshot if something changed."""
         with self._lock:
@@ -145,6 +193,7 @@ class TelemetryPipeline:
                     vit, vit_at = None, 0.0
                 sample = self._movement.track(d.payload, d.observed_at)
                 if sample is not None:
+                    self._counts["decoded"] += 1
                     pos, pos_at, changed = sample, d.observed_at, True
             elif d.direction == INBOUND:
                 self._counts["inbound"] += 1
@@ -173,11 +222,11 @@ def is_windows() -> bool:
     return sys.platform == "win32"
 
 
-def find_game_pid(process_name: str = GAME_PROCESS_NAME) -> int | None:
-    """Look the game up in a Toolhelp32 snapshot. This only reads the system's
-    process *list* (name + pid); it does not open the game process."""
+def list_processes() -> list[tuple[int, str]]:
+    """(pid, exe file name) for all processes, from a Toolhelp32 snapshot. This
+    only reads the system's process *list*; it does not open any process."""
     if not is_windows():
-        return None
+        return []
     from ctypes import wintypes
 
     TH32CS_SNAPPROCESS = 0x2
@@ -199,19 +248,24 @@ def find_game_pid(process_name: str = GAME_PROCESS_NAME) -> int | None:
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snap in (None, ctypes.c_void_p(-1).value):
-        return None
+        return []
+    out: list[tuple[int, str]] = []
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        wanted = (process_name + ".exe").lower()
         ok = k32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            if entry.szExeFile.lower() == wanted:
-                return int(entry.th32ProcessID)
+            out.append((int(entry.th32ProcessID), entry.szExeFile))
             ok = k32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         k32.CloseHandle(snap)
-    return None
+    return out
+
+
+def find_game_pid(process_name: str = GAME_PROCESS_NAME) -> int | None:
+    """Game pid by exact name, falling back to any ``TheIsleClient*`` exe."""
+    found = pick_game_process(list_processes(), process_name)
+    return found[0] if found else None
 
 
 def owned_udp_ports(pid: int) -> set[int]:
@@ -303,6 +357,10 @@ class LiveCapture:
 
     def _on_packet(self, pkt) -> None:
         try:
+            from scapy.layers.inet import UDP
+
+            if UDP in pkt:
+                self.pipeline.note_udp()
             d = datagram_from_scapy(pkt, self._ports, time.monotonic())
             if d is not None:
                 self._q.put_nowait(d)

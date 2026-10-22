@@ -200,7 +200,7 @@ class MapView(QWidget):
         if not self.interp.has_fix:
             p.setPen(QColor(255, 255, 255, 220))
             p.setFont(QFont("Segoe UI", 10))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"Waiting for game…\n({self.pipeline.latest.status})")
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"Waiting for game…\n({self.pipeline.status_text()})")
             return
         c = self._player_screen()
         p.save()

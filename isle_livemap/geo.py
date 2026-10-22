@@ -219,6 +219,7 @@ class Settings:
     show_rings: bool = True
     window_x: int | None = None
     window_y: int | None = None
+    iface: str = ""  # last --iface used for live capture
 
     def normalise(self) -> "Settings":
         self.size_percent = clamp_size_percent(self.size_percent)

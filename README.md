@@ -64,6 +64,23 @@ bundled as point layers instead. World units are assumed to be Unreal centimetre
 **The author cannot guarantee that this complies with any anti-cheat or server rules.
 Check your server's rules; use at your own risk.**
 
+## Troubleshooting (overlay stuck on "waiting" / "capturing")
+
+The overlay and tray tooltip show the stage: waiting for game process, game running but no
+UDP socket, capturing with 0 packets (wrong interface?), UDP seen but none on the game's
+ports, game packets arriving but no position decoded, tracking.
+
+Run the passive diagnostic (no UI) while playing, ideally from an elevated terminal:
+
+    python -m isle_livemap --diagnose [--iface NAME] [--seconds 10]
+
+It reports Npcap and administrator status, the game process (exact name, falling back to any
+`TheIsleClient*` exe; otherwise lists running exes containing "isle"), its UDP ports, all
+capture interfaces, then sniffs each interface and prints UDP packets, packets on the game's
+ports, decoded positions and bytes, ending with a verdict ("Best interface: ..." or the likely
+cause). Then run normally with `python -m isle_livemap --iface "NAME"`; the choice is
+remembered in settings.json.
+
 ## Tests
 
     pip install -r requirements-dev.txt

@@ -14,8 +14,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--local-port", type=int, help="game's local UDP port inside the pcap (auto-detected if omitted)")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     ap.add_argument("--iface", help="capture interface (default: scapy's default route)")
+    ap.add_argument("--diagnose", action="store_true", help="print capture diagnostics (no UI) and exit")
+    ap.add_argument("--seconds", type=float, default=10.0, help="--diagnose: sniff duration per run (default 10)")
     ap.add_argument("--data-dir", type=Path, help="where markers.json/settings.json live")
     args = ap.parse_args(argv)
+
+    if args.diagnose:
+        from .diagnose import run_diagnose
+
+        return run_diagnose(args.iface, args.seconds)
 
     from PySide6.QtWidgets import QApplication
 
@@ -26,6 +33,10 @@ def main(argv: list[str] | None = None) -> int:
     settings_path = args.data_dir / "settings.json" if args.data_dir else None
     settings = Settings.load(settings_path)
     store = MarkerStore(args.data_dir / "markers.json" if args.data_dir else None)
+    if args.iface and not args.replay and settings.iface != args.iface:
+        settings.iface = args.iface
+        settings.save(settings_path)
+    iface = args.iface or settings.iface or None
     pipeline = TelemetryPipeline()
     qapp = QApplication(sys.argv[:1])
     qapp.setQuitOnLastWindowClosed(False)
@@ -42,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
             source = ReplayFeeder(pipeline, pcap_datagrams(path, args.local_port), args.speed)
         source.start()
     else:
-        source = LiveCapture(pipeline, args.iface)
+        source = LiveCapture(pipeline, iface)
         try:
             source.start()
         except CaptureUnavailable as err:

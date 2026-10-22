@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Qt
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QColor
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QInputDialog, QLineEdit, QListWidget,
@@ -101,6 +101,7 @@ class App(QObject):
     def __init__(self, qapp: QApplication, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings) -> None:
         super().__init__()
         self.qapp, self.settings, self.store = qapp, settings, store
+        self.pipeline = pipeline
         self.view = MapView(pipeline, store, settings)
         self.view.request_marker_at_world = self.add_marker_at
         self.panel = MarkersPanel(self.view, store)
@@ -118,6 +119,9 @@ class App(QObject):
             g = qapp.primaryScreen().availableGeometry()
             self.view.move(g.right() - self.view.width() - 24, g.top() + 24)
         self.view.show()
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(lambda: self.tray.setToolTip(f"Isle LiveMap: {self.pipeline.status_text()}"))
+        self._status_timer.start(1000)
 
     def _install_hotkeys(self, actions) -> None:
         self._shortcuts = []
