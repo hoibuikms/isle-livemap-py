@@ -1,10 +1,13 @@
-"""Standalone nearby-entities radar: pure function plus a small table printer.
+"""Nearby-entities radar: a thin adapter over the shared ``isle_livemap.geo`` path.
 
-UNITS / AXES WARNING: this module uses **Y-up metres** (X and Z are the horizontal
-plane, Y is height), exactly as specified for the lab radar. The existing
-``isle_livemap.geo`` works in Unreal centimetres with X/Y horizontal and Z as
-height. Do not feed values between the two without converting. Only the
-unit-free ``truncate`` helper is reused from geo.
+The local player comes from ``geo.local_entity`` and every nearby entry is a
+``geo.Entity``, so positions, vitals (0-100 %), names, ids, the self filter, 3D
+distance and height delta all use the same code as the map overlay and Nearby panel.
+Nothing is parsed or computed separately here.
+
+UNITS / AXES WARNING: ``geo`` works in Unreal centimetres with X/Y horizontal and Z as
+height. The lab radar input (``from_lab``) is **Y-up metres** (X and Z horizontal, Y
+height); it is converted once, at the boundary, into the geo convention.
 
 ``tabulate`` is an optional dependency: used when installed, otherwise a plain
 aligned table is printed.
@@ -12,16 +15,20 @@ aligned table is printed.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 
-from .geo import truncate
+from .geo import (
+    UNITS_PER_METER, Entity, Nearby, _pct, distance_3d_m, height_delta_m, local_entity, nearby_3d, truncate,
+    vital_pct,
+)
 
 try:  # optional; not added to requirements
     from tabulate import tabulate as _tabulate
 except ImportError:  # pragma: no cover - depends on environment
     _tabulate = None
 
-HEADERS = ["Name", "Species", "Health", "Growth", "Distance (m)", "Height diff (m)"]
+HEADERS = ["Name", "Species", "Health", "Growth", "Distance (m)", "Delta height (m)"]
 
 
 def _num(value: Any) -> float:
@@ -34,66 +41,69 @@ def _num(value: Any) -> float:
     return f
 
 
-def _point(pos: Mapping[str, Any]) -> tuple[float, float, float]:
-    return _num(pos["x"]), _num(pos["y"]), _num(pos["z"])
+def _cm(pos: Mapping[str, Any]) -> tuple[float, float, float]:
+    """Lab Y-up metres {"x","y","z"} -> geo (x, y, height) in centimetres."""
+    return (_num(pos["x"]) * UNITS_PER_METER, _num(pos["z"]) * UNITS_PER_METER,
+            _num(pos["y"]) * UNITS_PER_METER)
+
+
+def _opt(value: Any) -> float | None:
+    try:
+        return _num(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def my_entity(my_pos: Mapping[str, Any]) -> Entity:
+    """The local player via ``geo.local_entity``. Raises ValueError/KeyError if ``my_pos`` is invalid."""
+    x, y, z = _cm(my_pos)
+    return local_entity(SimpleNamespace(x=x, y=y, z=z), None)
+
+
+def from_lab(raw: Mapping[str, Any]) -> Entity | None:
+    """One lab dict -> ``geo.Entity`` (None if ``pos`` is missing or non-numeric).
+
+    ``health`` is a 0-100 value, ``growth`` a 0-1 fraction; both go through ``vital_pct``
+    like the local player's vitals. Missing name/species/vitals stay empty / None."""
+    try:
+        x, y, z = _cm(raw["pos"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    name, species = raw.get("name"), raw.get("species")
+    return Entity(
+        str(raw.get("id", "")), "player", name if isinstance(name, str) else "",
+        species if isinstance(species, str) else "", x, y, z,
+        growth_pct=vital_pct(_opt(raw.get("growth")), 1.0), health_pct=vital_pct(_opt(raw.get("health")), 100.0),
+    )
 
 
 def nearby_entities(my_pos: Mapping[str, Any], entities: Iterable[Mapping[str, Any]],
-                    max_distance: float = 100.0) -> list[dict]:
-    """Entities within ``max_distance`` metres of ``my_pos``, nearest first.
+                    max_distance: float = 100.0) -> list[Nearby]:
+    """Entities within ``max_distance`` metres (3D, strictly less) of ``my_pos``, nearest first.
 
-    Math (Y-up, metres):
-        dx = e.x - me.x,  dy = e.y - me.y,  dz = e.z - me.z
-        distance = sqrt(dx^2 + dy^2 + dz^2)      (3D Euclidean distance)
-        height_diff = dy = e.y - me.y
-    Sign convention for ``height_diff``: positive = entity is higher than you,
-    negative = lower, zero = level.
-
-    Only entities with ``distance < max_distance`` (strictly) are kept. Entities
-    whose ``pos`` is missing or non-numeric are skipped, never raised on; missing
-    name/species/health/growth are kept and shown as None ("?" in the table).
-
-    Returns copies of the input dicts with ``distance`` and ``height_diff`` added.
+    Y is vertical: distance = sqrt(dx^2 + dy^2 + dz^2) and the height delta is
+    entity.y - me.y (positive = higher), computed by ``geo.distance_3d_m`` /
+    ``geo.height_delta_m``. Entities with a missing or non-numeric ``pos`` are skipped.
     Raises ValueError/KeyError only if ``my_pos`` itself is invalid.
     """
-    mx, my, mz = _point(my_pos)
-    rows: list[dict] = []
-    for ent in entities:
-        try:
-            ex, ey, ez = _point(ent["pos"])
-        except (KeyError, TypeError, ValueError):
-            continue  # malformed entity: skip
-        dx, dy, dz = ex - mx, ey - my, ez - mz
-        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if dist < max_distance:
-            rows.append({**ent, "distance": dist, "height_diff": dy})
-    rows.sort(key=lambda r: r["distance"])
-    return rows
+    me = my_entity(my_pos)
+    parsed = [e for e in map(from_lab, entities) if e is not None]
+    return nearby_3d(me, parsed, max_distance)
 
 
-def _health(v: Any) -> str:
-    return "?" if v is None else str(v)
+def table_rows(rows: Iterable[Nearby], my_y: float | None) -> list[list[str]]:
+    """Cells for ``HEADERS``; ``my_y`` is the local height in geo units (``my_entity(...).z``)."""
+    out = []
+    for n in rows:
+        e, dy = n.entity, height_delta_m(n, my_y)
+        out.append([truncate(e.name or e.id or "?", 24), e.species or "-", _pct(e.health_pct), _pct(e.growth_pct),
+                    f"{distance_3d_m(n, my_y):.1f}",
+                    "?" if dy is None else f"{dy:+.1f} ({'higher' if dy > 0 else 'lower' if dy < 0 else 'level'})"])
+    return out
 
 
-def _growth(v: Any) -> str:
-    try:
-        return f"{_num(v):.0%}"  # 0.8 -> "80%"
-    except (TypeError, ValueError):
-        return "?"
-
-
-def _height(dy: float) -> str:
-    return f"{dy:+.1f} ({'higher' if dy > 0 else 'lower' if dy < 0 else 'level'})"
-
-
-def table_rows(rows: Iterable[Mapping[str, Any]]) -> list[list[str]]:
-    return [[truncate(str(r.get("name") or "?"), 24), str(r.get("species") or "-"),
-             _health(r.get("health")), _growth(r.get("growth")),
-             f"{r['distance']:.1f}", _height(r["height_diff"])] for r in rows]
-
-
-def format_table(rows: Iterable[Mapping[str, Any]]) -> str:
-    body = table_rows(rows)
+def format_table(rows: Iterable[Nearby], my_y: float | None) -> str:
+    body = table_rows(rows, my_y)
     if _tabulate is not None:
         return _tabulate(body, headers=HEADERS, tablefmt="simple")
     widths = [max(len(r[i]) for r in [HEADERS, *body]) for i in range(len(HEADERS))]
@@ -102,10 +112,10 @@ def format_table(rows: Iterable[Mapping[str, Any]]) -> str:
 
 
 def print_nearby(my_pos: Mapping[str, Any], entities: Iterable[Mapping[str, Any]],
-                 max_distance: float = 100.0) -> list[dict]:
+                 max_distance: float = 100.0) -> list[Nearby]:
     """Compute, print the table, and return the list (see ``nearby_entities``)."""
     rows = nearby_entities(my_pos, entities, max_distance)
-    print(format_table(rows))
+    print(format_table(rows, my_entity(my_pos).z))
     return rows
 
 

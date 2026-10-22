@@ -2,7 +2,9 @@ import math
 
 import pytest
 
-from isle_livemap.nearby import format_table, nearby_entities, print_nearby
+from isle_livemap.geo import distance_3d_m, height_delta_m, local_entity
+from isle_livemap.nearby import format_table, from_lab, my_entity, nearby_entities, print_nearby
+from isle_livemap.tracking import Vitals
 
 ME = {"x": 100.0, "y": 50.0, "z": 200.0}
 ALPHA = {"id": 1, "name": "Alpha", "species": "Rex", "health": 100, "growth": 0.8,
@@ -15,17 +17,18 @@ FAR = {"id": 3, "name": "Far", "species": "Rex", "health": 1, "growth": 1.0,
 
 def test_example_entities_distance_and_height_sign():
     rows = nearby_entities(ME, [ALPHA, BETA])
-    by = {r["name"]: r for r in rows}
-    assert by["Alpha"]["distance"] == pytest.approx(math.sqrt(25 + 4 + 4))
-    assert by["Alpha"]["height_diff"] == pytest.approx(2.0)    # higher
-    assert by["Beta"]["distance"] == pytest.approx(40.0)
-    assert by["Beta"]["height_diff"] == pytest.approx(-40.0)   # lower
+    my_y = my_entity(ME).z
+    by = {r.entity.name: r for r in rows}
+    assert distance_3d_m(by["Alpha"], my_y) == pytest.approx(math.sqrt(25 + 4 + 4))
+    assert height_delta_m(by["Alpha"], my_y) == pytest.approx(2.0)    # higher
+    assert distance_3d_m(by["Beta"], my_y) == pytest.approx(40.0)
+    assert height_delta_m(by["Beta"], my_y) == pytest.approx(-40.0)   # lower
 
 
 def test_filters_and_orders_nearest_first():
-    assert [r["name"] for r in nearby_entities(ME, [FAR, BETA, ALPHA])] == ["Alpha", "Beta"]
-    assert [r["name"] for r in nearby_entities(ME, [FAR, BETA, ALPHA], max_distance=10)] == ["Alpha"]
-    assert [r["name"] for r in nearby_entities(ME, [FAR, BETA, ALPHA], max_distance=1000)][-1] == "Far"
+    assert [r.entity.name for r in nearby_entities(ME, [FAR, BETA, ALPHA])] == ["Alpha", "Beta"]
+    assert [r.entity.name for r in nearby_entities(ME, [FAR, BETA, ALPHA], max_distance=10)] == ["Alpha"]
+    assert [r.entity.name for r in nearby_entities(ME, [FAR, BETA, ALPHA], max_distance=1000)][-1] == "Far"
 
 
 def test_max_distance_is_exclusive():
@@ -34,8 +37,22 @@ def test_max_distance_is_exclusive():
 
 
 def test_input_not_mutated():
+    before = dict(ALPHA)
     nearby_entities(ME, [ALPHA])
-    assert "distance" not in ALPHA
+    assert ALPHA == before
+
+
+def test_lab_entity_matches_local_player_path():
+    # same position/vitals through local_entity and from_lab must give identical Entities
+    me = local_entity(type("P", (), {"x": 10_500.0, "y": 20_200.0, "z": 5_200.0})(),
+                      Vitals(health=60.0, max_health=100.0, growth=0.5), "Raptor")
+    lab = from_lab({"id": "local", "name": "You", "species": "Raptor", "health": 60, "growth": 0.5,
+                    "pos": {"x": 105.0, "y": 52.0, "z": 202.0}})
+    assert lab == me
+
+
+def test_self_is_filtered():
+    assert nearby_entities(ME, [{"id": "local", "name": "me", "pos": ME}]) == []
 
 
 @pytest.mark.parametrize("bad", [
@@ -47,21 +64,21 @@ def test_input_not_mutated():
     {"name": "bool", "pos": {"x": True, "y": 0.0, "z": 0.0}},
 ])
 def test_malformed_entities_are_skipped(bad):
-    assert [r["name"] for r in nearby_entities(ME, [bad, ALPHA])] == ["Alpha"]
+    assert [r.entity.name for r in nearby_entities(ME, [bad, ALPHA])] == ["Alpha"]
 
 
 def test_missing_optional_fields_kept_and_shown_as_placeholders():
     e = {"pos": {"x": 101.0, "y": 50.0, "z": 200.0}}
     rows = nearby_entities(ME, [e])
     assert len(rows) == 1
-    out = format_table(rows)
+    out = format_table(rows, my_entity(ME).z)
     assert "?" in out and "level" in out
 
 
 def test_empty_list():
     assert nearby_entities(ME, []) == []
-    out = format_table([])
-    assert "Height diff (m)" in out
+    out = format_table([], my_entity(ME).z)
+    assert "Delta height (m)" in out
 
 
 def test_invalid_my_pos_raises():
@@ -72,7 +89,7 @@ def test_invalid_my_pos_raises():
 def test_print_table(capsys):
     rows = print_nearby(ME, [BETA, ALPHA])
     out = capsys.readouterr().out
-    for col in ("Name", "Species", "Health", "Growth", "Distance (m)", "Height diff (m)"):
+    for col in ("Name", "Species", "Health", "Growth", "Distance (m)", "Delta height (m)"):
         assert col in out
     assert "+2.0 (higher)" in out and "-40.0 (lower)" in out and "80%" in out
     assert out.index("Alpha") < out.index("Beta")

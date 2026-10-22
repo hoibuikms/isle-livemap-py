@@ -370,16 +370,21 @@ VITAL_FIELDS = (("Growth", "growth_pct"), ("Health", "health_pct"), ("Stamina", 
                 ("Hunger", "hunger_pct"), ("Water", "thirst_pct"))
 
 
+def vital_pct(cur: float | None, mx: float | None) -> float | None:
+    """A vital as a 0-100 percentage (None when unknown); one decoding for every entity."""
+    from .tracking import Vitals
+
+    f = Vitals.fraction(cur, mx)
+    return None if f is None else f * 100.0
+
+
 def local_entity(pos, vitals, species: str = "") -> Entity:
     """The local player as an Entity (``pos``: MovementCandidate | None, ``vitals``:
     Vitals | None) so it shares the formatting path of feed entities: same cm units
     and axes, vitals as 0-100 percentages."""
     from .tracking import Vitals
 
-    def pct(cur, mx):
-        f = Vitals.fraction(cur, mx)
-        return None if f is None else f * 100.0
-
+    pct = vital_pct
     v = vitals or Vitals()
     return Entity(
         "local", "player", "You", species,
@@ -406,6 +411,15 @@ def distance_3d_m(n: Nearby, my_z: float | None) -> float:
     """sqrt(horizontal² + dZ²); falls back to the horizontal distance without heights."""
     dz = height_delta_m(n, my_z)
     return n.distance_m if dz is None else math.hypot(n.distance_m, dz)
+
+
+def nearby_3d(me: Entity, entities, max_distance_m: float) -> list[Nearby]:
+    """Entities with 3D distance < ``max_distance_m`` from ``me`` (e.g. ``local_entity``),
+    nearest first, skipping ``me`` itself. Positions/heights are read exactly like
+    ``nearby_entities`` / ``height_delta_m`` do, so local player and feed entities agree."""
+    near = nearby_entities([(e, e.x, e.y) for e in entities if e.id != me.id], me.x, me.y)
+    near = [(distance_3d_m(n, me.z), n) for n in near]
+    return [n for d, n in sorted(near, key=lambda t: (t[0], t[1].entity.id)) if d < max_distance_m]
 
 
 def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None) -> tuple[str, str]:
