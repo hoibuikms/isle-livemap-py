@@ -1,10 +1,10 @@
 """Other players for the minimap: a local, in-process ``PeerSource`` (no network client, no feed).
 
 Backends (all produce ``geo.Entity`` so everything downstream is source-neutral):
-  * ``LabPeerSource``  - dev/testing. Reads the assumed 18-byte lab record from loopback
+  * ``LabPeerSource``  - dev/testing only (``--lab-peers``). Reads the assumed 18-byte lab record from loopback
                          127.0.0.1 through ``labsim.payload_sniffer.PayloadSniffer`` (socket).
-  * ``SyntheticPeers`` - ``--replay`` demo: moving peers anchored to the replayed local player.
-  * ``GamePeerSource`` - real-game traffic. Owner-only, opt-in, passive capture only: taps the same
+  * ``SyntheticPeers`` - bare ``--replay`` demo (dev only): moving peers anchored to the replayed local player.
+  * ``GamePeerSource`` - real-game traffic, the default source. Passive capture only: taps the same
                          inbound datagrams the local-player vitals decoder reads (position only).
 
 Units: ``geo`` is Unreal centimetres, X/Y horizontal, Z height, north = -Y. The lab record is
@@ -328,7 +328,7 @@ class SyntheticPeers:
 # ----------------------------------------------------------------- backend G: real game
 class GamePeerSource:
     """Other replicated actors from the game's own inbound traffic, through the SAME capture path as the
-    local player. Owner-only, opt-in (``peer_source = "game"`` or ``--game-peers``), never the default.
+    local player. This is the default and only user-facing source (owner's personal tool; decision in TRD rev 6).
     Passive: it only reads datagrams that ``TelemetryPipeline`` already delivers (no memory access,
     no injection, nothing is sent).
 
@@ -360,13 +360,19 @@ class GamePeerSource:
         self.locations = 0  # actor locations decoded
         self.destroyed = 0  # destruction records that removed a tracked peer
         self._attached = False
+        self.error = ""
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         if self.pipeline is None:
-            log.warning("game peers requested, but no capture pipeline is attached; showing no peers")
+            log.warning("game peers: no capture pipeline is attached; showing no peers")
             return
-        self.pipeline.add_observer(self.on_inbound, self.on_reset)
+        try:
+            self.pipeline.add_observer(self.on_inbound, self.on_reset)
+        except Exception as err:  # noqa: BLE001 - never take the app down
+            log.warning("game peers: could not attach to the capture pipeline: %s", err)
+            self.error = str(err)
+            return
         self._attached = True
         log.info("game peers: decoding other actors' positions from inbound replication (passive)")
 
@@ -404,8 +410,12 @@ class GamePeerSource:
     def status(self) -> str:
         if self.pipeline is None:
             return self.STATUS_NO_PIPELINE
+        if self.error:
+            return f"game: unavailable ({self.error})"
         n = len(self.store.entities())
         own = f"own handle {self.own_handle}" if self.own_handle is not None else "own handle not locked yet"
+        if self.packets == 0:
+            return "game: waiting for server traffic"
         if n == 0:
             return f"game: waiting for actor locations ({self.packets} pkts, {own})"
         return f"game: {n} actors (position only; class, name and vitals not decoded; {own})"

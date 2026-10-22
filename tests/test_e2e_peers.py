@@ -130,10 +130,10 @@ def ready(app) -> bool:
 
 
 # ---------------------------------------------------------------- game path through __main__
-def test_game_peers_through_real_main_draw_dots_at_their_decoded_positions(tmp_path, monkeypatch):
+def test_default_game_peers_through_real_main_draw_dots_at_their_decoded_positions(tmp_path, monkeypatch):
     pcap = build_pcap(tmp_path / "real.pcap")
     data = settings_dir(tmp_path)  # defaults: radius 1000 m, zoom 1
-    app, img = run_main(monkeypatch, ["--replay", str(pcap), "--game-peers", "--speed", "3", "--data-dir", str(data)], ready)
+    app, img = run_main(monkeypatch, ["--replay", str(pcap), "--speed", "3", "--data-dir", str(data)], ready)
 
     # wiring: the factory got the real pipeline, the observer is the one that decoded, own handle was learned
     assert type(app.peers).__name__ == "GamePeerSource" and app.peers.pipeline is app.pipeline
@@ -166,7 +166,7 @@ def test_out_of_view_actor_in_radius_gets_an_edge_pointer_through_real_main(tmp_
 
     pcap = build_pcap(tmp_path / "real.pcap")
     data = settings_dir(tmp_path, zoom=2.0)  # view edge ~556 m, radius still 1000 m -> the 750-840 m actors are off view
-    app, img = run_main(monkeypatch, ["--replay", str(pcap), "--game-peers", "--speed", "3", "--data-dir", str(data)], ready)
+    app, img = run_main(monkeypatch, ["--replay", str(pcap), "--speed", "3", "--data-dir", str(data)], ready)
     pos = app.pipeline.latest.position
     cx, cy = screen_of(app.view, pos.x, pos.y)
     hit = 0
@@ -181,7 +181,7 @@ def test_out_of_view_actor_in_radius_gets_an_edge_pointer_through_real_main(tmp_
 def test_actors_beyond_the_radius_are_not_drawn(tmp_path, monkeypatch):
     pcap = build_pcap(tmp_path / "real.pcap")
     data = settings_dir(tmp_path, peer_radius_m=500)
-    app, _ = run_main(monkeypatch, ["--replay", str(pcap), "--game-peers", "--speed", "3", "--data-dir", str(data)],
+    app, _ = run_main(monkeypatch, ["--replay", str(pcap), "--speed", "3", "--data-dir", str(data)],
                       lambda a: a.peers.locations > 20)
     assert app.view.nearby() == [] and len(app.peers.snapshot().entities) > 10  # decoded, but outside 500 m
 
@@ -189,8 +189,8 @@ def test_actors_beyond_the_radius_are_not_drawn(tmp_path, monkeypatch):
 def test_game_peers_survive_settings_edits_and_a_server_change(tmp_path, monkeypatch):
     pcap = build_pcap(tmp_path / "real.pcap")
     data = settings_dir(tmp_path)
-    app, _ = run_main(monkeypatch, ["--replay", str(pcap), "--game-peers", "--speed", "3", "--data-dir", str(data)], ready)
-    # Peers settings dialog "OK" path: configured self ids replace only the USER ids, never the learned own handle
+    app, _ = run_main(monkeypatch, ["--replay", str(pcap), "--speed", "3", "--data-dir", str(data)], ready)
+    # configured self ids replace only the USER ids, never the learned own handle
     app.peers.store.set_self_ids(["999"])
     app.peers.store.update(Entity("103940", "player", "me", "", 1.0, 1.0))
     assert "103940" not in {p.id for p in app.peers.snapshot().entities}
@@ -198,6 +198,23 @@ def test_game_peers_survive_settings_edits_and_a_server_change(tmp_path, monkeyp
     app.peers.start()  # run_main's quit detached the observer; re-attach it to exercise the reset tap
     app.pipeline.reset()
     assert app.peers.snapshot().entities == () and app.peers.own_handle is None
+
+
+def test_no_flags_starts_game_source_and_survives_without_server(tmp_path, monkeypatch):
+    """Plain start (no --replay needed for the wiring): the default source is the game backend on the real pipeline,
+    and an old settings file with peer_source is accepted and ignored. Live capture is replaced by an inert source."""
+    import isle_livemap.capture as capmod
+
+    class Idle:
+        def __init__(self, *a, **k): pass
+        def start(self): pass
+        def stop(self): pass
+
+    monkeypatch.setattr(capmod, "LiveCapture", Idle)
+    data = settings_dir(tmp_path, peer_source="lab")
+    app, _ = run_main(monkeypatch, ["--data-dir", str(data)], lambda a: True)
+    assert type(app.peers).__name__ == "GamePeerSource" and app.peers.pipeline is app.pipeline
+    assert app.view.peer_status == "game: waiting for server traffic" and app.view.nearby() == []
 
 
 # ---------------------------------------------------------------- other sources through __main__
@@ -210,7 +227,7 @@ def test_synthetic_replay_through_real_main_draws_demo_peers(tmp_path, monkeypat
     cx, cy = screen_of(app.view, pos.x, pos.y)
     assert sum(near_color(img, *screen_of(app.view, n.x, n.y)) for n in app.view.nearby()
                if math.hypot(screen_of(app.view, n.x, n.y)[0] - cx, screen_of(app.view, n.x, n.y)[1] - cy) < 160) >= 4
-    app.peers.store.set_self_ids(["999"])  # Peers dialog OK path: the demo "me" (id 0) must stay hidden
+    app.peers.store.set_self_ids(["999"])  # the demo "me" (id 0) must stay hidden
     time.sleep(0.6)  # SyntheticPeers re-emits every 0.5 s, including the self entry
     assert "0" not in {p.id for p in app.peers.snapshot().entities}
 

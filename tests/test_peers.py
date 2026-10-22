@@ -190,17 +190,29 @@ def test_factory():
     assert isinstance(create_peer_source("off", synthetic=True), SyntheticPeers)
 
 
-def test_game_is_never_the_default():
+def test_no_user_facing_source_setting():
     from isle_livemap.geo import Settings
-    assert Settings().peer_source == "off"
-    assert Settings(peer_source="bogus").normalise().peer_source == "off"
+    assert not hasattr(Settings(), "peer_source")
 
 
-def test_cli_rejects_both_peer_flags():
+def test_game_peers_flag_is_gone():
     from isle_livemap.__main__ import main
     with pytest.raises(SystemExit) as ei:
-        main(["--lab-peers", "--game-peers"])
+        main(["--game-peers"])
     assert ei.value.code == 2
+
+
+def test_game_status_waiting_texts_and_failing_pipeline_never_raises():
+    g = GamePeerSource(pipeline=object())  # object() has no add_observer: attaching must fail softly
+    g.start()
+    assert "unavailable" in g.status() and peers.status_is_warning(g.status())
+    class P:
+        def add_observer(self, *a): pass
+        def remove_observer(self, *a): pass
+    g2 = GamePeerSource(pipeline=P())
+    g2.start()
+    assert g2.status() == "game: waiting for server traffic"
+    g2.stop()
 
 
 def test_synthetic_peers_exercise_self_id_name_and_ttl():

@@ -17,13 +17,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--diagnose", action="store_true", help="print capture diagnostics (no UI) and exit")
     ap.add_argument("--seconds", type=float, default=10.0, help="--diagnose: sniff duration per run (default 10)")
     ap.add_argument("--lab-peers", nargs="?", const=7777, type=int, metavar="PORT",
-                    help="dev/testing: show other players from lab records on loopback 127.0.0.1:PORT (default 7777)")
-    ap.add_argument("--game-peers", action="store_true",
-                    help="owner-only, opt-in: other players from real game traffic (passive capture of the same inbound stream; position only)")
+                    help="dev/testing only: show other players from lab records on loopback 127.0.0.1:PORT (default 7777) "
+                         "instead of the game. Without this flag, nearby players always come from the game capture.")
     ap.add_argument("--data-dir", type=Path, help="where markers.json/settings.json live")
     args = ap.parse_args(argv)
-    if args.lab_peers is not None and args.game_peers:
-        ap.error("--lab-peers and --game-peers are mutually exclusive")
 
     if args.diagnose:
         from .diagnose import run_diagnose
@@ -74,24 +71,23 @@ def main(argv: list[str] | None = None) -> int:
 
     lab_port = args.lab_peers if args.lab_peers is not None else 7777
 
-    def make_peers(kind: str):
-        return create_peer_source(kind, anchor, lab_port=lab_port, self_ids=settings.peer_self_ids, pipeline=pipeline)
-
-    # Flags win over settings. --replay alone shows the synthetic demo peers. "game" is only ever
-    # chosen explicitly (--game-peers or peer_source = "game"); it is never the default.
-    if args.lab_peers is not None:
-        kind = "lab"
-    elif args.game_peers:
-        kind = "game"
-    elif args.replay:
-        kind = "synthetic"
-    else:
-        kind = settings.peer_source
-    peers = create_peer_source("off", anchor, synthetic=True) if kind == "synthetic" else make_peers(kind)
-    if peers is not None:
+    # Nearby players come from the game capture (the same pipeline as the own position) by default; there is
+    # no user-facing source choice. Dev/test tooling only: --lab-peers (loopback records) and a bare --replay
+    # (synthetic demo peers). --replay FILE.pcap uses the game path.
+    peers = None
+    try:
+        if args.lab_peers is not None:
+            peers = create_peer_source("lab", anchor, lab_port=lab_port, self_ids=settings.peer_self_ids)
+        elif args.replay == "synthetic":
+            peers = create_peer_source("off", anchor, synthetic=True)
+        else:
+            peers = create_peer_source("game", anchor, self_ids=settings.peer_self_ids, pipeline=pipeline)
         peers.start()
+    except Exception as err:  # noqa: BLE001 - a broken peer source must never take the minimap down
+        print(f"warning: nearby players unavailable: {err}", file=sys.stderr)
+        peers = None
 
-    app = App(qapp, pipeline, store, settings, peers, make_peers)  # noqa: F841 (kept alive)
+    app = App(qapp, pipeline, store, settings, peers)  # noqa: F841 (kept alive)
     qapp.aboutToQuit.connect(source.stop)
     qapp.aboutToQuit.connect(lambda: app.peers.stop() if app.peers is not None else None)
     return qapp.exec()

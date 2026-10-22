@@ -132,10 +132,10 @@ def test_style_table_keeps_self_distinct_and_bigger():
 # ---- T11
 def test_settings_roundtrip_and_migration(tmp_path):
     p = tmp_path / "s.json"
-    s = Settings(peer_source="lab", peer_radius_m=2500, peer_self_ids=[" 5 ", "4294967295", "5"], show_vitals_detail=True)
+    s = Settings(peer_radius_m=2500, peer_self_ids=[" 5 ", "4294967295", "5"], show_vitals_detail=True)
     s.save(p)
     back = Settings.load(p)
-    assert (back.peer_source, back.peer_radius_m, back.show_vitals_detail) == ("lab", 2500.0, True)
+    assert (back.peer_radius_m, back.show_vitals_detail) == (2500.0, True)
     assert back.peer_self_ids == ["-1", "5"]
     assert Settings(peer_radius_m="x").normalise().peer_radius_m == 1000.0
     assert Settings(peer_radius_m=1e9).normalise().peer_radius_m == 20_000
@@ -145,8 +145,8 @@ def test_settings_roundtrip_and_migration(tmp_path):
 def test_old_settings_file_migrates_feed_radius_and_ignores_unknown_keys(tmp_path):
     p = tmp_path / "old.json"
     p.write_text(json.dumps({"feed_url": "http://x/", "feed_token": "t", "feed_radius_m": 750, "zoom": 2.0,
-                             "some_removed_key": 1}))
+                             "some_removed_key": 1, "peer_source": "lab"}))
     s = Settings.load(p)
-    assert s.peer_radius_m == 750.0 and s.zoom == 2.0 and s.peer_source == "off"
+    assert s.peer_radius_m == 750.0 and s.zoom == 2.0 and not hasattr(s, "peer_source")
     p.write_text(json.dumps({"feed_radius_m": 750, "peer_radius_m": 300}))
     assert Settings.load(p).peer_radius_m == 300.0  # an explicit new value wins

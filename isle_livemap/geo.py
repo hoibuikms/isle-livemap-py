@@ -216,9 +216,6 @@ def _clamp_num(value, lo: float, hi: float, default: float) -> float:
     return min(max(v, lo), hi) if math.isfinite(v) else default
 
 
-PEER_SOURCES = ("off", "lab", "game")
-
-
 @dataclass(slots=True)
 class Settings:
     size_percent: int = 100
@@ -232,9 +229,8 @@ class Settings:
     window_y: int | None = None
     iface: str = ""  # last --iface used for live capture
     # other players (packet-sourced, see peers.py)
-    peer_source: str = "off"  # "off" | "lab" | "game"; never "game" by default (owner-only opt-in)
     peer_radius_m: float = 1000.0
-    peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client)
+    peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client); settings-file only
     show_vitals_detail: bool = False
     show_players: bool = True
     show_ai: bool = True  # inert for packet sources (they never report an AI kind)
@@ -244,7 +240,6 @@ class Settings:
         self.zoom = min(max(float(self.zoom), 0.5), 16.0)
         radii = [r for r in self.ring_radii_m if isinstance(r, (int, float)) and r > 0]
         self.ring_radii_m = radii[:6] or list(DEFAULT_RING_RADII_M)
-        self.peer_source = self.peer_source if self.peer_source in PEER_SOURCES else "off"
         self.peer_radius_m = _clamp_num(self.peer_radius_m, 50.0, 20_000.0, 1000.0)
         ids = self.peer_self_ids if isinstance(self.peer_self_ids, (list, tuple, set)) else []
         self.peer_self_ids = sorted({c for c in (canonical_id(i) for i in ids) if c}, key=str)[:32]
@@ -258,6 +253,7 @@ class Settings:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
+            # obsolete keys such as "peer_source" are dropped by the filter above
             if "peer_radius_m" not in known and "feed_radius_m" in raw:  # legacy key from before peers existed (migration only)
                 known["peer_radius_m"] = raw["feed_radius_m"]
             return cls(**known).normalise()

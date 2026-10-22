@@ -7,14 +7,14 @@ import sys
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QInputDialog,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QInputDialog,
     QAbstractItemView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .capture import TelemetryPipeline
 from .geo import (
-    MARKER_KINDS, PEER_SOURCES, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, canonical_id, entity_row, format_distance,
+    MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance,
     parse_radii,
 )
 from .overlay import MapView
@@ -127,7 +127,7 @@ class NearbyPanel(QDialog):
         self.timer.timeout.connect(self.refresh)
 
     def refresh(self) -> None:
-        self.status.setText(self.view.peer_status or "peers: off (choose a source in Peers settings)")
+        self.status.setText(self.view.peer_status or "no nearby-players source")
         pos = self.view.pipeline.latest.position
         my_z = pos.z if pos is not None else None
         rows = [entity_row(n, my_z) for n in self.view.nearby()]
@@ -148,52 +148,13 @@ class NearbyPanel(QDialog):
         super().hideEvent(e)
 
 
-class PeersDialog(QDialog):
-    """Owner-facing settings for other players: source, radius, self ids, detail line."""
-
-    def __init__(self, parent, settings: Settings) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Peers settings")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-        self.source = QComboBox()
-        self.source.addItems(PEER_SOURCES)
-        self.source.setCurrentText(settings.peer_source)
-        self.radius = QDoubleSpinBox()
-        self.radius.setRange(50, 20_000)
-        self.radius.setSuffix(" m")
-        self.radius.setValue(settings.peer_radius_m)
-        self.self_ids = QLineEdit(", ".join(settings.peer_self_ids))
-        self.self_ids.setPlaceholderText("ids that are you, comma separated")
-        self.detail = QCheckBox("Show vitals detail line on labels")
-        self.detail.setChecked(settings.show_vitals_detail)
-        form = QFormLayout(self)
-        form.addRow(QLabel("off = none, lab = loopback test records, game = owner-only passive capture, other actors' positions only."))
-        form.addRow("Source", self.source)
-        form.addRow("Minimap radius", self.radius)
-        form.addRow("My ids", self.self_ids)
-        form.addRow("", self.detail)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        form.addRow(bb)
-
-    def apply(self, settings: Settings) -> None:
-        settings.peer_source = self.source.currentText()
-        settings.peer_radius_m = self.radius.value()
-        settings.peer_self_ids = [canonical_id(t) for t in self.self_ids.text().replace(";", ",").split(",") if t.strip()]
-        settings.show_vitals_detail = self.detail.isChecked()
-        settings.normalise()
-
-
 class App(QObject):
     def __init__(self, qapp: QApplication, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings,
-                 peers=None, peer_factory=None) -> None:
-        """``peer_factory(kind) -> unstarted PeerSource | None`` lets the Peers dialog switch source."""
+                 peers=None) -> None:
         super().__init__()
         self.qapp, self.settings, self.store = qapp, settings, store
         self.pipeline = pipeline
         self.peers = peers
-        self.peer_factory = peer_factory
         self.view = MapView(pipeline, store, settings, peers)
         self.view.request_marker_at_world = self.add_marker_at
         self.panel = MarkersPanel(self.view, store)
@@ -252,7 +213,7 @@ class App(QObject):
         for text, fn in (
             ("Zoom to peer radius", lambda: self.view.zoom_to_radius(self.settings.peer_radius_m)),
             ("Size…", self.ask_size), ("Range rings…", self.ask_rings), ("Species label…", self.ask_species),
-            ("Peers settings…", self.ask_peers),
+            ("Nearby radius…", self.ask_peer_radius),
         ):
             a = QAction(text, menu)
             a.triggered.connect(fn)
@@ -260,6 +221,7 @@ class App(QObject):
         for text, attr in (
             ("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings"),
             ("Show other players", "show_players"),  # no "Show AI": packet sources never report an AI kind
+            ("Vitals detail on labels", "show_vitals_detail"),
         ):
             a = QAction(text, menu, checkable=True)
             a.setChecked(getattr(self.settings, attr))
@@ -282,24 +244,13 @@ class App(QObject):
         self.nearby_panel.show()
         self.nearby_panel.raise_()
 
-    def ask_peers(self) -> None:
-        dlg = PeersDialog(None, self.settings)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        before = self.settings.peer_source
-        dlg.apply(self.settings)
-        self.view.zoom_to_radius(self.settings.peer_radius_m)
-        if hasattr(self.peers, "store"):
-            self.peers.store.set_self_ids(self.settings.peer_self_ids)
-        if self.settings.peer_source != before and self.peer_factory is not None:
-            self.set_peers(self.peer_factory(self.settings.peer_source))
-
-    def set_peers(self, peers) -> None:
-        if self.peers is not None:
-            self.peers.stop()
-        self.peers = self.view.peers = peers
-        if peers is not None:
-            peers.start()
+    def ask_peer_radius(self) -> None:
+        v, ok = QInputDialog.getDouble(None, "Nearby players radius", "Metres (50-20000):", self.settings.peer_radius_m,
+                                       50.0, 20_000.0, 0)
+        if ok:
+            self.settings.peer_radius_m = v
+            self.settings.normalise()
+            self.view.zoom_to_radius(self.settings.peer_radius_m)
 
     def add_marker_here(self) -> None:
         pos = self.view.player_world()

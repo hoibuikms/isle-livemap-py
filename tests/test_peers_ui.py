@@ -231,8 +231,8 @@ def test_lab_loopback_to_map_nearby(tmp_path):
     assert "1 malformed" in status and "listening" in status
 
 
-def test_nearby_panel_and_peers_dialog_build(tmp_path):
-    from isle_livemap.app import NearbyPanel, PeersDialog
+def test_nearby_panel_builds(tmp_path):
+    from isle_livemap.app import NearbyPanel
 
     view = make_view(tmp_path)
     view.peers = FakePeers([peer(view, 1, 100, 0)])
@@ -240,12 +240,6 @@ def test_nearby_panel_and_peers_dialog_build(tmp_path):
     panel = NearbyPanel(view)
     panel.refresh()
     assert panel.table.rowCount() == 1 and panel.table.item(0, 0).text() == "P1"
-    s = Settings()
-    dlg = PeersDialog(None, s)
-    dlg.source.setCurrentText("lab")
-    dlg.self_ids.setText("4294967295, 12")
-    dlg.apply(s)
-    assert s.peer_source == "lab" and s.peer_self_ids == ["-1", "12"]
 
 
 # ---- T14

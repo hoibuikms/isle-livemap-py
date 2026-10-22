@@ -1,11 +1,12 @@
 # TRD: Show Other Players on the Minimap (parity with the Local Player), packet-sourced
 
-- Status: rev 5, implemented; remaining open items are blocked on a new game capture (see section 10)
+- Status: rev 6, implemented; remaining open items are blocked on a new game capture (see section 10)
 - Date: 2026-10-22
 - Repo: isle-livemap-py, branch `main`
 - Revision note: rev 1 sourced other players from the server feed URL. New constraint: NO feed URL. Other players must come from the same local data path as the local player and the nearby radar. Every feed dependency is removed or marked DEPRECATED (section 9).
 - Revision note rev 3: decision recorded that decoding other players from real game traffic is allowed. The policy question and all policy gates are removed. The real-game backend is now a first-class target backend (the lab backend remains for development and testing). The only open unknown on that path is technical feasibility (Q1, spike TRD-050).
 - Revision note rev 4: the real-game backend (`peer_source = "game"`) is a personal tool for the repo owner only, used to verify things from their own side. It is NOT a distributed or user-facing feature, stays opt-in via config/flag, and is not made the default for anyone. The lab backend remains the dev/testing backend. Q2 is resolved accordingly. Passive capture (REQ-023) is restated as a design choice matching the existing repo approach, not a restriction or compliance boundary; no memory-access or injection work is added. No end-user distribution or UX-polish tasks were present, so none were removed; the Peers dialog (TRD-033) is kept as a plain owner-facing settings replacement for the Feed dialog. Numbering of REQ/TRD/Q/T items is unchanged.
+- Revision note rev 6 (DECISION, supersedes the rev 4 "opt-in, never the default" wording): other nearby players come from the GAME, through the same capture pipeline that provides the current player, always. There is no source choice for the user. `GamePeerSource` is the default and only user-facing source; the `peer_source` setting, the `--game-peers` flag, the Peers settings dialog (TRD-033) and its tray entry are removed. Lab and synthetic stay as developer/test tooling selected only by CLI (`--lab-peers [PORT]`, bare `--replay`). `--replay FILE.pcap` uses the game path. Old settings files containing `peer_source` still load (the key is ignored). Kept as minimal tray items: "Show other players" (`show_players`), "Nearby radius..." (`peer_radius_m`), "Vitals detail on labels" (`show_vitals_detail`); `peer_self_ids` is settings-file only. The owner's personal-tool scope is the reason game-as-default is acceptable. Where earlier text below says opt-in, owner-only opt-in, `peer_source`, `--game-peers` or the Peers dialog, read it as superseded by this note.
 - Task legend: `□` not started, `☐` in progress, `✓` done
 
 ---
@@ -300,7 +301,7 @@ Until TRD-070 lands, nothing new may depend on any item above.
 ## 10. Open Questions
 
 - Q1 (feasibility): ANSWERED by TRD-050 (section 11): position and handle yes; name, vitals, heading, class no (need a new capture).
-- Q2 (scope): RESOLVED in rev 4. Lab loopback backend = dev/testing (behind `--lab-peers`). Real-game backend = personal tool for the repo owner only, opt-in via config/flag, not distributed, not user-facing, not the default.
+- Q2 (scope): RESOLVED in rev 4, amended in rev 6 (game backend is now the default, see the rev 6 note). Lab loopback backend = dev/testing (behind `--lab-peers`). Real-game backend = personal tool for the repo owner only, opt-in via config/flag, not distributed, not user-facing, not the default.
 - Q3 (format): Canonical lab record: signed (`<i3fh`, telemetry/probe) or unsigned (`<IfffH`, sniffer)? And does the int16 mean health 0..100 or a status code? Proposed: treat as health 0..100 as `nearby.from_lab` does; confirm.
 - Q4 (heading): Infer heading from successive positions when absent? Proposed: no in v1.
 - Q5 (AI kind): Packets give no AI/player distinction. Hide `show_ai`? Proposed: yes, disable it.

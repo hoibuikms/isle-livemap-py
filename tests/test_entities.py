@@ -87,16 +87,16 @@ def test_smoother_interpolates_snaps_and_drops():
 
 def test_settings_roundtrip_and_normalise(tmp_path):
     p = tmp_path / "s.json"
-    s = Settings(peer_source="lab", peer_radius_m=2500, peer_self_ids=["7", "7", "3"], show_ai=False)
+    s = Settings(peer_radius_m=2500, peer_self_ids=["7", "7", "3"], show_ai=False)
     s.save(p)
     back = Settings.load(p)
-    assert (back.peer_source, back.peer_radius_m, back.peer_self_ids) == ("lab", 2500, ["3", "7"])
+    assert (back.peer_radius_m, back.peer_self_ids) == (2500, ["3", "7"])
     assert back.show_players and not back.show_ai
-    bad = Settings(peer_radius_m="x", peer_source="bogus").normalise()
-    assert bad.peer_radius_m == 1000.0 and bad.peer_source == "off"
+    bad = Settings(peer_radius_m="x").normalise()
+    assert bad.peer_radius_m == 1000.0
     assert Settings(peer_radius_m=1e9).normalise().peer_radius_m == 20_000
     assert Settings(peer_radius_m=1).normalise().peer_radius_m == 50
-    assert Settings().peer_radius_m == 1000.0 and Settings().peer_source == "off"
+    assert Settings().peer_radius_m == 1000.0
     assert not any(k.startswith("feed_") for k in json.loads(p.read_text()))  # no legacy keys are written
 
 
