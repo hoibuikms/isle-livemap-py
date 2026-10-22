@@ -25,6 +25,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from .ifaces import (
+    collect_interfaces, derive_capture_status, get_logger, outbound_ip, select_interfaces, should_fallback_to_all,
+)
 from .decode import MovementCandidate
 from .tracking import MovementTracker, Vitals, VitalsObservation, VitalsTracker
 
@@ -334,7 +337,11 @@ class LiveCapture:
         self._q: queue.Queue[Datagram] = queue.Queue(maxsize=8192)
         self._ports: set[int] = set()
         self._threads: list[threading.Thread] = []
-        self._sniffer = None
+        self._sniffers: list = []
+        self._force_all = False
+        self._all_mode = False
+        self._opened_at = 0.0
+        self._udp_at_open = 0
 
     def start(self) -> None:
         if not is_windows():
@@ -348,12 +355,7 @@ class LiveCapture:
 
     def stop(self) -> None:
         self._stop.set()
-        s = self._sniffer
-        if s is not None:
-            try:
-                s.stop()
-            except Exception:  # noqa: BLE001 - shutting down
-                pass
+        self._close_sniffers()
 
     def _on_packet(self, pkt) -> None:
         try:
@@ -380,9 +382,106 @@ class LiveCapture:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _supervise(self) -> None:
-        from scapy.config import conf
+    # -- sniffer management ------------------------------------------------
+
+    def _open_sniffers(self, names: list[str]) -> tuple[list[str], dict[str, str]]:
+        """Start one read-only AsyncSniffer per interface; keep those that are
+        confirmed running. A failing interface never aborts the others."""
         from scapy.sendrecv import AsyncSniffer
+
+        log = get_logger()
+        opened: list[str] = []
+        errors: dict[str, str] = {}
+        started = []
+        for name in names:
+            try:
+                s = AsyncSniffer(iface=name, filter="udp", prn=self._on_packet, store=False)
+                s.start()
+                started.append((name, s))
+            except Exception as e:  # noqa: BLE001
+                errors[name] = f"{type(e).__name__}: {e}"
+        deadline = time.monotonic() + 1.5
+        while started and time.monotonic() < deadline:
+            if all(getattr(s, "running", False) or not _thread_alive(s) for _n, s in started):
+                break
+            time.sleep(0.05)
+        for name, s in started:
+            err = getattr(s, "exception", None)
+            if getattr(s, "running", False) and _thread_alive(s) and err is None:
+                opened.append(name)
+                self._sniffers.append((name, s))
+            else:
+                errors[name] = f"{type(err).__name__}: {err}" if err else "sniffer thread exited right after start"
+                try:
+                    s.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        for n in opened:
+            log.info("opened interface %s", n)
+        for n, e in errors.items():
+            log.error("could not open interface %s: %s", n, e)
+        return opened, errors
+
+    def _close_sniffers(self) -> None:
+        for _n, s in self._sniffers:
+            try:
+                s.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._sniffers = []
+
+    def _ensure_capture(self) -> None:
+        """Open sniffers if none are healthy: preferred interface first, then all."""
+        log = get_logger()
+        dead = [n for n, s in self._sniffers if not (getattr(s, "running", False) and _thread_alive(s))]
+        if dead and self._sniffers:
+            log.error("sniffer(s) died: %s; restarting", dead)
+            self._close_sniffers()
+        if self._sniffers:
+            return
+        try:
+            infos = collect_interfaces()
+        except Exception as e:  # noqa: BLE001
+            log.error("cannot list interfaces: %s", e)
+            infos = []
+        try:
+            ip = outbound_ip()
+        except Exception:  # noqa: BLE001
+            ip = None
+        primary, everything, reason = select_interfaces(infos, ip, self.iface)
+        log.info("interfaces: %s", [(i.name, i.description, i.ips) for i in infos])
+        log.info("selection: %s", reason)
+        errors: dict[str, str] = {}
+        opened: list[str] = []
+        self._all_mode = False
+        if primary and not self._force_all:
+            opened, errors = self._open_sniffers(primary)
+        if not opened:
+            self._all_mode = True
+            more, errs = self._open_sniffers([n for n in everything if n not in errors])
+            opened, errors = more, {**errors, **errs}
+        self._opened_at = time.monotonic()
+        self._udp_at_open = self.pipeline.counts().get("udp_total", 0)
+        self.pipeline.set_status(derive_capture_status(opened, errors))
+        log.info("status after open: %s (opened=%s)", self.pipeline.latest.status, opened)
+
+    def _watchdog(self) -> None:
+        """No UDP at all a few seconds after opening one interface: widen to all."""
+        udp = self.pipeline.counts().get("udp_total", 0) - self._udp_at_open
+        if self._sniffers and should_fallback_to_all(udp, time.monotonic() - self._opened_at, self._all_mode):
+            get_logger().warning("no UDP seen on %s after 5 s; restarting on all interfaces", [n for n, _ in self._sniffers])
+            self._close_sniffers()
+            self._force_all = True  # one-shot widening
+
+    def _supervise(self) -> None:
+        try:
+            self._supervise_inner()
+        except Exception as e:  # noqa: BLE001
+            get_logger().exception("supervisor crashed")
+            self.pipeline.set_status(f"capture failed: {type(e).__name__}: {e}"[:160])
+
+    def _supervise_inner(self) -> None:
+        from scapy.config import conf
 
         conf.use_pcap = True  # sniff through Npcap
         tracked_pid: int | None = None
@@ -404,10 +503,14 @@ class LiveCapture:
                 self.pipeline.reset()
                 tracked_pid = pid
             self._ports = ports  # atomic replace; read by the sniffer callback
-            if self._sniffer is None:
-                # Read-only sniffing. BPF is applied in user mode via the port set
-                # because the game's sockets can be re-bound at any time.
-                self._sniffer = AsyncSniffer(iface=self.iface, filter="udp", prn=self._on_packet, store=False)
-                self._sniffer.start()
+            self._watchdog()
+            self._ensure_capture()
+            if self._sniffers and self.pipeline.latest.status not in ("capturing", "tracking"):
                 self.pipeline.set_status("capturing")
             self._stop.wait(2.0)
+        self._close_sniffers()
+
+
+def _thread_alive(sniffer) -> bool:
+    t = getattr(sniffer, "thread", None)
+    return t is not None and t.is_alive()

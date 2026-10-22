@@ -5,7 +5,8 @@ hiddenimports = (
     ["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"]
     + collect_submodules("scapy.layers")
     + collect_submodules("scapy.arch")
-    + ["scapy.sendrecv", "scapy.config", "scapy.layers.inet"]
+    + ["scapy.sendrecv", "scapy.config", "scapy.layers.inet", "scapy.layers.all",
+       "scapy.arch.windows", "scapy.arch.libpcap", "scapy.arch.common"]
     + collect_submodules("isle_livemap")
 )
 
@@ -25,5 +26,6 @@ exe = EXE(
     name="IsleLiveMap",
     console=False,
     upx=False,
+    uac_admin=True,  # Npcap capture often needs elevation
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="IsleLiveMap", upx=False)

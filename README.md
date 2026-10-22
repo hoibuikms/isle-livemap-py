@@ -70,6 +70,12 @@ The overlay and tray tooltip show the stage: waiting for game process, game runn
 UDP socket, capturing with 0 packets (wrong interface?), UDP seen but none on the game's
 ports, game packets arriving but no position decoded, tracking.
 
+Without `--iface` the app picks the interface that owns the default outbound route (found
+with a UDP `connect`, nothing is sent) and, if that fails or sees no UDP for 5 s, sniffs all
+usable interfaces. "capture failed: ..." in the status is the real sniffer error; details and
+the interfaces tried are in `%LOCALAPPDATA%\IsleLiveMap\capture.log`. The built exe asks for
+administrator rights (UAC) because Npcap capture often needs them.
+
 Run the passive diagnostic (no UI) while playing, ideally from an elevated terminal:
 
     python -m isle_livemap --diagnose [--iface NAME] [--seconds 10]
