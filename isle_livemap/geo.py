@@ -232,7 +232,7 @@ class Settings:
     feed_url: str = ""
     feed_token: str = ""  # stored in plain text; prefer ISLE_FEED_TOKEN
     feed_radius_m: float = 1000.0
-    feed_interval_s: float = 1.0
+    feed_interval_s: float = 0.5
     show_players: bool = True
     show_ai: bool = True
 
@@ -244,7 +244,7 @@ class Settings:
         self.feed_url = str(self.feed_url or "").strip()
         self.feed_token = str(self.feed_token or "").strip()
         self.feed_radius_m = _clamp_num(self.feed_radius_m, 50.0, 20_000.0, 1000.0)
-        self.feed_interval_s = _clamp_num(self.feed_interval_s, 0.25, 30.0, 1.0)
+        self.feed_interval_s = _clamp_num(self.feed_interval_s, 0.25, 30.0, 0.5)
         self.show_players, self.show_ai = bool(self.show_players), bool(self.show_ai)
         return self
 
@@ -400,9 +400,9 @@ def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bo
 
 
 class EntitySmoother:
-    """Per-entity exponential smoothing between ~1 Hz feed updates (like Interpolator)."""
+    """Per-entity exponential smoothing between ~2 Hz feed updates (like Interpolator)."""
 
-    def __init__(self, tau_s: float = 0.4, snap_distance_units: float = 200_000.0) -> None:
+    def __init__(self, tau_s: float = 0.15, snap_distance_units: float = 200_000.0) -> None:
         self.tau, self.snap = tau_s, snap_distance_units
         self.entities: dict[str, Entity] = {}
         self.pos: dict[str, list[float]] = {}

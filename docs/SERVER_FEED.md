@@ -19,7 +19,7 @@ Precedence: CLI flag, then environment variable, then saved settings.
 * Prefer the environment variable for the token: command-line arguments are visible to
   other processes. A token entered in the dialog is saved in `settings.json` in plain
   text. The token is never logged or shown in the UI.
-* Poll interval defaults to 1 s (`feed_interval_s` in `settings.json`, 0.25 to 30).
+* Poll interval defaults to 0.5 s (`feed_interval_s` in `settings.json`, 0.25 to 30).
   Errors back off exponentially up to 15 s.
 * Minimap radius defaults to 1 km (dialog, `feed_radius_m`). The full map shows every
   entity the feed sends.
