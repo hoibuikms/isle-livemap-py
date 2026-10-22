@@ -15,6 +15,17 @@ Undo-IsleLiveMap. No account, login, key, license check, server or telemetry upl
 Live capture needs [Npcap](https://npcap.com) (install with "WinPcap API-compatible mode").
 Run in **Borderless/Windowed**; true exclusive fullscreen hides overlays.
 
+## Windows exe build (PyInstaller)
+
+On Windows, run `build_exe.bat`. It creates/uses `.venv`, installs `requirements.txt` and
+PyInstaller, and builds a one-folder, windowed app from `IsleLiveMap.spec`:
+`dist\IsleLiveMap\IsleLiveMap.exe` (distribute the whole `IsleLiveMap` folder).
+
+* [Npcap](https://npcap.com) must still be installed separately (WinPcap API-compatible mode).
+* The exe is unsigned, so Windows SmartScreen may warn; choose "More info" then "Run anyway".
+* The game must still run in **Borderless/Windowed** mode. Exclusive fullscreen hides overlays.
+* Pass options (e.g. `--replay`) by running the exe from a terminal or a shortcut.
+
 ## Controls (global hotkeys on Windows; also tray menu)
 
 | Key | Action |

@@ -291,7 +291,10 @@ class Interpolator:
 
 
 # ----------------------------------------------------------------- bundled data
-ASSET_DIR = Path(__file__).parent / "assets"
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):  # PyInstaller bundle
+    ASSET_DIR = Path(sys._MEIPASS) / "isle_livemap" / "assets"
+else:
+    ASSET_DIR = Path(__file__).parent / "assets"
 
 
 def load_zones(path: Path | None = None) -> dict:
