@@ -150,11 +150,12 @@ class NearbyPanel(QDialog):
 
 class App(QObject):
     def __init__(self, qapp: QApplication, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings,
-                 peers=None) -> None:
+                 peers=None, recorder=None) -> None:
         super().__init__()
         self.qapp, self.settings, self.store = qapp, settings, store
         self.pipeline = pipeline
         self.peers = peers
+        self.recorder = recorder
         self.view = MapView(pipeline, store, settings, peers)
         self.view.request_marker_at_world = self.add_marker_at
         self.panel = MarkersPanel(self.view, store)
@@ -174,8 +175,14 @@ class App(QObject):
             self.view.move(g.right() - self.view.width() - 24, g.top() + 24)
         self.view.show()
         self._status_timer = QTimer(self)
-        self._status_timer.timeout.connect(lambda: self.tray.setToolTip(f"Isle LiveMap: {self.pipeline.status_text()}"))
+        self._status_timer.timeout.connect(self._update_status)
         self._status_timer.start(1000)
+
+    def _update_status(self) -> None:
+        text = f"Isle LiveMap: {self.pipeline.status_text()}"
+        rec = self.recorder.status() if self.recorder is not None else ""
+        self.view.record_status = rec
+        self.tray.setToolTip(f"{text}\n{rec}" if rec else text)
 
     def _install_hotkeys(self, actions) -> None:
         self._shortcuts = []

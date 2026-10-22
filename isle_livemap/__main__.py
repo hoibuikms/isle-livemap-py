@@ -19,6 +19,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lab-peers", nargs="?", const=7777, type=int, metavar="PORT",
                     help="dev/testing only: show other players from lab records on loopback 127.0.0.1:PORT (default 7777) "
                          "instead of the game. Without this flag, nearby players always come from the game capture.")
+    ap.add_argument("--record", metavar="FILE.pcap",
+                    help="passively record the game's UDP datagrams (both directions) to a pcap while the app runs; "
+                         "start the app with this BEFORE joining a server so actor creation data is captured. "
+                         "Read it back with --replay FILE or tools/inspect_capture.py FILE")
+    ap.add_argument("--record-max-mb", type=float, default=200.0, metavar="MB",
+                    help="--record: stop writing at this file size; automatic sessions roll to a new file at this "
+                         "size instead (default 200)")
+    ap.add_argument("--no-record", action="store_true",
+                    help="do not write the automatic session files (live capture records session_*.pcap + .log "
+                         "under <data dir>/logs/sessions by default; setting record_sessions=false does the same)")
     ap.add_argument("--data-dir", type=Path, help="where markers.json/settings.json live")
     args = ap.parse_args(argv)
 
@@ -44,6 +54,34 @@ def main(argv: list[str] | None = None) -> int:
     qapp = QApplication(sys.argv[:1])
     qapp.setQuitOnLastWindowClosed(False)
 
+    # Started before any source so nothing sent while joining a server is missed. A failure only disables recording.
+    recorder = None
+    if args.record:
+        from .recorder import PcapRecorder
+
+        recorder = PcapRecorder(args.record, args.record_max_mb)
+        if recorder.attach(pipeline):
+            print(f"recording game datagrams to {args.record} (cap {args.record_max_mb:g} MB); "
+                  "join the server now, quit the app when the neighbour has left", file=sys.stderr)
+        else:
+            print(f"warning: not recording: {recorder.error}", file=sys.stderr)
+
+    # Automatic session files: live capture only (not --replay / --lab-peers), unless disabled or --record FILE
+    # was given. Created before any source starts so the join is captured. Failures only disable them.
+    session = None
+    if not args.replay and args.lab_peers is None and not args.record and not args.no_record \
+            and settings.record_sessions:
+        from .sessionlog import SessionFiles, default_session_dir
+
+        directory = Path(settings.record_dir) if settings.record_dir else default_session_dir(args.data_dir)
+        session = SessionFiles(directory, pipeline, keep_sessions=settings.record_keep_sessions,
+                               total_cap_mb=settings.record_total_cap_mb, file_cap_mb=args.record_max_mb)
+        if session.start():
+            print(f"session files: {session.pcap_path} (+ .log)", file=sys.stderr)
+        recorder = session.recorder  # a failed recorder still shows "recording FAILED (...)" in the status line
+        if session.error:
+            print(f"warning: session recording problem: {session.error}", file=sys.stderr)
+
     source = None
     if args.replay:
         from .replay import ReplayFeeder, SyntheticSource, pcap_datagrams
@@ -61,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             source.start()
         except CaptureUnavailable as err:
             print(f"error: {err}", file=sys.stderr)
+            if session is not None:
+                session.close()
             return 2
 
     from .peers import create_peer_source
@@ -83,12 +123,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             peers = create_peer_source("game", anchor, self_ids=settings.peer_self_ids, pipeline=pipeline)
         peers.start()
+        if session is not None and session.log is not None:
+            session.log.peers = peers
     except Exception as err:  # noqa: BLE001 - a broken peer source must never take the minimap down
         print(f"warning: nearby players unavailable: {err}", file=sys.stderr)
         peers = None
 
-    app = App(qapp, pipeline, store, settings, peers)  # noqa: F841 (kept alive)
+    app = App(qapp, pipeline, store, settings, peers, recorder=recorder)  # noqa: F841 (kept alive)
     qapp.aboutToQuit.connect(source.stop)
+    if session is not None:
+        qapp.aboutToQuit.connect(session.close)
+    elif recorder is not None:
+        qapp.aboutToQuit.connect(recorder.close)
     qapp.aboutToQuit.connect(lambda: app.peers.stop() if app.peers is not None else None)
     return qapp.exec()
 

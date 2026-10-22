@@ -22,6 +22,9 @@ Bare `--replay` shows synthetic demo peers (one entry deliberately carries a sel
 | Flag | Effect |
 |---|---|
 | `--replay [FILE.pcap]` | replay a synthetic walker (with synthetic demo peers) or a pcap (peers decoded by the game path) |
+| `--no-record` | live capture records a session automatically by default; this turns it off (see "Automatic session logs") |
+| `--record FILE.pcap` | manual single-file recording instead of the automatic session files (stops at the size cap) |
+| `--record-max-mb MB` | size cap per pcap file (default 200): `--record` stops there, automatic sessions roll to a new file |
 | `--lab-peers [PORT]` | dev/test: use lab records on loopback (default port 7777) instead of the game |
 
 `--game-peers` was removed (it is now the default). Passing it is an argparse error rather than a silent no-op, so stale launchers are noticed.
@@ -37,6 +40,10 @@ Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on lab
 | `show_players` | `true` | draw other players; tray toggle |
 | `show_vitals_detail` | `false` | extra label line with the vitals that are known; tray toggle |
 | `show_ai` | `true` | inert: packet sources never report an AI kind |
+| `record_sessions` | `true` | settings-file only: automatic session pcap + log for live capture; `false` = same as `--no-record` |
+| `record_dir` | `""` | settings-file only: sessions directory; empty = `<data dir>/logs/sessions` |
+| `record_keep_sessions` | `10` | settings-file only: newest sessions kept (1..1000) |
+| `record_total_cap_mb` | `1024` | settings-file only: total size cap of the sessions directory (10..) |
 
 ## Behaviour common to all sources
 
@@ -90,13 +97,39 @@ The game status line shows what the capture contains so far:
 
 `creation 0, exports 0` means the capture holds no join data and species/name cannot be recovered from it. All current fixtures show `creation 0, exports 0, destroyed 1`.
 
+## Automatic session logs
+
+Every live launch (not `--replay`, not `--lab-peers`) writes two files without any flag, from the moment the app starts, so the join of a server is always on disk:
+
+- `session_YYYYmmdd_HHMMSS.pcap`: the game's UDP datagrams (both directions), format below.
+- `session_YYYYmmdd_HHMMSS.log`: a concise plain-text event log: app start/stop, server learned, own handle locked/changed, peer-source status transitions, a counters line every ~10 s (packets in/out, creation / exports / destroyed, actors tracked, distinct handles), the first creation record (with its handle), every destruction record (with its handle), recorder start / roll / stop / failure, retention deletions, and decoder exceptions with traceback (first 5 per site). No per-packet lines. It rotates at 5 MB (`.log.1`).
+
+Where: `<data dir>/logs/sessions/`. On Windows that is `%APPDATA%\isle-livemap\logs\sessions\` (typically `C:\Users\<you>\AppData\Roaming\isle-livemap\logs\sessions`; paste `%APPDATA%\isle-livemap\logs\sessions` into Explorer). Elsewhere `~/.isle-livemap/logs/sessions/`. `--data-dir D` moves it to `D/logs/sessions`; the `record_dir` setting overrides it completely.
+
+Off switch: `--no-record` or `"record_sessions": false`. An explicit `--record FILE` replaces the automatic files for that run (single file, no session log).
+
+Retention (at startup and at every roll): keep the newest 10 sessions (`record_keep_sessions`), keep the directory under 1 GB (`record_total_cap_mb`), oldest files first. The running session is never deleted. Only files named `session_<stamp>[_partN].pcap|.log|.log.1` are ever removed; anything else in that folder is left alone.
+
+Size cap per pcap file: 200 MB (`--record-max-mb`). At the cap the recorder closes the file and continues in `session_<stamp>_part2.pcap`, `_part3`, ... so a long session keeps its NEWEST data and retention removes the oldest parts first. The join-time creation records are in part 1 (the first ~200 MB of the session), so keep that file if you want to decode names.
+
+The status line under the minimap (and the tray tooltip) shows it working: `recording session_20261022_101500.pcap: N pkts, M MB, creation records seen: K, exports E`. It turns orange on `FAILED` (cannot create or write; the minimap keeps working) or `STOPPED` (manual `--record` hit its cap).
+
+**Privacy:** the pcaps contain your IP address, the server's address and the raw game traffic, and `logs/` is in `.gitignore` so they are never committed by accident. Share them deliberately.
+
 ## Recording steps for the owner
 
-1. Start the packet capture (Wireshark or Npcap on the game's UDP port, saved as pcap) BEFORE you join the server. If you are already in, leave to the main menu first, start the capture, then rejoin.
-2. Join and stay put for the first 30 s so the actors around you are created.
-3. Make sure at least one neighbour spawns into range during the capture and at least one leaves (walks away, dies or logs off). A populated server is best.
-4. Write down for that neighbour: character name, species, roughly when they appeared and left (clock time), and any handle you can read in game.
-5. Stop the capture after the neighbour has left. Check the status line (or replay the pcap): `creation` should be above 0.
+Just play. Start the app before joining a server (it records from launch), join, stay put for the first 30 s, and quit from the tray when done (this flushes the file; it is also flushed about once a second). Optionally note, for one neighbour, the character name, species and roughly when they appeared and left.
+
+Afterwards:
+
+1. Look at the newest session: `python -I tools/inspect_capture.py --latest` (or pass a file or a directory: the newest `session_*.pcap` in it is used). `creation batches` above 0 means the join data was captured.
+2. Send the `session_<stamp>.pcap` and `session_<stamp>.log` of that session (plus `_partN.pcap` files if any) from the folder above, and your notes.
+
+If the file cannot be opened or written the status line says `recording FAILED (...)`; the minimap and nearby players keep working.
+
+The pcap is a standard classic pcap (link type 101 = raw IPv4; open it in Wireshark). It holds only the datagrams of the game's own UDP ports, with rebuilt IPv4/UDP headers (no Ethernet layer) and wall-clock arrival times. The same file can be replayed through the full app with `python -m isle_livemap --replay FILE.pcap` (add `--local-port N` if the local port is not auto-detected; it is taken from the private-address side of the busiest flow).
+
+`tools/inspect_capture.py [FILE|DIR] [--latest] [--first N] [--max-bytes B] [--local-port P]` runs offline (no Qt, no network) and prints packet counts, duration, batch kinds, creation / export / destruction counts, distinct handles and a raw hex dump of the first N creation and export-bearing batches. It does not decode species or names.
 
 ## Capture that would unlock the rest
 

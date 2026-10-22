@@ -46,6 +46,7 @@ class MapView(QWidget):
         self._peers_snap = None
         self._peers_version = -1
         self.peer_status = ""
+        self.record_status = ""  # set by App once a second while --record is active
         self._marker_tools: dict[tuple[str, bool], tuple[QPen, QColor]] = {}
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
         self.interp = Interpolator()
@@ -183,6 +184,7 @@ class MapView(QWidget):
         self._draw_border(p)
         self._draw_hud(p)
         self._draw_peer_status(p)
+        self._draw_record_status(p)
         p.end()
 
     def _circle_region(self):
@@ -360,6 +362,16 @@ class MapView(QWidget):
         room = self.width() * (0.9 if self.full_map else 0.62)  # inside the circle chord at that height
         text = QFontMetricsF(p.font()).elidedText(self.peer_status, Qt.TextElideMode.ElideRight, room)
         p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, text)
+
+    def _draw_record_status(self, p: QPainter) -> None:
+        if not self.record_status:
+            return
+        p.setFont(QFont("Segoe UI", 8))
+        bad = "FAILED" in self.record_status or "STOPPED" in self.record_status
+        p.setPen(QColor(255, 170, 90) if bad else QColor(255, 90, 90))
+        room = self.width() * (0.9 if self.full_map else 0.62)
+        text = QFontMetricsF(p.font()).elidedText(self.record_status, Qt.TextElideMode.ElideRight, room)
+        p.drawText(QRectF(0, (6 if self.full_map else 18) + 14, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, text)
 
     def _draw_player(self, p: QPainter) -> None:
         if not self.interp.has_fix:

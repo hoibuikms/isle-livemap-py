@@ -9,3 +9,6 @@ build/
 .pytest_cache/
 .DS_Store
 .env
+
+# session recordings: pcaps contain IP addresses and game traffic, never commit them
+logs/

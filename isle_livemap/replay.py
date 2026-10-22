@@ -132,24 +132,30 @@ def pcap_datagrams(path: Path, local_port: int | None = None) -> Iterator[Datagr
     from scapy.layers.inet import IP, UDP
     from scapy.utils import PcapReader
 
-    pkts = []
-    with PcapReader(str(path)) as reader:
-        for p in reader:
-            if UDP in p and IP in p and len(bytes(p[UDP].payload)) > 0:
-                pkts.append(p)
-    if not pkts:
-        return
+    def udp_packets():
+        # streamed: a 200 MB recording must not be held in memory as scapy packet objects
+        with PcapReader(str(path)) as reader:
+            for p in reader:
+                if UDP in p and IP in p and len(bytes(p[UDP].payload)) > 0:
+                    yield p
+
+    t0 = None
     if local_port is None:
         counts: dict[int, int] = {}
-        for p in pkts:
+        for p in udp_packets():
+            if t0 is None:
+                t0 = float(p.time)
             for ip, port in ((p[IP].src, p[UDP].sport), (p[IP].dst, p[UDP].dport)):
                 if ipaddress.ip_address(ip).is_private:
                     counts[port] = counts.get(port, 0) + len(bytes(p[UDP].payload))
         if not counts:
+            if t0 is None:
+                return
             raise ValueError("could not infer the local game port; pass --local-port")
         local_port = max(counts, key=counts.get)
-    t0 = float(pkts[0].time)
-    for p in pkts:
+    for p in udp_packets():
+        if t0 is None:
+            t0 = float(p.time)
         direction = classify_direction(int(p[UDP].sport), int(p[UDP].dport), {local_port})
         if direction is None:
             continue

@@ -234,6 +234,11 @@ class Settings:
     show_vitals_detail: bool = False
     show_players: bool = True
     show_ai: bool = True  # inert for packet sources (they never report an AI kind)
+    # automatic session recording (live capture only; see sessionlog.py). Settings-file only.
+    record_sessions: bool = True
+    record_dir: str = ""  # "" = <data dir>/logs/sessions
+    record_keep_sessions: int = 10  # newest sessions kept (pcap parts + log count as one session)
+    record_total_cap_mb: float = 1024.0  # total size cap of the sessions directory
 
     def normalise(self) -> "Settings":
         self.size_percent = clamp_size_percent(self.size_percent)
@@ -245,6 +250,10 @@ class Settings:
         self.peer_self_ids = sorted({c for c in (canonical_id(i) for i in ids) if c}, key=str)[:32]
         self.show_vitals_detail = bool(self.show_vitals_detail)
         self.show_players, self.show_ai = bool(self.show_players), bool(self.show_ai)
+        self.record_sessions = bool(self.record_sessions)
+        self.record_dir = self.record_dir.strip() if isinstance(self.record_dir, str) else ""
+        self.record_keep_sessions = int(_clamp_num(self.record_keep_sessions, 1, 1000, 10))
+        self.record_total_cap_mb = _clamp_num(self.record_total_cap_mb, 10.0, 1_000_000.0, 1024.0)
         return self
 
     @classmethod

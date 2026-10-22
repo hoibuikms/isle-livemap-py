@@ -155,7 +155,12 @@ class TelemetryPipeline:
         # reset: fn() when handles stop being valid (new server / game restart).
         self._inbound_observers: list[Callable[[Datagram, int | None], None]] = []
         self._reset_observers: list[Callable[[], None]] = []
+        # fn(datagram) for EVERY datagram handed to handle(), both directions, before decoding (the recorder).
+        self._datagram_observers: list[Callable[[Datagram], None]] = []
         self._counts = {"outbound": 0, "inbound": 0, "dropped": 0, "udp_total": 0, "decoded": 0}
+        # fn(where) called from inside an ``except`` block when a decoder/observer raised (the session log
+        # records the traceback); the exception itself is still swallowed so capture never stops.
+        self.error_hook: Callable[[str], None] | None = None
         self.latest = Telemetry()
 
     def set_status(self, status: str) -> None:
@@ -180,12 +185,34 @@ class TelemetryPipeline:
             if on_reset is not None and on_reset in self._reset_observers:
                 self._reset_observers.remove(on_reset)
 
+    def add_datagram_observer(self, fn: Callable[[Datagram], None]) -> None:
+        with self._lock:
+            self._datagram_observers.append(fn)
+
+    def remove_datagram_observer(self, fn: Callable[[Datagram], None]) -> None:
+        with self._lock:
+            if fn in self._datagram_observers:
+                self._datagram_observers.remove(fn)
+
+    @property
+    def server(self) -> str | None:
+        """``ip:port`` of the game server learned from outbound traffic (None until then)."""
+        return self._server
+
+    def report_error(self, where: str) -> None:
+        hook = self.error_hook
+        if hook is not None:
+            try:
+                hook(where)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _notify_reset(self, observers: list[Callable[[], None]]) -> None:
         for fn in observers:
             try:
                 fn()
             except Exception:  # noqa: BLE001 - an observer must never break own-player decoding
-                pass
+                self.report_error("reset observer")
 
     def reset(self) -> None:
         with self._lock:
@@ -212,6 +239,11 @@ class TelemetryPipeline:
 
     def handle(self, d: Datagram) -> Telemetry | None:
         """Decode one datagram; returns the new snapshot if something changed."""
+        for fn in tuple(self._datagram_observers):  # passive raw tap; a failing observer never affects decoding
+            try:
+                fn(d)
+            except Exception:  # noqa: BLE001
+                self.report_error("datagram observer")
         tap: tuple[list, int | None] | None = None
         reset_taps: list | None = None
         with self._lock:
@@ -251,7 +283,7 @@ class TelemetryPipeline:
                 try:
                     fn(d, tap[1])
                 except Exception:  # noqa: BLE001 - an observer must never break own-player decoding
-                    pass
+                    self.report_error("inbound observer")
         if snap is not None and self._on_update:
             self._on_update(snap)
         return snap
@@ -423,7 +455,7 @@ class LiveCapture:
             try:
                 self.pipeline.handle(d)
             except Exception:  # noqa: BLE001
-                pass
+                self.pipeline.report_error("pipeline.handle")
 
     # -- sniffer management ------------------------------------------------
 
