@@ -13,8 +13,8 @@ import pytest
 from isle_livemap import peers
 from isle_livemap.capture import INBOUND, OUTBOUND, Datagram, TelemetryPipeline
 from isle_livemap.decode import (
-    ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, Bits, IrisBatch, decode_actor_location,
-    decode_actor_locations, parse_iris_packet,
+    ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, Bits, IrisBatch, PacketCounts, batch_kind,
+    count_batches, decode_actor_location, decode_actor_locations, parse_iris_packet,
 )
 from isle_livemap.geo import peer_label_lines, visible_entities
 from isle_livemap.peers import GamePeerSource, create_peer_source
@@ -256,3 +256,73 @@ def test_factory_wires_the_pipeline_and_start_without_one_logs(caplog):
     with caplog.at_level(logging.WARNING, logger="isle_livemap.peers"):
         GamePeerSource().start()
     assert "no capture pipeline" in caplog.text
+
+
+# ---------------------------------------------------------------- batch kind classifier and join-data counters
+def kind_batch(prefix_bits: list[int], total: int = 40, offset: int = 0):
+    """Batch whose payload starts with ``prefix_bits`` (LSB-first), built with BitWriter."""
+    w = BitWriter()
+    w.write(0, offset)
+    for b in prefix_bits:
+        w.write(b, 1)
+    w.write(0, total - len(prefix_bits))
+    return Bits(w.to_bytes()), IrisBatch(1, offset, total, False, False)
+
+
+def test_batch_kind_on_synthetic_prefixes():
+    assert batch_kind(*kind_batch([0, 0, 0, 1, 0])) == "state"
+    assert batch_kind(*kind_batch([0, 0, 0, 1, 1])) == "creation"
+    assert batch_kind(*kind_batch([0, 0, 0, 1, 1], offset=13)) == "creation"  # honours data_bit_offset
+    assert batch_kind(*kind_batch([0, 0, 0, 0, 0])) == "unknown"  # no state bit
+    assert batch_kind(*kind_batch([1, 0, 0, 1, 0])) == "unknown"  # skipped bits not zero
+    assert batch_kind(*kind_batch([0, 0, 1, 1, 1])) == "unknown"
+    assert batch_kind(*kind_batch([0, 0, 0, 1], total=4)) == "unknown"  # shorter than the prefix
+
+
+def test_batch_kind_of_the_recorded_location_batch_is_state():
+    bits, batch = actor_batch(1e5, 2e5, 3e4)
+    assert batch_kind(bits, batch) == "state"
+
+
+def test_every_recorded_batch_is_a_state_update(recorded, b64):
+    total = states = 0
+    for name in recorded:
+        try:
+            payload = b64(name)
+        except Exception:  # entries stored as hex are not Iris payloads
+            continue
+        pkt = parse_iris_packet(payload)
+        if pkt is None:
+            continue
+        c = count_batches(payload, pkt)
+        assert (c.creation, c.unknown, c.exports) == (0, 0, 0) and c.state == len(pkt.batches)
+        total += len(pkt.batches)
+        states += c.state
+    assert total == states == 126
+
+
+def test_counts_per_packet_on_the_destruction_fixture(b64):
+    c = count_batches(b64("DetachedDamagedAttributes"))
+    assert (c.creation, c.exports, c.destroyed) == (0, 0, 1) and c.unknown == 0
+    assert count_batches(b"") == PacketCounts() and count_batches(bytes(range(200))) == PacketCounts()
+
+
+def test_source_counters_on_recorded_traffic_and_status_text(b64, recorded):
+    g, _ = make()
+    for name in recorded:
+        try:
+            payload = b64(name)
+        except Exception:
+            continue
+        g.on_inbound(inbound(payload), None)
+    assert (g.creation_records, g.export_batches, g.destruction_records) == (0, 0, 1)
+    st = g.snapshot().status
+    assert "creation 0, exports 0, destroyed 1" in st and not peers.status_is_warning(st)
+    assert len(st) < 140
+
+
+def test_destruction_records_count_even_when_the_handle_is_untracked(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("DetachedDamagedAttributes")), None)
+    assert g.destruction_records == 1 and g.destroyed == 0
+

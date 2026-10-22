@@ -10,7 +10,7 @@ Start the app with no flags and nearby players appear next to the current player
 
 | Source | Purpose | Selected by | Status text (examples) |
 |---|---|---|---|
-| game | the only user-facing source | default; also `--replay FILE.pcap` | `game: waiting for server traffic`, `game: waiting for actor locations (N pkts, own handle not locked yet)`, `game: N actors (position only; ...)`, `game: unavailable (...)` |
+| game | the only user-facing source | default; also `--replay FILE.pcap` | `game: waiting for server traffic`, `game: waiting for actor locations (N pkts, own handle not locked yet)`, `game: N actors (creation 0, exports 0, destroyed 1; position only, ...)`, `game: unavailable (...)` |
 | lab | developer/test only | `--lab-peers [PORT]` | `lab: listening 127.0.0.1:7777 (N peers, ...)`, `lab: unavailable (...)` |
 | synthetic | developer/test only | bare `--replay` | `synthetic peers (N)` |
 
@@ -63,6 +63,26 @@ Little-endian `<IfffH` + UTF-8 name: id (uint32, shown as signed), x, y, z (floa
 | Reliable despawn | not validated |
 
 Evidence and method are in section 11 of `docs/trd/other-players-on-minimap.md`.
+
+## When identity is sent (why the capture must start before joining)
+
+Name, species and player-versus-AI are not part of the steady-state position updates. The game sends them once, in the actor creation record (plus the object exports that name its class), when an actor first becomes relevant to your client. A capture that starts while the neighbour is already in view cannot contain that data, however long it runs. Vitals of other players are not replicated in any form that has been decoded.
+
+The game status line shows what the capture contains so far:
+`game: N actors (creation C, exports E, destroyed D; ...)`.
+- `creation C`: batches whose first bits say "actor creation" (the record itself is not decoded yet).
+- `exports E`: batches followed by an export section (object paths, net-token strings).
+- `destroyed D`: destruction records in the envelope (an actor leaving relevance).
+
+`creation 0, exports 0` means the capture holds no join data and species/name cannot be recovered from it. All current fixtures show `creation 0, exports 0, destroyed 1`.
+
+## Recording steps for the owner
+
+1. Start the packet capture (Wireshark or Npcap on the game's UDP port, saved as pcap) BEFORE you join the server. If you are already in, leave to the main menu first, start the capture, then rejoin.
+2. Join and stay put for the first 30 s so the actors around you are created.
+3. Make sure at least one neighbour spawns into range during the capture and at least one leaves (walks away, dies or logs off). A populated server is best.
+4. Write down for that neighbour: character name, species, roughly when they appeared and left (clock time), and any handle you can read in game.
+5. Stop the capture after the neighbour has left. Check the status line (or replay the pcap): `creation` should be above 0.
 
 ## Capture that would unlock the rest
 

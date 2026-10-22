@@ -584,6 +584,54 @@ def parse_iris_packet(payload: bytes) -> IrisPacket | None:
     return IrisPacket(sequence, has_stream, complete, batches, reason, tuple(destroyed))
 
 
+# ---------------------------------------------------------------- batch kind (state update vs creation)
+#
+# Fact base (docs/trd/reference-findings.md, 3.4 and 5): a batch payload starts with 3 bits that are zero, then
+# a "has state" bit, then an "is creation" bit. All 126 recorded batches begin 0,0,0,1,0 (LSB-first), i.e. a
+# state update; none is a creation. Only this prefix is classified: the creation record itself is NOT decoded.
+
+KIND_STATE = "state"
+KIND_CREATION = "creation"
+KIND_UNKNOWN = "unknown"
+_KIND_PREFIX_BITS = 5
+_KIND_SKIPPED_MASK = 0b00111
+_KIND_HAS_STATE = 1 << 3
+_KIND_IS_CREATION = 1 << 4
+
+
+def batch_kind(bits: Bits, batch: IrisBatch) -> str:
+    """"state" / "creation" / "unknown" from the first five payload bits of ``batch`` (nothing else is read)."""
+    if batch.data_bit_count < _KIND_PREFIX_BITS or batch.data_bit_offset < 0:
+        return KIND_UNKNOWN
+    prefix = bits.read(batch.data_bit_offset, _KIND_PREFIX_BITS)
+    if prefix & _KIND_SKIPPED_MASK or not prefix & _KIND_HAS_STATE:
+        return KIND_UNKNOWN
+    return KIND_CREATION if prefix & _KIND_IS_CREATION else KIND_STATE
+
+
+@dataclass(frozen=True, slots=True)
+class PacketCounts:
+    """Diagnostics for one datagram: how many batches of each kind, how many carry an export section and how
+    many destruction records the envelope holds."""
+
+    state: int = 0
+    creation: int = 0
+    unknown: int = 0
+    exports: int = 0
+    destroyed: int = 0
+
+
+def count_batches(payload: bytes, packet: IrisPacket | None = None) -> PacketCounts:
+    packet = packet or parse_iris_packet(payload)
+    if packet is None:
+        return PacketCounts()
+    bits = Bits(payload)
+    kinds = [batch_kind(bits, b) for b in packet.batches]
+    return PacketCounts(
+        kinds.count(KIND_STATE), kinds.count(KIND_CREATION), kinds.count(KIND_UNKNOWN),
+        sum(1 for b in packet.batches if b.has_exports), len(packet.destroyed_handles))
+
+
 # ---------------------------------------------------------------- other actors' location (TRD-050)
 #
 # Derived from the recorded inbound packets in tests/fixtures (see docs/trd/other-players-on-minimap.md,

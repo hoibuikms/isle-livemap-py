@@ -359,6 +359,9 @@ class GamePeerSource:
         self.packets = 0  # inbound datagrams seen
         self.locations = 0  # actor locations decoded
         self.destroyed = 0  # destruction records that removed a tracked peer
+        self.creation_records = 0  # batches whose prefix says "creation" (identity is sent there; not decoded yet)
+        self.export_batches = 0  # batches followed by an export section (object paths / net-token strings)
+        self.destruction_records = 0  # destruction records seen in the envelope (tracked or not)
         self._attached = False
         self.error = ""
 
@@ -393,11 +396,15 @@ class GamePeerSource:
         if own_handle is not None and own_handle != self.own_handle:
             self.own_handle = own_handle  # replaces (not adds to) the previous own handle
             self.store.set_owned_self_ids((str(own_handle),))
-        from .decode import decode_actor_locations, parse_iris_packet
+        from .decode import count_batches, decode_actor_locations, parse_iris_packet
 
         packet = parse_iris_packet(d.payload)
         if packet is None:
             return
+        counts = count_batches(d.payload, packet)
+        self.creation_records += counts.creation
+        self.export_batches += counts.exports
+        self.destruction_records += counts.destroyed
         for handle in packet.destroyed_handles:
             if self.store.remove(str(handle)):
                 self.destroyed += 1
@@ -418,7 +425,8 @@ class GamePeerSource:
             return "game: waiting for server traffic"
         if n == 0:
             return f"game: waiting for actor locations ({self.packets} pkts, {own})"
-        return f"game: {n} actors (position only; class, name and vitals not decoded; {own})"
+        seen = f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}"
+        return f"game: {n} actors ({seen}; position only, name/class/vitals not decoded; {own})"
 
     def snapshot(self) -> PeerSnapshot:
         return self.store.snapshot(self.status(), True)
