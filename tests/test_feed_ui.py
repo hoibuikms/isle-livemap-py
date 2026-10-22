@@ -47,3 +47,13 @@ def test_overlay_draws_feed_entities(tmp_path):
     plain = MapView(pipe, MarkerStore(tmp_path / "m2.json"), Settings())
     plain.tick()
     assert plain.nearby() == [] and not plain.grab().toImage().isNull()
+
+
+def test_zoom_to_radius_edge_is_radius_metres():
+    from isle_livemap.geo import MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, Settings
+    from isle_livemap.overlay import BASE_VIEW_FRACTION, MapView
+
+    settings = Settings()
+    MapView.zoom_to_radius(type("V", (), {"settings": settings})(), 1000)
+    span = BASE_VIEW_FRACTION / settings.zoom
+    assert abs(span * MAP_WIDTH * WORLD_SCALE / UNITS_PER_METER / 2 - 1000) < 1
