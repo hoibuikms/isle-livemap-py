@@ -50,6 +50,23 @@ def test_place_label_avoids_overlap_and_bounds():
     assert place_label(5, 5, 300, 20, [], bounds) is None  # wider than the view
 
 
+def test_place_label_prefers_centred_under_then_above_right_left():
+    bounds = (0, 0, 200, 100)
+    placed = []
+    assert place_label(100, 40, 60, 10, placed, bounds) == (70, 48, 60, 10)  # centred, just under the dot
+    assert place_label(100, 40, 60, 10, placed, bounds) == (70, 22, 60, 10)  # under taken: above
+    assert place_label(100, 40, 60, 10, placed, bounds) == (108, 35, 60, 10)  # both taken: right
+    assert place_label(100, 40, 60, 10, placed, bounds) == (32, 35, 60, 10)  # then left
+
+
+def test_place_label_clamps_centred_text_into_bounds():
+    bounds = (0, 0, 200, 100)
+    assert place_label(5, 40, 60, 20, [], bounds) == (0, 48, 60, 20)
+    assert place_label(198, 40, 60, 20, [], bounds) == (140, 48, 60, 20)
+    # no room below: falls back to above
+    assert place_label(100, 90, 60, 20, [], bounds) == (70, 62, 60, 20)
+
+
 def test_smoother_interpolates_snaps_and_drops():
     s = EntitySmoother(tau_s=0.4)
     s.update([E("a", x=0, y=0)])

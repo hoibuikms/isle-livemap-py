@@ -561,12 +561,17 @@ def _overlaps(a: Rect, b: Rect) -> bool:
 
 
 def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect) -> Rect | None:
-    """Pick a label rect next to anchor (ax, ay) (right, left, above, below) that
-    stays inside ``bounds`` and overlaps no already placed label; None if none fits."""
-    for r in ((ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h),
-              (ax - w / 2, ay - 8 - h, w, h), (ax - w / 2, ay + 8, w, h)):
-        inside = (r[0] >= bounds[0] and r[1] >= bounds[1]
-                  and r[0] + r[2] <= bounds[0] + bounds[2] and r[1] + r[3] <= bounds[1] + bounds[3])
+    """Pick a label rect for anchor (ax, ay), preferring centred directly under the marker, then
+    above (centred), right, left. A centred candidate is shifted sideways so it stays inside
+    ``bounds``; every candidate must lie inside ``bounds`` and overlap no already placed label.
+    Returns None if none fits."""
+    bx, by, bw, bh = bounds
+    if w > bw:
+        return None
+    cx = min(max(ax - w / 2, bx), bx + bw - w)  # centred under/above, clamped into the view
+    for r in ((cx, ay + 8, w, h), (cx, ay - 8 - h, w, h),
+              (ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h)):
+        inside = (r[0] >= bx and r[1] >= by and r[0] + r[2] <= bx + bw and r[1] + r[3] <= by + bh)
         if inside and not any(_overlaps(r, o) for o in placed):
             placed.append(r)
             return r
