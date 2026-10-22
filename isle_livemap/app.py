@@ -237,6 +237,7 @@ class App(QObject):
             menu.addAction(a)
         menu.addSeparator()
         for text, fn in (
+            ("Zoom to feed radius", lambda: self.view.zoom_to_radius(self.settings.feed_radius_m)),
             ("Size…", self.ask_size), ("Range rings…", self.ask_rings), ("Species label…", self.ask_species),
             ("Feed settings…", self.ask_feed),
         ):
@@ -278,6 +279,7 @@ class App(QObject):
         self.settings.feed_url, self.settings.feed_token = dlg.url.text().strip(), token
         self.settings.feed_radius_m = dlg.radius.value()
         self.settings.normalise()
+        self.view.zoom_to_radius(self.settings.feed_radius_m)
         self.feed.configure(self.settings.feed_url, self.settings.feed_token, self.settings.feed_interval_s)
 
     def add_marker_here(self) -> None:

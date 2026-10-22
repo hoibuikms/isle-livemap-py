@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QWidget
 
 from .capture import TelemetryPipeline
 from .geo import (
-    ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
+    ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     EntitySmoother, Nearby, entity_label_lines, nearby_entities, place_label,
 )
@@ -87,6 +87,11 @@ class MapView(QWidget):
             self.full_zoom = min(max(self.full_zoom * factor, 1.0), 16.0)
         else:
             self.settings.zoom = min(max(self.settings.zoom * factor, 0.5), 16.0)
+
+    def zoom_to_radius(self, radius_m: float) -> None:
+        """Zoom the minimap so its edge (half the width) is radius_m metres from the player."""
+        span = 2 * radius_m * UNITS_PER_METER / (MAP_WIDTH * WORLD_SCALE)
+        self.settings.zoom = min(max(BASE_VIEW_FRACTION / span, 0.5), 16.0)
 
     def set_size_percent(self, pct: int) -> None:
         self.settings.size_percent = clamp_size_percent(pct)
