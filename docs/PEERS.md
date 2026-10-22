@@ -41,8 +41,8 @@ Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on lab
 ## Behaviour common to all sources
 
 - Self is excluded by identity, never by position. Lab: id 0 is the lab's "me". Game: the entity whose Iris handle equals the own handle (learned from the survival heartbeat) is dropped, and a provisional peer with that handle is purged when the lock arrives. `peer_self_ids` adds more.
-- A peer is dimmed after 3 s without an update and removed after 5 s. This is the fallback despawn rule. The game source also removes a tracked handle when the packet carries a destruction record for it (see "Not decoded").
-- Missing fields are `None` and shown as `?`. Nothing is guessed. There is no heading inferred from movement: peers without a decoded heading are drawn as a dot, and only a source-supplied heading draws an arrow.
+- Silence timeouts are a property of the source. Lab and synthetic peers are dimmed after 3 s without an update and removed after 5 s. Game peers are dimmed after 8 s and removed after 30 s (`GAME_PEER_STALE_S` / `GAME_PEER_TTL_S`), because Iris replicates changes only: an actor that stands still sends nothing, so silence is not absence. The game source also removes a tracked handle at once when the packet carries a destruction record for it (see "Not decoded"). The 8 s / 30 s values are a judgement call, not a measured number (no recorded idle actor exists).
+- Missing fields are `None` and are simply not printed: the minimap label never shows `?`, `HP ?` or `G ?`. The label is name (or `Actor #<handle>`), species if known, then the known vitals, distance, compass bearing and height difference, e.g. `Actor #84466` / `757 m N +116m`. The Nearby table keeps `-` / `?` only because its columns need a cell. Nothing is guessed. There is no heading inferred from movement: peers without a decoded heading are drawn as a dot, and only a source-supplied heading draws an arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
 
 ## Lab record (development only)
@@ -56,13 +56,27 @@ Little-endian `<IfffH` + UTF-8 name: id (uint32, shown as signed), x, y, z (floa
 | Identity (Iris `net_ref_handle`) | decoded, shown as `Actor #<handle>` |
 | Position x, y, z | decoded, same quantisation and cm units as the own movement |
 | Despawn | partial: destruction records remove an already tracked handle; not validated against a recorded despawn, TTL is the fallback |
-| Name | not decoded |
-| Class (player, AI, animal) | not decoded; every actor is shown as `player`, so AI/animals with the same state layout can appear |
-| Health, growth, stamina, hunger, thirst | not decoded (`?`) |
+| Name | not decoded (label shows `Actor #<handle>`) |
+| Class / species (player, AI, animal, trice, t-rex, ...) | not decoded; every actor is shown as `player`, so AI/animals with the same state layout can appear |
+| Health, growth, stamina, hunger, thirst | not decoded, not shown (see "Why the own-player vitals do not transfer") |
 | Heading | not decoded (dot glyph) |
 | Reliable despawn | not validated |
 
 Evidence and method are in section 11 of `docs/trd/other-players-on-minimap.md`.
+
+## Update rate and lag
+
+The own marker follows the client's own outbound move packets (no network hop). Other actors can only be as fresh as the server's replication of them: one-way latency plus the server's send interval for that actor, which Iris decides per actor (priority, relevance, only when state changed). The recorded fixtures carry no packet timestamps, so that rate cannot be measured in seconds from them. What the code controls:
+
+- Every decoded location is written to the store immediately (no buffering, decode cost 0.04..3 ms per packet) and the overlay reads the store every frame (16 ms timer), the same tick that moves the own marker.
+- Between samples the dot is dead-reckoned (`geo.EntitySmoother`, `DR_*`): the target advances along the velocity of the last two distinct samples, for at most one measured interval and never more than 1 s; a position re-sent unchanged, a gap over 3 s, a teleport or an implausible speed (over 60 m/s) switches it off. Position only: it never produces a heading.
+- The smoothing time constant of peers equals the own marker's (0.09 s).
+
+What stays inherent: the first sample after a silence, network latency and the server's send interval.
+
+## Why the own-player vitals do not transfer to other actors
+
+The own decoder never reads an attribute id from the wire. It finds 66-bit slots (float, set flag bit, repeated float) and names them by position: the survival heartbeat (hunger, thirst, hunger repeated), then the last two slots of the same batch (health, stamina), or fixed offsets inside the 1380..1535 bit full frames. It locks onto one handle only after two consistent heartbeats and then checks every value against the maxima it learned. Other actors' batches (16..516 bits) show lone slots or a pair 66 bits apart (handle 80984 at bits 289 and 355: 620.877 and 483.054; handle 61016 at 295 and 361: 470.133 and 541.388), never the heartbeat triple and never a full frame, so no slot position can be named. Values would also need a maximum to become a percentage and none is sent. Nothing is decoded for others: not health, growth, stamina, hunger, thirst, species or name.
 
 ## When identity is sent (why the capture must start before joining)
 

@@ -101,10 +101,10 @@ def test_entity_heading_normalised():
 
 
 # ---- T8 / T9
-def test_labels_unknown_fields_print_question_mark_and_fallbacks():
+def test_labels_omit_unknown_fields_and_fall_back_to_the_id():
     n = visible_entities(items(E("12", 25_000, name="", health_pct=40.0)), 0, 0)[0]
     head, tail = entity_label_lines(n)
-    assert head == "12" and tail == "HP 40% G ? 250 m"  # geo falls back to the id; peers.from_record uses "Player #id"
+    assert head == "12" and tail == "HP 40% 250 m E"  # geo falls back to the id; peers.from_record uses "Player #id"
     assert peer_label_lines(n) == [head, tail]
     detail = peer_label_lines(n, detail=True)
     assert detail[2] == "Health 40%" and len(detail) == 3
@@ -150,3 +150,75 @@ def test_old_settings_file_migrates_feed_radius_and_ignores_unknown_keys(tmp_pat
     assert s.peer_radius_m == 750.0 and s.zoom == 2.0 and not hasattr(s, "peer_source")
     p.write_text(json.dumps({"feed_radius_m": 750, "peer_radius_m": 300}))
     assert Settings.load(p).peer_radius_m == 300.0  # an explicit new value wins
+
+
+# ---- dead reckoning between sparse samples
+def _walk(s, sample_every, seconds=6.0, speed=800.0, frame=0.016, dead_reckon=True, tau=0.09):
+    """Actor walking east at ``speed`` cm/s, reported every ``sample_every`` s; returns the mean lead error (cm)."""
+    t, nxt, err, n = 0.0, 0.0, 0.0, 0
+    while t < seconds:
+        if t >= nxt:
+            s.update([PeerEntity(E("a", speed * t), t)], now=t)
+            nxt += sample_every
+        s.step(frame, t if dead_reckon else None)
+        if t > 2.0:
+            err += abs(speed * t - s.pos["a"][0])
+            n += 1
+        t += frame
+    return err / n
+
+
+def test_dead_reckoning_cuts_the_lag_behind_a_walking_actor():
+    plain = _walk(EntitySmoother(tau_s=0.09), 0.5, dead_reckon=False)
+    dr = _walk(EntitySmoother(tau_s=0.09), 0.5)
+    assert plain > 150.0  # without it the dot sits ~ half a send interval + tau behind (8 m/s walker, 2 Hz samples)
+    assert dr < plain / 3 and dr < 90.0  # what is left is the filter lag tau * speed (~72 cm)
+
+
+def test_dead_reckoning_is_bounded_so_a_stop_is_not_overshot_by_more_than_one_interval():
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
+    s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)  # 800 cm/s, then silence (the actor stopped, nothing more is sent)
+    for i in range(1, 600):
+        s.step(0.016, 0.5 + i * 0.016)
+    assert s.pos["a"][0] == pytest.approx(400.0 + 800.0 * 0.5, abs=1.0)  # horizon = the measured 0.5 s interval
+    assert s.target("a", 1000.0)[0] == pytest.approx(800.0)  # and it never grows after that
+
+
+def test_dead_reckoning_is_off_without_a_clock_for_gaps_teleports_and_a_resend_at_the_same_spot():
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
+    s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)
+    assert s.target("a") == (400.0, 0.0)  # step(dt) without `now` follows the last sample only
+    assert s.target("a", 0.7)[0] == pytest.approx(560.0)
+    s.update([PeerEntity(E("a", 400.0), 0.9)], now=0.9)  # identical position re-sent later: it stands still
+    assert s.target("a", 1.0) == (400.0, 0.0)
+    s.update([PeerEntity(E("a", 500.0), 5.0)], now=5.0)  # 4.1 s gap: not one continuous movement
+    assert s.target("a", 5.2) == (500.0, 0.0)
+    s.update([PeerEntity(E("a", 900_000.0), 5.6)], now=5.6)  # teleport
+    assert s.target("a", 5.8) == (900_000.0, 0.0) and s.pos["a"][0] == 900_000.0
+    s.update([PeerEntity(E("a", 900_000.0 + 400_000.0), 5.7)], now=5.7)  # > max speed: glitch, no velocity
+    assert s.target("a", 5.9)[0] == pytest.approx(1_300_000.0)
+
+
+def test_unchanged_entities_in_a_new_snapshot_keep_their_velocity():
+    s = EntitySmoother(tau_s=0.09)
+    a0, a1 = PeerEntity(E("a", 0.0), 0.0), PeerEntity(E("a", 400.0), 0.5)
+    s.update([a0], now=0.0)
+    s.update([a1], now=0.5)
+    s.update([a1, PeerEntity(E("b", 5.0), 0.6)], now=0.6)  # another actor changed; a was not refreshed
+    assert s.target("a", 0.7)[0] == pytest.approx(560.0)
+
+
+def test_nearby_stale_threshold_follows_the_source():
+    got = visible_entities([(E("a"), 0, 0, 5.0)], 0, 0, ttl_s=30.0, stale_s=8.0)
+    assert [(n.entity.id, n.stale) for n in got] == [("a", False)]
+    got = visible_entities([(E("a"), 0, 0, 9.0)], 0, 0, ttl_s=30.0, stale_s=8.0)
+    assert got[0].stale
+
+
+def test_peer_label_includes_known_vitals_only_in_order():
+    n = visible_entities(items(E("1", 25_000, health_pct=92.4, growth_pct=40.0, z=13_000.0)), 0, 0)[0]
+    assert peer_label_lines(n, my_z=10_000.0) == ["P1", "HP 92% G 40% 250 m E +30m"]
+    n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
+    assert peer_label_lines(n) == ["P1", "G 40% 250 m E"]

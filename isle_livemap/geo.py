@@ -319,6 +319,10 @@ class Interpolator:
 
 PEER_STALE_S = 3.0  # dimmed after this long without an update
 PEER_TTL_S = 5.0  # removed after this long (the only despawn rule; matches labsim NODE_TTL)
+# Real-game peers: Iris replicates DELTAS, so an actor that stands still sends nothing; silence is not absence.
+# Destruction records remove an actor at once; these are only the fallback (judgement call, see docs/PEERS.md).
+GAME_PEER_STALE_S = 8.0
+GAME_PEER_TTL_S = 30.0
 LOCAL_ID = "local"  # id of geo.local_entity(); packet ids never equal it
 
 
@@ -351,10 +355,11 @@ class Nearby:
     distance_m: float
     bearing: float
     age_s: float | None = None  # seconds since the source last reported it (None = not tracked)
+    stale_s: float = PEER_STALE_S  # dimmed from this age on (the source decides, see GAME_PEER_STALE_S)
 
     @property
     def stale(self) -> bool:
-        return self.age_s is not None and self.age_s >= PEER_STALE_S
+        return self.age_s is not None and self.age_s >= self.stale_s
 
 
 # ---- marker styles: the one place colours / sizes / glyphs of map entities live
@@ -477,7 +482,8 @@ def distance_3d_m(n: Nearby, my_z: float | None) -> float:
 
 def visible_entities(items, px: float, py: float, radius_m: float | None = None, show_players: bool = True,
                      show_ai: bool = True, self_ids=(), me_id: str = LOCAL_ID, my_z: float | None = None,
-                     use_3d: bool = False, ttl_s: float | None = PEER_TTL_S) -> list[Nearby]:
+                     use_3d: bool = False, ttl_s: float | None = PEER_TTL_S,
+                     stale_s: float = PEER_STALE_S) -> list[Nearby]:
     """The one selection used by the minimap, the Nearby panel and nearby.py.
 
     ``items``: iterable of (Entity, x, y) or (Entity, x, y, age_s) from (px, py). Drops the
@@ -496,7 +502,7 @@ def visible_entities(items, px: float, py: float, radius_m: float | None = None,
             continue
         if age is not None and ttl_s is not None and age >= ttl_s:
             continue
-        n = Nearby(e, x, y, distance_m(px, py, x, y), bearing_deg(px, py, x, y), age)
+        n = Nearby(e, x, y, distance_m(px, py, x, y), bearing_deg(px, py, x, y), age, stale_s)
         d = distance_3d_m(n, my_z) if use_3d else n.distance_m
         if radius_m is not None and (d >= radius_m if use_3d else d > radius_m):
             continue
@@ -513,10 +519,20 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
 
 
 def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None) -> tuple[str, str]:
+    """(head, tail) of the minimap label. Only what is known is printed: name (or id) and species on the head;
+    the tail holds the known vitals ("HP 92%", "G 40%"), then distance, compass bearing and height difference.
+    Unknown fields are omitted, never shown as a placeholder."""
     e, dz = n.entity, height_delta_m(n, my_z)
     head = truncate(e.name or e.id, name_max) + (f" ({truncate(e.species, 14)})" if e.species else "")
-    tail = f"HP {_pct(e.health_pct)} G {_pct(e.growth_pct)} {format_distance(n.distance_m)}"
-    return head, tail if dz is None else f"{tail} {dz:+.0f}m"
+    parts = []
+    if e.health_pct is not None:
+        parts.append(f"HP {e.health_pct:.0f}%")
+    if e.growth_pct is not None:
+        parts.append(f"G {e.growth_pct:.0f}%")
+    parts += [format_distance(n.distance_m), compass_label(n.bearing)]
+    if dz is not None:
+        parts.append(f"{dz:+.0f}m")
+    return head, " ".join(parts)
 
 
 def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False) -> list[str]:
@@ -545,7 +561,8 @@ def entity_summary(n: Nearby, my_z: float | None = None) -> str:
             extra += f" {tag} {v:.0f}%"
     if e.z is not None and my_z is not None:
         extra += f" dZ {(e.z - my_z) / 100.0:+.0f}m"
-    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}  HP {_pct(e.health_pct)}  G {_pct(e.growth_pct)}{extra}  "
+    known = "".join(f"  {tag} {v:.0f}%" for tag, v in (("HP", e.health_pct), ("G", e.growth_pct)) if v is not None)
+    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}{known}{extra}  "
             f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°)")
 
 
@@ -574,14 +591,25 @@ def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bo
     return None
 
 
+# Dead reckoning for peers. The server only sends a position now and then (Iris replicates changes), so a dot that
+# waits for the next sample trails reality by up to one send interval. Between samples the target is advanced along
+# the velocity of the last two distinct samples, never further than the interval it was measured over (the next
+# sample is due then) and never beyond DR_MAX_EXTRAP_S, so a stop is overshot by less than one interval of motion.
+DR_MIN_DT_S = 0.05  # samples closer than this give a noisy velocity; the old velocity is kept
+DR_MAX_INTERVAL_S = 3.0  # samples further apart are not one continuous movement: no velocity
+DR_MAX_EXTRAP_S = 1.0
+DR_MAX_SPEED = 6_000.0  # cm/s (60 m/s); faster is a glitch or a respawn, not movement
+
+
 class EntitySmoother:
-    """Per-entity exponential smoothing between source updates (like Interpolator).
+    """Per-entity exponential smoothing between source updates (like Interpolator), plus dead reckoning.
 
     ``update(entities)`` (no ``now``) keeps the old contract: ids missing from an update vanish
     at once. ``update(entities, now)`` tracks ``last_seen`` and keeps a missing id until
     ``ttl_s`` has passed, so one missed packet does not flicker. Entries may be ``Entity`` or
     anything with ``.entity`` / ``.last_seen`` (``peers.PeerEntity``). Heading is smoothed along
-    the shortest arc when the source supplies one."""
+    the shortest arc when the source supplies one. ``step(dt, now)`` with ``now`` also advances each
+    target along its measured velocity (see ``DR_*``); ``step(dt)`` alone follows the last sample."""
 
     def __init__(self, tau_s: float = 0.15, snap_distance_units: float = 200_000.0, ttl_s: float = PEER_TTL_S) -> None:
         self.tau, self.snap, self.ttl = tau_s, snap_distance_units, ttl_s
@@ -589,6 +617,26 @@ class EntitySmoother:
         self.pos: dict[str, list[float]] = {}
         self.heading: dict[str, float] = {}
         self.last_seen: dict[str, float] = {}
+        self._sample: dict[str, tuple[float, float, float]] = {}  # newest distinct (x, y, time)
+        self._vel: dict[str, tuple[float, float, float]] = {}  # (vx, vy in cm/s, extrapolation horizon s)
+
+    def _note_sample(self, eid: str, e: Entity, t: float, refreshed: bool) -> None:
+        s = self._sample.get(eid)
+        if s is None or math.hypot(e.x - s[0], e.y - s[1]) > self.snap:
+            self._sample[eid] = (e.x, e.y, t)  # first sight or teleport: nothing to measure against
+            self._vel.pop(eid, None)
+        elif (e.x, e.y) == (s[0], s[1]):
+            if refreshed and t - s[2] >= DR_MIN_DT_S:
+                self._vel.pop(eid, None)  # re-sent at the same spot: it has stopped
+        else:
+            dt = t - s[2]
+            if dt >= DR_MIN_DT_S:
+                vx, vy = (e.x - s[0]) / dt, (e.y - s[1]) / dt
+                if dt <= DR_MAX_INTERVAL_S and math.hypot(vx, vy) <= DR_MAX_SPEED:
+                    self._vel[eid] = (vx, vy, min(dt, DR_MAX_EXTRAP_S))
+                else:
+                    self._vel.pop(eid, None)
+            self._sample[eid] = (e.x, e.y, t)
 
     def update(self, entities, now: float | None = None) -> None:
         new: dict[str, Entity] = {}
@@ -604,6 +652,7 @@ class EntitySmoother:
                 self.pos[eid] = [e.x, e.y]
                 if e.heading is not None:
                     self.heading[eid] = e.heading
+            self._note_sample(eid, e, seen[eid], seen[eid] > self.last_seen.get(eid, -math.inf))
             if e.heading is None:
                 self.heading.pop(eid, None)
             elif eid not in self.heading:
@@ -618,14 +667,27 @@ class EntitySmoother:
             self.heading.pop(eid, None)
             self.last_seen.pop(eid, None)
             self.entities.pop(eid, None)
+            self._sample.pop(eid, None)
+            self._vel.pop(eid, None)
         self.entities = {**{i: e for i, e in self.entities.items() if i in self.pos}, **new}
 
-    def step(self, dt: float) -> None:
+    def target(self, eid: str, now: float | None = None) -> tuple[float, float]:
+        """Where the entity is expected to be at ``now``: its last sample, advanced along its velocity."""
+        e = self.entities[eid]
+        v = self._vel.get(eid)
+        s = self._sample.get(eid)
+        if now is None or v is None or s is None:
+            return e.x, e.y
+        ahead = min(max(now - s[2], 0.0), v[2])
+        return e.x + v[0] * ahead, e.y + v[1] * ahead
+
+    def step(self, dt: float, now: float | None = None) -> None:
         a = 1.0 - math.exp(-max(dt, 0.0) / self.tau) if self.tau > 0 else 1.0
         for eid, e in self.entities.items():
             p = self.pos[eid]
-            p[0] += (e.x - p[0]) * a
-            p[1] += (e.y - p[1]) * a
+            tx, ty = self.target(eid, now)
+            p[0] += (tx - p[0]) * a
+            p[1] += (ty - p[1]) * a
             h = self.heading.get(eid)
             if h is not None and e.heading is not None:
                 self.heading[eid] = (h + shortest_arc(h, e.heading) * a) % 360.0

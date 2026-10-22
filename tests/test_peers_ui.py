@@ -275,3 +275,16 @@ def test_500_entities_selection_and_paint_budget(tmp_path):
     p.end()
     print(f"entity layer: logic {logic_ms:.2f} ms, paint {paint_ms:.2f} ms")
     assert paint_ms < 4.0, f"paint {paint_ms:.2f} ms"
+
+
+def test_overlay_uses_the_sources_own_stale_and_ttl(tmp_path):
+    class Slow(FakePeers):
+        stale_s, ttl_s = 8.0, 30.0
+
+    view = make_view(tmp_path)
+    view.peers = Slow([peer(view, 1, 100, 0, age=6.0), peer(view, 2, -100, 0, age=9.0)])
+    tick_twice(view)
+    got = {n.entity.id: n for n in view.nearby()}
+    assert not got["1"].stale and got["2"].stale  # 6 s old is fresh for this source (3 s for the lab feed)
+    assert "2" in {n.entity.id for n in view.nearby(now=time.monotonic() + 15.0)}  # still there 24 s after its last update
+    assert "2" not in {n.entity.id for n in view.nearby(now=time.monotonic() + 25.0)}  # 34 s: past 30 s

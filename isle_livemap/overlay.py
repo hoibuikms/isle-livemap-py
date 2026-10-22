@@ -14,7 +14,7 @@ from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
-    place_label, vital_lines, visible_entities,
+    PEER_STALE_S, PEER_TTL_S, place_label, vital_lines, visible_entities,
 )
 from .peers import status_is_warning
 from .tracking import Vitals
@@ -41,7 +41,8 @@ class MapView(QWidget):
         super().__init__()
         self.pipeline, self.store, self.settings = pipeline, store, settings
         self.peers = peers  # a peers.PeerSource or None; the only source of other players
-        self.ents = EntitySmoother()
+        self.ents = EntitySmoother(tau_s=Interpolator().tau)  # same time constant as the own marker
+        self._stale_s = PEER_STALE_S
         self._peers_snap = None
         self._peers_version = -1
         self.peer_status = ""
@@ -120,13 +121,16 @@ class MapView(QWidget):
         if self.peers is not None:
             snap = self.peers.snapshot()
             self.peer_status = snap.status if snap.enabled else ""
+            # the source decides how long silence is tolerated (game: deltas only, so idle actors go quiet)
+            self.ents.ttl = getattr(self.peers, "ttl_s", PEER_TTL_S)
+            self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
             # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
             if snap is not self._peers_snap or snap.version != self._peers_version:
                 self._peers_snap, self._peers_version = snap, snap.version
                 self.ents.update(snap.entities, now)
         else:
             self.peer_status = ""
-        self.ents.step(dt)
+        self.ents.step(dt, now)
         self.update()
 
     def nearby(self, radius_m: float | None = ..., now: float | None = None) -> list[Nearby]:
@@ -139,7 +143,8 @@ class MapView(QWidget):
             radius_m = self.settings.peer_radius_m
         now = time.monotonic() if now is None else now
         return visible_entities(self.ents.items_aged(now), self.interp.x, self.interp.y, radius_m,
-                                self.settings.show_players, self.settings.show_ai, self.settings.peer_self_ids)
+                                self.settings.show_players, self.settings.show_ai, self.settings.peer_self_ids,
+                                ttl_s=self.ents.ttl, stale_s=self._stale_s)
 
     def view(self) -> tuple[float, float, float]:
         """(centre_left, centre_top, view width as a fraction of the map)."""

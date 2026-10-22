@@ -34,7 +34,7 @@ def test_labels_and_truncation():
     n = nearby_entities([(E("a", "player", 25_000, name="X" * 40, species="Tyrannosaurus", health_pct=92.4), 25_000, 0)], 0, 0)[0]
     head, tail = entity_label_lines(n)
     assert len(head.split(" (")[0]) <= 16 and head.endswith("(Tyrannosaurus)") and "…" in head
-    assert tail == "HP 92% G ? 250 m"
+    assert tail == "HP 92% 250 m E"  # growth unknown: omitted, no placeholder
     assert "250 m E" in entity_summary(n)
     assert truncate("abcdef", 4) == "abc…" and truncate("ab", 4) == "ab"
 

@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Protocol
 
-from .geo import PEER_STALE_S, PEER_TTL_S, Entity, canonical_id, is_self, vital_pct
+from .geo import GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, canonical_id, is_self, vital_pct
 from .nearby import _cm
 
 __all__ = [
@@ -342,18 +342,25 @@ class GamePeerSource:
         FVector_NetQuantize100 / cm units as the own movement decoder, so ``geo`` treats them alike).
       * A peer is keyed by its handle. The own handle is excluded as soon as the heartbeat lock gives it;
         a provisional peer with that handle is purged retroactively (``PeerStore.set_owned_self_ids``).
-      * The envelope's destruction records remove a tracked handle immediately; TTL (dim 3 s / remove
-        5 s) remains the fallback.
+      * The envelope's destruction records remove a tracked handle immediately. Iris replicates changes
+        only, so an actor that stands still goes quiet: the fallback is therefore generous (dim after
+        ``STALE_S`` = 8 s, remove after ``TTL_S`` = 30 s without any location), not the 3 s / 5 s of the lab feed.
+      * Every decoded location is written to the store at once (no buffering); the overlay smooths and
+        dead-reckons between samples (``geo.EntitySmoother``).
 
-    Decoded: handle, x/y/z. NOT decoded (stay None, render as ``?``): name (shown as ``Actor #<handle>``),
+    Decoded: handle, x/y/z. NOT decoded (left None and simply not printed): name (shown as ``Actor #<handle>``),
     species/kind (every actor is shown as ``player``, but the class is unknown, so AI/animals with the
     same state layout may appear), heading, growth, health, stamina, hunger, thirst."""
+
+    STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim) and the smoother (TTL)
+    TTL_S = GAME_PEER_TTL_S
+    stale_s, ttl_s = STALE_S, TTL_S
 
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
 
     def __init__(self, self_ids: Iterable[str] = (), pipeline=None, clock: Callable[[], float] = time.monotonic) -> None:
         self._config_self = tuple(canonical_id(i) for i in self_ids)
-        self.store = PeerStore(clock=clock, self_ids=self._config_self)
+        self.store = PeerStore(ttl=self.TTL_S, clock=clock, self_ids=self._config_self)
         self.pipeline = pipeline
         self.own_handle: int | None = None
         self.packets = 0  # inbound datagrams seen
@@ -426,7 +433,7 @@ class GamePeerSource:
         if n == 0:
             return f"game: waiting for actor locations ({self.packets} pkts, {own})"
         seen = f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}"
-        return f"game: {n} actors ({seen}; position only, name/class/vitals not decoded; {own})"
+        return f"game: {n} actors ({seen}; position only; name, class and vitals not available; {own})"
 
     def snapshot(self) -> PeerSnapshot:
         return self.store.snapshot(self.status(), True)

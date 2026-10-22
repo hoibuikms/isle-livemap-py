@@ -93,7 +93,7 @@ Source and data model:
 
 Field handling and graceful degradation:
 - REQ-007: Fields are filled only when the source provides them. Lab/real-source defaults: kind = `player`; species = `""`; growth/stamina/hunger/thirst = `None`; heading = `None`; name = decoded UTF-8 (NULs stripped, invalid bytes replaced) or `""`.
-- REQ-008: Vitals SHALL use only `geo.vital_pct` / `vital_lines` / `entity_label_lines`. The lab health int maps to `vital_pct(health, 100.0)` (same as `from_lab`); values outside 0..100 clamp via `vital_pct`. Missing vitals render as `?` (labels) and are omitted (`vital_lines`). The minimap SHALL NOT invent growth, species or other missing values.
+- REQ-008: Vitals SHALL use only `geo.vital_pct` / `vital_lines` / `entity_label_lines`. The lab health int maps to `vital_pct(health, 100.0)` (same as `from_lab`); values outside 0..100 clamp via `vital_pct`. Missing vitals are omitted everywhere on the minimap (labels and `vital_lines`); only the Nearby table prints `-`/`?` because its columns need a cell (rev 7). The minimap SHALL NOT invent growth, species or other missing values.
 - REQ-009: Name fallback: empty name shows the id (`Player #<id>`), via the existing `e.name or e.id` rule. Label never blanks.
 - REQ-010: Heading: `geo.Entity` SHALL gain `heading: float | None = None` (last field, normalised with `decode.normalize_degrees`). Packet sources in v1 supply `None`, so other players draw as a dot (REQ-014). Optional client-side heading from successive positions is NOT in v1 (Q4).
 
@@ -102,12 +102,12 @@ Self-exclusion:
 - REQ-012: The existing `geo.nearby_3d` `id != me.id` filter SHALL be extended to also drop ids in the self-id set, so the Nearby panel, the map and `nearby.py` all agree.
 
 Staleness and despawn:
-- REQ-013: Each peer carries `last_seen`. Age = now - last_seen. Dimmed after `PEER_STALE_S` = 3 s; removed after `PEER_TTL_S` = 5 s (matches `telemetry.NODE_TTL` and `net_diag.NODE_TTL`). The packet sources provide no explicit despawn message, so TTL is the only despawn rule (Iris destruction records are skipped by the current parser; reading them is a possible later improvement, Q6). The old 6 s grace from rev 1 is dropped. A missed packet within TTL does not flicker (REQ-016).
+- REQ-013: Each peer carries `last_seen`. Age = now - last_seen. Dimmed after `PEER_STALE_S` = 3 s; removed after `PEER_TTL_S` = 5 s (matches `telemetry.NODE_TTL` and `net_diag.NODE_TTL`). The packet sources provide no explicit despawn message, so TTL is the only despawn rule (Iris destruction records are skipped by the current parser; reading them is a possible later improvement, Q6). The old 6 s grace from rev 1 is dropped. A missed packet within TTL does not flicker (REQ-016). Rev 7: these 3 s / 5 s apply to lab/synthetic peers. The source supplies its own `stale_s` / `ttl_s`; the game source uses 8 s / 30 s (`GAME_PEER_STALE_S`, `GAME_PEER_TTL_S`) because Iris sends changes only, so an idle actor is silent, and destruction records already despawn immediately.
 
 Rendering:
 - REQ-014: Player with heading -> rotated arrow; without heading -> dot. Distinct from the local player: different colour, smaller, outlined; local arrow stays on top. One `ENTITY_STYLE` table replaces scattered constants.
-- REQ-015: Minimap label = name (species when present) + compact line `HP x% G y% dist [dZ]` through `entity_label_lines`; an optional detail line (`show_vitals_detail`) uses `vital_lines`. Missing fields print `?`.
-- REQ-016: `EntitySmoother` SHALL smooth x/y (and heading when present, `shortest_arc`), keep each id until its TTL (not drop on first miss), and snap on teleports > 200 000 units.
+- REQ-015: Minimap label = name (species when present) + compact line through `entity_label_lines`: known vitals (`HP x%`, `G y%`), distance, compass bearing, then `[dZ]`. Unknown fields are omitted, never printed as `?` (rev 7); a game peer therefore reads `Actor #<handle>` / `757 m N +116m`. An optional detail line (`show_vitals_detail`) uses `vital_lines`.
+- REQ-016: `EntitySmoother` SHALL smooth x/y (and heading when present, `shortest_arc`), keep each id until its TTL (not drop on first miss), and snap on teleports > 200 000 units. Rev 7: with a clock (`step(dt, now)`) it also dead-reckons x/y along the velocity of the last two distinct samples (at most one measured interval, at most 1 s; off for a gap > 3 s, an unchanged re-send, a teleport or > 60 m/s). It never derives a heading.
 - REQ-017: A player inside the radar radius but outside the view gets an edge indicator on the circle; beyond the radius nothing is drawn.
 - REQ-018: Crowding rules unchanged: above 20 visible only the nearest 4 labelled; dots always drawn far to near. `show_players` applies before label placement. `show_ai` is inert for packet sources (no AI kind is available) and SHALL be hidden or disabled in the UI (Q5).
 - REQ-019: Rendering SHALL tolerate: no source, source disabled/unavailable (e.g. no Npcap, no scapy, port taken), empty, all-stale; and SHALL draw no peers when the local player has no fix.
@@ -171,14 +171,14 @@ Touched only by the real-game backend (TRD-050/051): `capture.py`, `decode.py`, 
 |---|---|---|---|
 | Glyph | Red arrow 10 px, interpolated heading | Cyan dot (arrow only if a source supplies heading), outlined | v1 lab/real sources give no heading |
 | Z-order | Top | Below self, far to near | |
-| Label | HUD box bottom-left | Name or `Player #id`, species only if known, `HP x% G ? dist [dZ]` | G shows `?` |
+| Label | HUD box bottom-left | Name or `Player #id`, species only if known, `[HP x%] [G y%] dist bearing [dZ]` | unknown parts are omitted |
 | Vitals | Full (`vital_lines`) | Health only from lab; full set only if a real decoder supplies it | |
-| Stale | n/a | Dim at 3 s, removed at 5 s | |
+| Stale | n/a | Lab: dim 3 s, removed 5 s. Game: dim 8 s, removed 30 s or on a destruction record | |
 
 ### 4.6 Key decisions
 1. One neutral peer interface; the lab backend is the dev/test reference and the real game is an opt-in owner-only backend, so the pipeline can be built and verified before the decoder is proven.
 2. Lab backend is the verifiable reference: it exercises the real overlay path with true packet bytes, not a fake dict.
-3. No guessing: absent fields stay `None` and render as `?` or fallback glyphs.
+3. No guessing: absent fields stay `None` and are not printed (fallback glyphs only for the marker).
 4. TTL (5 s) is the single despawn rule, aligned with existing lab constants.
 5. Identity-based self exclusion only.
 
@@ -192,12 +192,12 @@ Touched only by the real-game backend (TRD-050/051): `capture.py`, `decode.py`, 
 | Invalid UTF-8 / NUL-padded name | Replaced / stripped; empty name falls back to `Player #id` (REQ-009). |
 | NaN/inf or implausible coordinates (wrong endianness or layout) | Record dropped and counted; no entity created. |
 | Health outside 0..100 or negative | Clamped by `vital_pct`; shown as a percentage, never crashes. |
-| Name or health absent (real game, if not decodable) | `Player #id`, `HP ?`. |
+| Name or health absent (real game, if not decodable) | `Actor #id` (lab: `Player #id`) with distance, bearing, dZ; no `HP ?`. |
 | No heading (all v1 sources) | Dot marker; no arrow, no inferred direction. |
 | Self id appears in packets | Dropped at the source (REQ-011). Same coordinates, different id: shown. |
 | Own handle learned late (real game) | Provisional peer is purged once own handle locks. |
 | Same id, packet burst | Latest wins; `version` increments once per snapshot change. |
-| Peer silent 3 to 5 s | Dimmed, then removed at 5 s (REQ-013); reappearing id resets age without a position jump. |
+| Peer silent | Lab: dimmed at 3 s, removed at 5 s. Game: dimmed at 8 s, removed at 30 s or by a destruction record (REQ-013); reappearing id resets age without a position jump. |
 | Teleport > 200 000 units | Smoother snaps. |
 | Out of radius / in radius but out of view | Not drawn / edge indicator (REQ-017). |
 | No local fix | No peers or edge indicators; "Waiting for game..." stays. |
@@ -340,3 +340,10 @@ Implementation (TRD-051): `decode.py` (additive: `destroyed_handles`, `ActorLoca
 - `tests/test_e2e_peers.py` replays a pcap built from the recorded payloads through `__main__.main` (offscreen) and inspects rendered pixels. Own handle 103940 locks, the five actors 752..838 m NNW of the recorded own fix are drawn as dots at their projected positions, edge pointers appear when they are off view, lab and synthetic paths use the same axes.
 - Frame: land/sea test on the bundled map: 43/53 decoded positions on land as-is, 5/53 with x mirrored, 23/53 with both axes mirrored. Mirroring only y (37/53) is not excluded. The recorded own fix and the inbound packets are not proven to come from one session.
 - Player vs other actors: not distinguishable. All 55 location batches are 155/158 bits with one header; the 53 handles span 69776..208258 and interleave with the own pawn's handle range (103940); the own pawn has no such batch (433/1491-bit batches only). Actors are spread up to ~8 km from the recorded own fix, so the 1000 m default radius shows only a few.
+
+
+## 12. Rev 7 (live feedback: laggy dots, `?` placeholders, vitals/species parity)
+
+- Lag: decode and store writes are immediate (0.04..3 ms per packet); the repaint runs at 16 ms in the same tick as the own marker. The lag came from (a) dots only moving after the next sample with a slower filter than the own marker (0.15 s vs 0.09 s), (b) idle actors, which Iris does not re-send, being dimmed at 3 s and deleted at 5 s. Fixed with dead reckoning, the same tau and 8 s / 30 s game timeouts (REQ-013, REQ-016). The server's own send interval and network latency remain. Fixtures hold no packet timestamps, so that interval is not measured.
+- Labels: no `?` placeholders on the minimap (REQ-008, REQ-015).
+- Parity with the own player: not possible. Own slots are named by position inside batches that carry the hunger/thirst heartbeat or a full frame; other actors' 364..516 bit batches hold lone slots with no heartbeat and no maxima, and no creation/export data exists in any fixture, so species and name are unavailable. Nothing was implemented for this; see `docs/PEERS.md`.

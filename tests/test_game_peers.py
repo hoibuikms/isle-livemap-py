@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 
 import pytest
 
@@ -16,7 +17,7 @@ from isle_livemap.decode import (
     ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, Bits, IrisBatch, PacketCounts, batch_kind,
     count_batches, decode_actor_location, decode_actor_locations, parse_iris_packet,
 )
-from isle_livemap.geo import peer_label_lines, visible_entities
+from isle_livemap.geo import GAME_PEER_STALE_S, GAME_PEER_TTL_S, peer_label_lines, visible_entities
 from isle_livemap.peers import GamePeerSource, create_peer_source
 from isle_livemap.replay import CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT, BitWriter, _needed, encode_move_payload
 
@@ -135,14 +136,18 @@ def test_peers_come_from_inbound_batches_with_unknown_fields_none(b64):
     assert (e.kind, e.name, e.species) == ("player", "Actor #93362", "")
     assert (e.x, e.y, e.z) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88))
     assert (e.health_pct, e.growth_pct, e.stamina_pct, e.hunger_pct, e.thirst_pct, e.heading) == (None,) * 6
-    assert "position only" in snap.status and "not decoded" in snap.status and not peers.status_is_warning(snap.status)
+    assert "position only" in snap.status and "not available" in snap.status and not peers.status_is_warning(snap.status)
 
 
-def test_labels_show_question_marks_for_undecoded_vitals(b64):
+def test_game_labels_have_no_placeholders_only_id_distance_bearing_and_height(b64):
     g, _ = make()
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     near = visible_entities([(p.entity, p.entity.x, p.entity.y) for p in g.snapshot().entities], 200_000.0, -250_000.0, 5_000.0)
-    assert near and "HP ? G ?" in peer_label_lines(near[0])[1]
+    assert near
+    head, tail, *rest = peer_label_lines(near[0], my_z=30_000.0)
+    assert head == f"Actor #{near[0].entity.id}" and not rest
+    assert "?" not in head + tail and "HP" not in tail and "G " not in tail
+    assert re.fullmatch(r"\d+ m (N|NE|E|SE|S|SW|W|NW) [+-]\d+m", tail), tail
 
 
 def test_provisional_peer_is_purged_when_own_handle_locks(b64):
@@ -177,12 +182,17 @@ def test_destruction_record_removes_a_tracked_peer_only(b64):
 
 
 def test_silent_peer_expires_after_ttl(b64):
+    # Iris sends changes only, so an idle actor is silent: game peers are dimmed late and kept long (destruction
+    # records remove them at once), unlike the 3 s / 5 s of the lab feed.
     g, clk = make()
+    assert (g.stale_s, g.ttl_s) == (GAME_PEER_STALE_S, GAME_PEER_TTL_S) and g.ttl_s > peers.PEER_TTL_S
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
-    clk.t += peers.PEER_STALE_S + 0.1
+    clk.t += peers.PEER_TTL_S + 1.0  # past the lab TTL: a stationary game actor is still there
     sn = g.snapshot()
-    assert sn.entities and all(clk.t - p.last_seen >= peers.PEER_STALE_S for p in sn.entities)  # overlay dims these
-    clk.t += peers.PEER_TTL_S
+    assert len(sn.entities) == 15 and all(clk.t - p.last_seen < g.stale_s for p in sn.entities)  # not even dimmed yet
+    clk.t += g.stale_s
+    assert len(g.snapshot().entities) == 15 and all(clk.t - p.last_seen >= g.stale_s for p in g.snapshot().entities)
+    clk.t += g.ttl_s
     assert g.snapshot().entities == ()
 
 
