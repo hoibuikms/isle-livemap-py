@@ -1,5 +1,6 @@
 """Entity maths: distance/bearing, radius filtering, sorting, labels, smoothing, settings."""
 
+import json
 import math
 
 from isle_livemap.geo import (
@@ -69,15 +70,17 @@ def test_smoother_interpolates_snaps_and_drops():
 
 def test_settings_roundtrip_and_normalise(tmp_path):
     p = tmp_path / "s.json"
-    s = Settings(feed_url=" https://h/f ", feed_token="tok", feed_radius_m=2500, feed_interval_s=2, show_ai=False)
+    s = Settings(peer_source="lab", peer_radius_m=2500, peer_self_ids=["7", "7", "3"], show_ai=False)
     s.save(p)
     back = Settings.load(p)
-    assert (back.feed_url, back.feed_token, back.feed_radius_m, back.feed_interval_s) == ("https://h/f", "tok", 2500, 2)
+    assert (back.peer_source, back.peer_radius_m, back.peer_self_ids) == ("lab", 2500, ["3", "7"])
     assert back.show_players and not back.show_ai
-    bad = Settings(feed_radius_m="x", feed_interval_s=0.0001).normalise()
-    assert bad.feed_radius_m == 1000.0 and bad.feed_interval_s == 0.25
-    assert Settings(feed_radius_m=1e9).normalise().feed_radius_m == 20_000
-    assert Settings().feed_radius_m == 1000.0 and Settings().feed_url == ""
+    bad = Settings(peer_radius_m="x", peer_source="bogus").normalise()
+    assert bad.peer_radius_m == 1000.0 and bad.peer_source == "off"
+    assert Settings(peer_radius_m=1e9).normalise().peer_radius_m == 20_000
+    assert Settings(peer_radius_m=1).normalise().peer_radius_m == 50
+    assert Settings().peer_radius_m == 1000.0 and Settings().peer_source == "off"
+    assert not any(k.startswith("feed_") for k in json.loads(p.read_text()))  # no legacy keys are written
 
 
 def test_summary_shows_vitals_and_height_delta():
@@ -116,9 +119,20 @@ def test_local_player_shares_entity_path():
     assert (me.x, me.y, me.z, me.growth_pct, me.health_pct, me.stamina_pct) == (1000.0, -2000.0, 5000.0, 50.0, 25.0, 100.0)
     assert me.hunger_pct is None and me.thirst_pct is None
     assert vital_lines(me) == ["Growth 50%", "Health 25%", "Stamina 100%"]
-    # a feed entity with the same values renders identically
+    # a peer entity with the same values renders identically
     twin = E("t", "player", 1000.0, name="You", species="Rex", growth_pct=50.0, health_pct=25.0, stamina_pct=100.0)
     assert vital_lines(twin) == vital_lines(me)
     n = nearby_entities([(twin, 1000.0, 0)], 0, 0)[0]
     assert entity_row(n)[2:7] == ("25%", "50%", "100%", "?", "?")
     assert local_entity(None, None).health_pct is None and vital_lines(local_entity(None, None)) == []
+
+
+def test_peer_vitals_use_the_same_decoder_as_the_local_player():
+    from types import SimpleNamespace as NS
+    from isle_livemap.geo import local_entity, vital_pct
+    from isle_livemap.tracking import Vitals
+    me = local_entity(NS(x=0.0, y=0.0, z=0.0), Vitals(health=37.0, max_health=100.0, growth=0.5))
+    peer = E("a", "player", health_pct=vital_pct(37.0, 100.0), growth_pct=vital_pct(0.5, 1.0))
+    assert (peer.health_pct, peer.growth_pct) == (me.health_pct, me.growth_pct) == (37.0, 50.0)
+    assert vital_pct(-5, 100.0) == 0.0 and vital_pct(500, 100.0) == 100.0  # clamped
+    assert vital_pct(None, 100.0) is None

@@ -255,7 +255,7 @@ class LabPeerSource:
 
 # ----------------------------------------------------------------- backend S: synthetic (--replay)
 class SyntheticPeers:
-    """Moving peers around ``anchor()`` -> (x, y) | None, in geo centimetres. Replaces DemoFeed.
+    """Moving peers around ``anchor()`` -> (x, y) | None, in geo centimetres.
 
     Includes an entry with the self id (``LAB_PLAYER_ID``) that the store must drop, one nameless
     peer (-> ``Player #id``), one with only a position, one that goes silent periodically (dims at

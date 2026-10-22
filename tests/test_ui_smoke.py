@@ -9,7 +9,7 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
-def test_overlay_renders_with_synthetic_feed(tmp_path):
+def test_overlay_renders_with_synthetic_stream(tmp_path):
     from PySide6.QtWidgets import QApplication
 
     from isle_livemap.capture import TelemetryPipeline

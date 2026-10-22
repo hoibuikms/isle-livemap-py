@@ -231,29 +231,19 @@ class Settings:
     window_x: int | None = None
     window_y: int | None = None
     iface: str = ""  # last --iface used for live capture
-    # DEPRECATED feed fields: nothing in the app reads them any more. They stay only
-    # because feed.py / test_feed.py still use them; removed together with feed.py (TRD-070).
-    feed_url: str = ""
-    feed_token: str = ""
-    feed_radius_m: float = 1000.0  # migrated to peer_radius_m on load
-    feed_interval_s: float = 0.5
     # other players (packet-sourced, see peers.py)
     peer_source: str = "off"  # "off" | "lab" | "game"; never "game" by default (owner-only opt-in)
     peer_radius_m: float = 1000.0
     peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client)
     show_vitals_detail: bool = False
     show_players: bool = True
-    show_ai: bool = True  # inert for packet sources (they never report an AI kind); kept for old feed data
+    show_ai: bool = True  # inert for packet sources (they never report an AI kind)
 
     def normalise(self) -> "Settings":
         self.size_percent = clamp_size_percent(self.size_percent)
         self.zoom = min(max(float(self.zoom), 0.5), 16.0)
         radii = [r for r in self.ring_radii_m if isinstance(r, (int, float)) and r > 0]
         self.ring_radii_m = radii[:6] or list(DEFAULT_RING_RADII_M)
-        self.feed_url = str(self.feed_url or "").strip()
-        self.feed_token = str(self.feed_token or "").strip()
-        self.feed_radius_m = _clamp_num(self.feed_radius_m, 50.0, 20_000.0, 1000.0)
-        self.feed_interval_s = _clamp_num(self.feed_interval_s, 0.25, 30.0, 0.5)
         self.peer_source = self.peer_source if self.peer_source in PEER_SOURCES else "off"
         self.peer_radius_m = _clamp_num(self.peer_radius_m, 50.0, 20_000.0, 1000.0)
         ids = self.peer_self_ids if isinstance(self.peer_self_ids, (list, tuple, set)) else []
@@ -268,7 +258,7 @@ class Settings:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
-            if "peer_radius_m" not in known and "feed_radius_m" in raw:  # settings written before peers existed
+            if "peer_radius_m" not in known and "feed_radius_m" in raw:  # legacy key from before peers existed (migration only)
                 known["peer_radius_m"] = raw["feed_radius_m"]
             return cls(**known).normalise()
         except (OSError, ValueError, TypeError, AttributeError):
@@ -456,7 +446,7 @@ def vital_pct(cur: float | None, mx: float | None) -> float | None:
 
 def local_entity(pos, vitals, species: str = "") -> Entity:
     """The local player as an Entity (``pos``: MovementCandidate | None, ``vitals``:
-    Vitals | None) so it shares the formatting path of feed entities: same cm units
+    Vitals | None) so it shares the formatting path of other players: same cm units
     and axes, vitals as 0-100 percentages."""
     from .tracking import Vitals
 
@@ -472,7 +462,7 @@ def local_entity(pos, vitals, species: str = "") -> Entity:
 
 
 def vital_lines(e: Entity) -> list[str]:
-    """"Label NN%" for every vital known for the entity (local player and feed alike)."""
+    """"Label NN%" for every vital known for the entity (local player and peers alike)."""
     return [f"{label} {v:.0f}%" for label, attr in VITAL_FIELDS if (v := getattr(e, attr)) is not None]
 
 

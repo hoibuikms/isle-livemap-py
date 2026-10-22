@@ -1,6 +1,6 @@
 # TRD: Show Other Players on the Minimap (parity with the Local Player), packet-sourced
 
-- Status: DRAFT rev 4, awaiting approval (no code has been written)
+- Status: rev 5, implemented; remaining open items are blocked on a new game capture (see section 10)
 - Date: 2026-10-22
 - Repo: isle-livemap-py, branch `main`
 - Revision note: rev 1 sourced other players from the server feed URL. New constraint: NO feed URL. Other players must come from the same local data path as the local player and the nearby radar. Every feed dependency is removed or marked DEPRECATED (section 9).
@@ -235,38 +235,40 @@ Run: `QT_QPA_PLATFORM=offscreen pytest -q`. Gate: suite green, new `geo.py`/`pee
 Hours. Dependencies in brackets. Critical path: TRD-001, 010, 011, 020, 030, 031, 040, 060, 070, 080.
 
 Phase 0, decisions
-- □ TRD-001 Resolve Q3 (record format); Q2 was resolved in rev 4; Q1 is answered by TRD-050 (1h)
+- ✓ TRD-001 Resolve Q3 (record format); Q2 was resolved in rev 4; Q1 is answered by TRD-050 (1h)
 
 Phase 1, peer source (parallel with Phase 2 after TRD-001)
-- □ TRD-010 `peers.py`: `PeerEntity`, `PeerSnapshot`, `PeerStore` (TTL, version, self-id drop) (3h) [TRD-001]
-- □ TRD-011 `from_record` + `LabPeerSource` over `PayloadSniffer` (socket), status text (3h) [TRD-010]
-- □ TRD-012 Canonicalise the record parser per Q3 (adjust `telemetry`/`probe` or document) (1h) [TRD-001]
-- □ TRD-013 `SyntheticPeers` incl. a self-id entry (replaces `DemoFeed` demo) (2h) [TRD-010]
+- ✓ TRD-010 `peers.py`: `PeerEntity`, `PeerSnapshot`, `PeerStore` (TTL, version, self-id drop) (3h) [TRD-001]
+- ✓ TRD-011 `from_record` + `LabPeerSource` over `PayloadSniffer` (socket), status text (3h) [TRD-010]
+- ✓ TRD-012 Canonicalise the record parser per Q3 (adjust `telemetry`/`probe` or document) (1h) [TRD-001]
+- ✓ TRD-013 `SyntheticPeers` incl. a self-id entry (replaces `DemoFeed` demo) (2h) [TRD-010]
 
 Phase 2, geo logic
-- □ TRD-020 `Entity.heading`; `EntitySmoother` TTL/age/heading; `items_aged()` (3h) [TRD-001]
-- □ TRD-021 `visible_entities`, `is_self`, `nearby_3d` self-id extension (3h) [TRD-020]
-- □ TRD-022 `edge_anchor` (1h)
-- □ TRD-023 Settings: `peer_radius_m` (+migration), `peer_self_ids`, `peer_source`, `show_vitals_detail` (1h)
+- ✓ TRD-020 `Entity.heading`; `EntitySmoother` TTL/age/heading; `items_aged()` (3h) [TRD-001]
+- ✓ TRD-021 `visible_entities`, `is_self`, `nearby_3d` self-id extension (3h) [TRD-020]
+- ✓ TRD-022 `edge_anchor` (1h)
+- ✓ TRD-023 Settings: `peer_radius_m` (+migration), `peer_self_ids`, `peer_source`, `show_vitals_detail` (1h)
 
 Phase 3, rendering and app
-- □ TRD-030 `ENTITY_STYLE`; `_draw_entity_marker` dot/arrow/dim (3h) [TRD-020]
-- □ TRD-031 `_draw_entities` on `visible_entities`; peers rename; `_draw_peer_status`; optional detail line (2h) [TRD-021, TRD-030, TRD-010]
-- □ TRD-032 `_draw_edge_indicators` (2h) [TRD-022, TRD-031]
-- □ TRD-033 Peers settings dialog replacing Feed dialog; hide/disable `show_ai`; status text (2h) [TRD-023]
+- ✓ TRD-030 `ENTITY_STYLE`; `_draw_entity_marker` dot/arrow/dim (3h) [TRD-020]
+- ✓ TRD-031 `_draw_entities` on `visible_entities`; peers rename; `_draw_peer_status`; optional detail line (2h) [TRD-021, TRD-030, TRD-010]
+- ✓ TRD-032 `_draw_edge_indicators` (2h) [TRD-022, TRD-031]
+- ✓ TRD-033 Peers settings dialog replacing Feed dialog; hide/disable `show_ai`; status text (2h) [TRD-023]
 
 Phase 4, wiring
-- □ TRD-040 `__main__`: `--lab-peers`, `--replay` -> `SyntheticPeers`, real-game peer option wired to `GamePeerSource` when available, start/stop peers, drop feed wiring (2h) [TRD-011, TRD-013, TRD-031]
-- □ TRD-041 Docs: `docs/PEERS.md` (sources, record layout, units, self-id, TTL, limits) replacing the deleted SERVER_FEED.md idea (2h) [TRD-011]
+- ✓ TRD-040 `__main__`: `--lab-peers`, `--replay` -> `SyntheticPeers`, real-game peer option wired to `GamePeerSource` when available, start/stop peers, drop feed wiring (2h) [TRD-011, TRD-013, TRD-031]
+- ✓ TRD-041 Docs: `docs/PEERS.md` (sources, record layout, units, self-id, TTL, limits) replacing the deleted SERVER_FEED.md idea (2h) [TRD-011]
 
 Phase 5, real-game backend (owner-only, opt-in; start TRD-050 immediately, it does not depend on Phase 1 to 4)
 - ✓ TRD-050 Technical feasibility spike (time-box 8h): from existing fixtures and captured pcaps, can inbound Iris batches (per `net_ref_handle`) yield other actors' position, name and vitals, and with which ids? Output: a written field list (decodable, partial, or not decodable) that scopes TRD-051; no production code. Answers Q1.
 - ✓ TRD-051 `GamePeerSource` (position only; see Findings) (Backend G): decode other actors' fields proven by TRD-050 into `PeerEntity`, drop own handle, provisional-purge logic, status text, fixture-based tests (estimate set after TRD-050, placeholder 12h) [TRD-010, TRD-050]
 
 Phase 6, tests and removal
-- □ TRD-060 Tests T1 to T15 (6h) [TRD-010..033, TRD-040]
-- □ TRD-070 Feed retirement per section 9: delete `feed.py`, `tools/mock_feed.py`, `test_feed.py`, `test_feed_ui.py` (port still-useful cases), strip settings/CLI/UI. BLOCKED until the user commits or discards the uncommitted `feed.py`/`test_feed.py` edits (3h) [TRD-040, TRD-060]
-- □ TRD-080 Full suite, `--replay` manual check, lab loopback manual check, code review, perf check (2h) [all]
+- ✓ TRD-060 Tests T1 to T15 (6h) [TRD-010..033, TRD-040]
+- ✓ TRD-070 Feed retirement per section 9: delete `feed.py`, `tools/mock_feed.py`, `test_feed.py`, `test_feed_ui.py` (port still-useful cases), strip settings/CLI/UI. DONE: user ruled "no more feed URL"; files deleted, deprecated Settings fields removed (load-time `feed_radius_m` migration kept) (3h) [TRD-040, TRD-060]
+- ☐ TRD-080 Full suite, `--replay` manual check, lab loopback manual check, code review, perf check (2h) [all]
+
+Remaining: TRD-080 manual checks with the real game (lab loopback, `--game-peers` on a live session) and the code review gate; everything else is done or blocked on the capture (Q10).
 
 Total about 41 h excluding TRD-050 (8h time-box) and TRD-051 (placeholder 12h, re-estimated after TRD-050). Suggested delegation after approval: backend-developer for Phases 1, 2 and 4; a Qt-capable developer for Phase 3; test-runner and code-reviewer for gates; documentation-specialist for TRD-041.
 
@@ -305,7 +307,8 @@ Until TRD-070 lands, nothing new may depend on any item above.
 - Q6 (despawn): Should Iris destruction records (currently skipped by `parse_iris_packet`) feed explicit despawns for the real-game backend? Proposed: later, once TRD-050 shows they are decodable.
 - Q7 (self for a second client): Is `peer_self_ids` enough, or should the app auto-learn own handle only?
 - Q8 (radius/label detail): Default `peer_radius_m` stays 1000 m; show only HP by default with a detail toggle (proposed)?
-- Q9 (feed.py deletion): Will the user commit or discard the uncommitted `feed.py`/`test_feed.py` edits so TRD-070 can proceed?
+- Q9 (feed.py deletion): RESOLVED by removal. The user said "no more feed URL"; `feed.py`, its tests and `tools/mock_feed.py` were deleted.
+- Q10 (needs new capture): name, class, vitals, heading and a validated despawn for the game backend. See `docs/PEERS.md`, "Capture that would unlock the rest". Q3/Q6/Q7/Q8 keep their proposed defaults (implemented as proposed); Q4 = no (no heading inference); Q5 = `show_ai` inert.
 
 
 ## 11. TRD-050 Findings (spike on the repo's recorded inbound packets) and TRD-051 result

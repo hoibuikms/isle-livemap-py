@@ -129,10 +129,6 @@ class MapView(QWidget):
         self.ents.step(dt)
         self.update()
 
-    @property
-    def feed_status(self) -> str:  # old name, kept until the feed tests are retired (TRD-070)
-        return self.peer_status
-
     def nearby(self, radius_m: float | None = ..., now: float | None = None) -> list[Nearby]:
         """Other players relative to the local player, nearest first (``geo.visible_entities``,
         also used by the Nearby panel). Default radius is the configured one; None = unlimited.
