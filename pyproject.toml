@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isle-livemap"
+version = "0.1.0"
+description = "Passive, own-player-only minimap overlay for The Isle: Evrima (Windows)"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6-Essentials==6.12.0",
+  "scapy==2.8.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "scapy==2.8.0", "Pillow==13.0.0"]
+
+[tool.setuptools]
+packages = ["isle_livemap"]
+
+[tool.setuptools.package-data]
+isle_livemap = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
