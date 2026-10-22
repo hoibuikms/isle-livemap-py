@@ -112,7 +112,9 @@ class PeerStore:
         self.ttl, self.clock = ttl, clock
         self._lock = threading.Lock()
         self._seen: dict[str, PeerEntity] = {}
-        self._self: set[str] = {canonical_id(i) for i in self_ids}
+        self._config: set[str] = {canonical_id(i) for i in self_ids}  # user-configured (Settings.peer_self_ids)
+        self._owned: set[str] = set()  # ids a backend owns (lab id 0, the learned game handle): survive set_self_ids
+        self._self: set[str] = set(self._config)
         self._version = 0
         self._cached: tuple[PeerEntity, ...] | None = ()
         self._snap: PeerSnapshot | None = None
@@ -133,15 +135,26 @@ class PeerStore:
             return True
 
     def set_self_ids(self, ids: Iterable[str]) -> None:
-        """Replace the self-id set and purge any provisional peer that turns out to be me."""
+        """Replace the USER-configured self ids and purge any peer that turns out to be me. Ids a backend
+        registered itself (``add_self_id`` / ``set_owned_self_ids``) are kept: editing the Peers settings
+        must not re-show the lab/demo "me" or the learned game handle."""
         with self._lock:
-            self._self = {canonical_id(i) for i in ids}
+            self._config = {canonical_id(i) for i in ids}
+            self._self = self._config | self._owned
             self._purge_self()
 
     def add_self_id(self, raw_id) -> None:
-        """E.g. the real-game own handle once it locks: drop it now and from here on."""
+        """E.g. the lab's id 0, or the real-game own handle once it locks: drop it now and from here on."""
         with self._lock:
-            self._self.add(canonical_id(raw_id))
+            self._owned.add(canonical_id(raw_id))
+            self._self = self._config | self._owned
+            self._purge_self()
+
+    def set_owned_self_ids(self, ids: Iterable[str]) -> None:
+        """Replace the backend-owned self ids (e.g. a new own handle after respawn, or none after a reset)."""
+        with self._lock:
+            self._owned = {canonical_id(i) for i in ids}
+            self._self = self._config | self._owned
             self._purge_self()
 
     def remove(self, raw_id) -> bool:
@@ -328,7 +341,7 @@ class GamePeerSource:
         quantised world position from the batches that have the recorded location layout (same
         FVector_NetQuantize100 / cm units as the own movement decoder, so ``geo`` treats them alike).
       * A peer is keyed by its handle. The own handle is excluded as soon as the heartbeat lock gives it;
-        a provisional peer with that handle is purged retroactively (``PeerStore.set_self_ids``).
+        a provisional peer with that handle is purged retroactively (``PeerStore.set_owned_self_ids``).
       * The envelope's destruction records remove a tracked handle immediately; TTL (dim 3 s / remove
         5 s) remains the fallback.
 
@@ -366,14 +379,14 @@ class GamePeerSource:
     def on_reset(self) -> None:
         """New server / game restart: handles are meaningless now."""
         self.own_handle = None
-        self.store.set_self_ids(self._config_self)
+        self.store.set_owned_self_ids(())
         self.store.clear()
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
         self.packets += 1
         if own_handle is not None and own_handle != self.own_handle:
             self.own_handle = own_handle  # replaces (not adds to) the previous own handle
-            self.store.set_self_ids((*self._config_self, str(own_handle)))
+            self.store.set_owned_self_ids((str(own_handle),))
         from .decode import decode_actor_locations, parse_iris_packet
 
         packet = parse_iris_packet(d.payload)

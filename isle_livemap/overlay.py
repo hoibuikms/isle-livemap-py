@@ -352,7 +352,9 @@ class MapView(QWidget):
             return
         p.setFont(QFont("Segoe UI", 8))
         p.setPen(QColor(255, 170, 90) if status_is_warning(self.peer_status) else QColor(255, 255, 255, 190))
-        p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, self.peer_status)
+        room = self.width() * (0.9 if self.full_map else 0.62)  # inside the circle chord at that height
+        text = QFontMetricsF(p.font()).elidedText(self.peer_status, Qt.TextElideMode.ElideRight, room)
+        p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, text)
 
     def _draw_player(self, p: QPainter) -> None:
         if not self.interp.has_fix:
