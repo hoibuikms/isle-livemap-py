@@ -7,12 +7,15 @@ import sys
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QColor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QInputDialog, QLineEdit, QListWidget,
-    QListWidgetItem, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout,
 )
 
 from .capture import TelemetryPipeline
-from .geo import MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, format_distance, parse_radii
+from .feed import insecure_warning, validate_url
+from .geo import (
+    MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_summary, format_distance, parse_radii,
+)
 from .overlay import MapView
 
 # (name, Windows modifiers, virtual key) -- modifiers: ALT=1 CTRL=2 SHIFT=4, NOREPEAT=0x4000
@@ -21,6 +24,7 @@ HOTKEYS = {
     "edit": ("Ctrl+Shift+O", 0x2 | 0x4, ord("O")),
     "add_marker": ("Ctrl+Shift+P", 0x2 | 0x4, ord("P")),
     "markers": ("Ctrl+Shift+L", 0x2 | 0x4, ord("L")),
+    "nearby": ("Ctrl+Shift+N", 0x2 | 0x4, ord("N")),
     "zoom_in": ("Ctrl+Shift+=", 0x2 | 0x4, 0xBB),
     "zoom_out": ("Ctrl+Shift+-", 0x2 | 0x4, 0xBD),
 }
@@ -97,17 +101,93 @@ class MarkersPanel(QDialog):
         self.refresh()
 
 
+class NearbyPanel(QDialog):
+    """Players / AI from the server feed, nearest first (refreshes while visible)."""
+
+    def __init__(self, view: MapView) -> None:
+        super().__init__()
+        self.view = view
+        self.setWindowTitle("Nearby (server feed)")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        self.status = QLabel()
+        self.list = QListWidget()
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.status)
+        lay.addWidget(self.list)
+        self.resize(520, 340)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+
+    def refresh(self) -> None:
+        self.status.setText(self.view.feed_status or "feed: off (set a feed URL in Feed settings)")
+        rows = [entity_summary(n) for n in self.view.nearby()]
+        if [self.list.item(i).text() for i in range(self.list.count())] != rows:
+            self.list.clear()
+            self.list.addItems(rows)
+
+    def showEvent(self, e) -> None:  # noqa: N802
+        self.refresh()
+        self.timer.start(500)
+        super().showEvent(e)
+
+    def hideEvent(self, e) -> None:  # noqa: N802
+        self.timer.stop()
+        super().hideEvent(e)
+
+
+class FeedDialog(QDialog):
+    """URL / token / radius of the user's own server feed."""
+
+    def __init__(self, parent, settings: Settings, current_url: str, token_set: bool) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Server feed settings")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        self.url = QLineEdit(current_url)
+        self.url.setPlaceholderText("https://my-server.example/feed")
+        self.token = QLineEdit()
+        self.token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token.setPlaceholderText("(unchanged)" if token_set else "(none)")
+        self.clear_token = QCheckBox("Clear token")
+        self.radius = QDoubleSpinBox()
+        self.radius.setRange(50, 20_000)
+        self.radius.setSuffix(" m")
+        self.radius.setValue(settings.feed_radius_m)
+        self.warn = QLabel()
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: #c60;")
+        self.url.textChanged.connect(self._check)
+        form = QFormLayout(self)
+        form.addRow(QLabel("Only a server you own/control can provide other players and AI."))
+        form.addRow("URL", self.url)
+        form.addRow("Token", self.token)
+        form.addRow("", self.clear_token)
+        form.addRow("Minimap radius", self.radius)
+        form.addRow(self.warn)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self._check()
+
+    def _check(self) -> None:
+        url = self.url.text().strip()
+        self.warn.setText((validate_url(url) if url else None) or insecure_warning(url) or "")
+
+
 class App(QObject):
-    def __init__(self, qapp: QApplication, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings) -> None:
+    def __init__(self, qapp: QApplication, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings,
+                 feed=None) -> None:
         super().__init__()
         self.qapp, self.settings, self.store = qapp, settings, store
         self.pipeline = pipeline
-        self.view = MapView(pipeline, store, settings)
+        self.feed = feed
+        self.view = MapView(pipeline, store, settings, feed)
         self.view.request_marker_at_world = self.add_marker_at
         self.panel = MarkersPanel(self.view, store)
+        self.nearby_panel = NearbyPanel(self.view)
         actions = {
             "full_map": self.view.toggle_full_map, "edit": self.view.toggle_edit,
-            "add_marker": self.add_marker_here, "markers": self.show_panel,
+            "add_marker": self.add_marker_here, "markers": self.show_panel, "nearby": self.show_nearby,
             "zoom_in": lambda: self.view.zoom_by(1.25), "zoom_out": lambda: self.view.zoom_by(0.8),
         }
         self._actions = actions
@@ -150,6 +230,7 @@ class App(QObject):
         for text, key in (
             ("Full map (Alt+M)", "full_map"), ("Edit mode (Ctrl+Shift+O)", "edit"),
             ("Add marker here (Ctrl+Shift+P)", "add_marker"), ("Markers… (Ctrl+Shift+L)", "markers"),
+            ("Nearby list… (Ctrl+Shift+N)", "nearby"),
         ):
             a = QAction(text, menu)
             a.triggered.connect(self._actions[key])
@@ -157,11 +238,15 @@ class App(QObject):
         menu.addSeparator()
         for text, fn in (
             ("Size…", self.ask_size), ("Range rings…", self.ask_rings), ("Species label…", self.ask_species),
+            ("Feed settings…", self.ask_feed),
         ):
             a = QAction(text, menu)
             a.triggered.connect(fn)
             menu.addAction(a)
-        for text, attr in (("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings")):
+        for text, attr in (
+            ("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings"),
+            ("Show players (feed)", "show_players"), ("Show AI (feed)", "show_ai"),
+        ):
             a = QAction(text, menu, checkable=True)
             a.setChecked(getattr(self.settings, attr))
             a.toggled.connect(lambda on, at=attr: setattr(self.settings, at, on))
@@ -178,6 +263,22 @@ class App(QObject):
     def show_panel(self) -> None:
         self.panel.show()
         self.panel.raise_()
+
+    def show_nearby(self) -> None:
+        self.nearby_panel.show()
+        self.nearby_panel.raise_()
+
+    def ask_feed(self) -> None:
+        if self.feed is None or not hasattr(self.feed, "token"):
+            return
+        dlg = FeedDialog(None, self.settings, self.feed.url if self.feed.url != "(demo)" else "", self.feed.token_set)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        token = "" if dlg.clear_token.isChecked() else (dlg.token.text().strip() or self.feed.token)
+        self.settings.feed_url, self.settings.feed_token = dlg.url.text().strip(), token
+        self.settings.feed_radius_m = dlg.radius.value()
+        self.settings.normalise()
+        self.feed.configure(self.settings.feed_url, self.settings.feed_token, self.settings.feed_interval_s)
 
     def add_marker_here(self) -> None:
         pos = self.view.player_world()

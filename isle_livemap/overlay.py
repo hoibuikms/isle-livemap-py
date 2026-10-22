@@ -6,13 +6,14 @@ import math
 import time
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from .capture import TelemetryPipeline
 from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
+    EntitySmoother, Nearby, entity_label_lines, nearby_entities, place_label,
 )
 from .tracking import Vitals
 
@@ -21,12 +22,20 @@ BASE_VIEW_FRACTION = 0.2  # minimap shows 20 % of map width at zoom 1
 KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "dinosaur": "#ff6b6b", "other": "#c8c8c8"}
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
 STALE_AFTER_S = 3.0
+PLAYER_COLOR, AI_COLOR = QColor("#4dd0ff"), QColor("#ff8a3d")
+MAX_LABELS_MINIMAP, MAX_LABELS_FULL = 8, 24
+CROWDED_ON_SCREEN = 20  # above this only the nearest few get labels
+CROWDED_LABELS = 4
 
 
 class MapView(QWidget):
-    def __init__(self, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings) -> None:
+    def __init__(self, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings, feed=None) -> None:
         super().__init__()
         self.pipeline, self.store, self.settings = pipeline, store, settings
+        self.feed = feed  # FeedPoller / DemoFeed or None; only source of other entities
+        self.ents = EntitySmoother()
+        self._feed_version = -1
+        self.feed_status = ""
         self.interp = Interpolator()
         self.full_map = False
         self.edit_mode = False
@@ -92,7 +101,24 @@ class MapView(QWidget):
             self._last_pos_at = t.position_at
             self.interp.set_target(t.position.x, t.position.y, t.position.map_heading_degrees)
         self.interp.step(dt)
+        if self.feed is not None:
+            snap = self.feed.snapshot()
+            self.feed_status = snap.status if snap.enabled else ""
+            if snap.version != self._feed_version:
+                self._feed_version = snap.version
+                self.ents.update(snap.entities)
+        self.ents.step(dt)
         self.update()
+
+    def nearby(self, radius_m: float | None = ...) -> list[Nearby]:
+        """Entities relative to the local player, nearest first. Default radius is
+        the configured one; pass None for unlimited."""
+        if not self.interp.has_fix:
+            return []
+        if radius_m is ...:
+            radius_m = self.settings.feed_radius_m
+        return nearby_entities(self.ents.items(), self.interp.x, self.interp.y, radius_m,
+                               self.settings.show_players, self.settings.show_ai)
 
     def view(self) -> tuple[float, float, float]:
         """(centre_left, centre_top, view width as a fraction of the map)."""
@@ -125,10 +151,12 @@ class MapView(QWidget):
         self._draw_zones(p)
         self._draw_rings(p)
         self._draw_markers(p)
+        self._draw_entities(p)
         self._draw_player(p)
         p.setClipping(False)
         self._draw_border(p)
         self._draw_hud(p)
+        self._draw_feed_status(p)
         p.end()
 
     def _circle_region(self):
@@ -195,6 +223,58 @@ class MapView(QWidget):
             p.drawText(pt + QPointF(9, 5), label)
             p.setPen(QColor(255, 255, 255))
             p.drawText(pt + QPointF(8, 4), label)
+
+    def _draw_entities(self, p: QPainter) -> None:
+        # Minimap: only within the configured radius. Full map: everything the feed sent.
+        near = self.nearby(None if self.full_map else self.settings.feed_radius_m)
+        if not near:
+            return
+        bounds = (0.0, 0.0, float(self.width()), float(self.height()))
+        pts = [(n, self.to_screen(*project_unclamped(n.x, n.y))) for n in near]
+        pts = [(n, pt) for n, pt in pts if -10 <= pt.x() <= bounds[2] + 10 and -10 <= pt.y() <= bounds[3] + 10]
+        max_labels = MAX_LABELS_FULL if self.full_map else MAX_LABELS_MINIMAP
+        if len(pts) > CROWDED_ON_SCREEN:
+            max_labels = min(max_labels, CROWDED_LABELS)
+        font = QFont("Segoe UI", 8)
+        fm = QFontMetricsF(font)
+        p.setFont(font)
+        placed: list[tuple[float, float, float, float]] = []
+        labelled = 0
+        for n, pt in reversed(pts):  # far first so near dots end up on top
+            self._draw_entity_dot(p, n, pt)
+        for n, pt in pts:  # near first so near labels win placement
+            if labelled >= max_labels:
+                break
+            lines = entity_label_lines(n)
+            w = max(fm.horizontalAdvance(t) for t in lines) + 2
+            h = fm.height() * 2
+            r = place_label(pt.x(), pt.y(), w, h, placed, bounds)
+            if r is None:
+                continue
+            labelled += 1
+            color = PLAYER_COLOR if n.entity.kind == "player" else AI_COLOR
+            for i, text in enumerate(lines):
+                base = QPointF(r[0], r[1] + fm.ascent() + i * fm.height())
+                p.setPen(QColor(0, 0, 0, 220))
+                p.drawText(base + QPointF(1, 1), text)
+                p.setPen(color if i == 0 else QColor(255, 255, 255))
+                p.drawText(base, text)
+
+    def _draw_entity_dot(self, p: QPainter, n: Nearby, pt: QPointF) -> None:
+        p.setPen(QPen(QColor(0, 0, 0, 230), 1.5))
+        if n.entity.kind == "player":  # circle
+            p.setBrush(PLAYER_COLOR)
+            p.drawEllipse(pt, 5, 5)
+        else:  # diamond
+            p.setBrush(AI_COLOR)
+            p.drawPolygon(QPolygonF([pt + QPointF(0, -6), pt + QPointF(6, 0), pt + QPointF(0, 6), pt + QPointF(-6, 0)]))
+
+    def _draw_feed_status(self, p: QPainter) -> None:
+        if not self.feed_status:
+            return
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(255, 255, 255, 190) if "ok" in self.feed_status or "demo" in self.feed_status else QColor(255, 170, 90))
+        p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, self.feed_status)
 
     def _draw_player(self, p: QPainter) -> None:
         if not self.interp.has_fix:

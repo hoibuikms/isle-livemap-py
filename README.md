@@ -51,6 +51,21 @@ so it is a label you set yourself. "13 food-source zones": the upstream asset in
 this snapshot has no food polygons; the 13 default animal food categories are
 bundled as point layers instead. World units are assumed to be Unreal centimetres.
 
+## Nearby players and AI (server feed, optional)
+
+The overlay can show nearby players and AI (dots with name, species, health %, growth %,
+distance; minimap radius default 1 km; list panel with Ctrl+Shift+N; tray toggles for
+players / AI and "Feed settings...") **only** from a JSON feed published by a server you
+own and can mod. It cannot work on servers you do not control; nothing about other
+entities is taken from the game's network packets or memory.
+
+    python -m isle_livemap --feed-url https://my-server/feed      # token: ISLE_FEED_TOKEN env or --feed-token
+    python tools/mock_feed.py                                      # local demo feed (127.0.0.1:8765)
+    python -m isle_livemap --replay --feed-url http://127.0.0.1:8765/feed
+    python -m isle_livemap --replay                                # internal synthetic feed
+
+Schema, units, security notes and how to expose the feed from your mod: `docs/SERVER_FEED.md`.
+
 ## Anti-cheat safety
 
 * Passive packet capture only (Npcap, read-only sniffing of your own UDP flow).
@@ -59,7 +74,8 @@ bundled as point layers instead. World units are assumed to be Unreal centimetre
   its UDP ports with `GetExtendedUdpTable`, neither of which opens the game process.
 * Nothing is sent or modified; no evasion or obfuscation.
 * Separate window. Global hotkeys use `RegisterHotKey` (not a keyboard hook).
-* Out of scope by design: other players / AI entities, nearby lists, remote radar.
+* Other players / AI are never decoded from traffic or memory. The only source of other
+  entities is the optional server feed below, which needs a server you control.
 
 **The author cannot guarantee that this complies with any anti-cheat or server rules.
 Check your server's rules; use at your own risk.**
@@ -94,7 +110,8 @@ remembered in settings.json.
 
 Includes ports of the upstream decoder / tracker / vitals / projection tests using the
 upstream recorded packets (`tests/fixtures`), plus rings, markers, waypoints, settings,
-a synthetic-packet pipeline test and a headless Qt smoke test. Not testable off
+a synthetic-packet pipeline test, feed parsing / polling tests against a local mock
+server, and headless Qt smoke tests. Not testable off
 Windows: live Npcap capture, process / port lookup against a real game, global
 hotkeys, click-through on Windows, real-game accuracy.
 

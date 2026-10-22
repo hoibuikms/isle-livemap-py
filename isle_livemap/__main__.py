@@ -16,6 +16,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--iface", help="capture interface (default: scapy's default route)")
     ap.add_argument("--diagnose", action="store_true", help="print capture diagnostics (no UI) and exit")
     ap.add_argument("--seconds", type=float, default=10.0, help="--diagnose: sniff duration per run (default 10)")
+    ap.add_argument("--feed-url", help="URL of YOUR server's entity feed (env ISLE_FEED_URL); see docs/SERVER_FEED.md")
+    ap.add_argument("--feed-token", help="bearer token for the feed (env ISLE_FEED_TOKEN is safer: argv is visible to other processes)")
     ap.add_argument("--data-dir", type=Path, help="where markers.json/settings.json live")
     args = ap.parse_args(argv)
 
@@ -60,8 +62,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {err}", file=sys.stderr)
             return 2
 
-    app = App(qapp, pipeline, store, settings)  # noqa: F841 (kept alive)
+    from .feed import DemoFeed, FeedPoller, resolve_feed_config
+
+    feed_url, feed_token = resolve_feed_config(settings, args.feed_url, args.feed_token)
+    if args.replay and not feed_url:  # demo without a server: internal synthetic feed
+        def anchor():
+            pos = pipeline.latest.position
+            return (pos.x, pos.y) if pos is not None else None
+
+        feed = DemoFeed(anchor)
+    else:
+        feed = FeedPoller(feed_url, feed_token, settings.feed_interval_s)
+    feed.start()
+
+    app = App(qapp, pipeline, store, settings, feed)  # noqa: F841 (kept alive)
     qapp.aboutToQuit.connect(source.stop)
+    qapp.aboutToQuit.connect(feed.stop)
     return qapp.exec()
 
 

@@ -208,6 +208,14 @@ def clamp_size_percent(value: float) -> int:
     return int(min(max(round(value), SIZE_MIN), SIZE_MAX))
 
 
+def _clamp_num(value, lo: float, hi: float, default: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi) if math.isfinite(v) else default
+
+
 @dataclass(slots=True)
 class Settings:
     size_percent: int = 100
@@ -220,12 +228,24 @@ class Settings:
     window_x: int | None = None
     window_y: int | None = None
     iface: str = ""  # last --iface used for live capture
+    # server feed (the ONLY source of other entities; needs a server you control)
+    feed_url: str = ""
+    feed_token: str = ""  # stored in plain text; prefer ISLE_FEED_TOKEN
+    feed_radius_m: float = 1000.0
+    feed_interval_s: float = 1.0
+    show_players: bool = True
+    show_ai: bool = True
 
     def normalise(self) -> "Settings":
         self.size_percent = clamp_size_percent(self.size_percent)
         self.zoom = min(max(float(self.zoom), 0.5), 16.0)
         radii = [r for r in self.ring_radii_m if isinstance(r, (int, float)) and r > 0]
         self.ring_radii_m = radii[:6] or list(DEFAULT_RING_RADII_M)
+        self.feed_url = str(self.feed_url or "").strip()
+        self.feed_token = str(self.feed_token or "").strip()
+        self.feed_radius_m = _clamp_num(self.feed_radius_m, 50.0, 20_000.0, 1000.0)
+        self.feed_interval_s = _clamp_num(self.feed_interval_s, 0.25, 30.0, 1.0)
+        self.show_players, self.show_ai = bool(self.show_players), bool(self.show_ai)
         return self
 
     @classmethod
@@ -289,6 +309,123 @@ class Interpolator:
         self.y += (self.target_y - self.y) * a
         self.heading = (self.heading + shortest_arc(self.heading, self.target_heading) * a) % 360.0
         return self.x, self.y, self.heading
+
+
+# ----------------------------------------------------------------- server-feed entities
+# World units are the same as the local telemetry: Unreal centimetres, same axes
+# (north = -Y). Entities come ONLY from the user's own server feed (see feed.py).
+
+
+@dataclass(frozen=True, slots=True)
+class Entity:
+    id: str
+    kind: str  # "player" | "ai"
+    name: str
+    species: str
+    x: float
+    y: float
+    z: float | None = None
+    growth_pct: float | None = None
+    health_pct: float | None = None
+    stamina_pct: float | None = None
+    hunger_pct: float | None = None
+    thirst_pct: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Nearby:
+    entity: Entity
+    x: float  # (possibly smoothed) display position, world units
+    y: float
+    distance_m: float
+    bearing: float
+
+
+def nearby_entities(items, px: float, py: float, radius_m: float | None = None,
+                    show_players: bool = True, show_ai: bool = True) -> list[Nearby]:
+    """``items``: iterable of (Entity, x, y). Distance and bearing from (px, py),
+    filtered by kind toggles and radius (None = unlimited), nearest first."""
+    out = []
+    for e, x, y in items:
+        if (e.kind == "player" and not show_players) or (e.kind == "ai" and not show_ai):
+            continue
+        d = distance_m(px, py, x, y)
+        if radius_m is not None and d > radius_m:
+            continue
+        out.append(Nearby(e, x, y, d, bearing_deg(px, py, x, y)))
+    out.sort(key=lambda n: (n.distance_m, n.entity.id))
+    return out
+
+
+def truncate(text: str, limit: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: max(limit - 1, 1)] + "…"
+
+
+def _pct(v: float | None) -> str:
+    return "?" if v is None else f"{v:.0f}%"
+
+
+def entity_label_lines(n: Nearby, name_max: int = 16) -> tuple[str, str]:
+    e = n.entity
+    head = truncate(e.name or e.id, name_max) + (f" ({truncate(e.species, 14)})" if e.species else "")
+    return head, f"HP {_pct(e.health_pct)} G {_pct(e.growth_pct)} {format_distance(n.distance_m)}"
+
+
+def entity_summary(n: Nearby) -> str:
+    e = n.entity
+    sp = f" {e.species}" if e.species else ""
+    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}  HP {_pct(e.health_pct)}  G {_pct(e.growth_pct)}  "
+            f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°)")
+
+
+Rect = tuple[float, float, float, float]  # x, y, w, h
+
+
+def _overlaps(a: Rect, b: Rect) -> bool:
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect) -> Rect | None:
+    """Pick a label rect next to anchor (ax, ay) (right, left, above, below) that
+    stays inside ``bounds`` and overlaps no already placed label; None if none fits."""
+    for r in ((ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h),
+              (ax - w / 2, ay - 8 - h, w, h), (ax - w / 2, ay + 8, w, h)):
+        inside = (r[0] >= bounds[0] and r[1] >= bounds[1]
+                  and r[0] + r[2] <= bounds[0] + bounds[2] and r[1] + r[3] <= bounds[1] + bounds[3])
+        if inside and not any(_overlaps(r, o) for o in placed):
+            placed.append(r)
+            return r
+    return None
+
+
+class EntitySmoother:
+    """Per-entity exponential smoothing between ~1 Hz feed updates (like Interpolator)."""
+
+    def __init__(self, tau_s: float = 0.4, snap_distance_units: float = 200_000.0) -> None:
+        self.tau, self.snap = tau_s, snap_distance_units
+        self.entities: dict[str, Entity] = {}
+        self.pos: dict[str, list[float]] = {}
+
+    def update(self, entities) -> None:
+        new = {e.id: e for e in entities}
+        for eid, e in new.items():
+            cur = self.pos.get(eid)
+            if cur is None or math.hypot(e.x - cur[0], e.y - cur[1]) > self.snap:
+                self.pos[eid] = [e.x, e.y]
+        for eid in set(self.pos) - set(new):
+            del self.pos[eid]
+        self.entities = new
+
+    def step(self, dt: float) -> None:
+        a = 1.0 - math.exp(-max(dt, 0.0) / self.tau) if self.tau > 0 else 1.0
+        for eid, e in self.entities.items():
+            p = self.pos[eid]
+            p[0] += (e.x - p[0]) * a
+            p[1] += (e.y - p[1]) * a
+
+    def items(self):
+        return [(e, *self.pos[eid]) for eid, e in self.entities.items()]
 
 
 # ----------------------------------------------------------------- bundled data
