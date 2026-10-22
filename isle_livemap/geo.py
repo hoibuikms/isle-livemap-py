@@ -366,10 +366,62 @@ def _pct(v: float | None) -> str:
     return "?" if v is None else f"{v:.0f}%"
 
 
-def entity_label_lines(n: Nearby, name_max: int = 16) -> tuple[str, str]:
-    e = n.entity
+VITAL_FIELDS = (("Growth", "growth_pct"), ("Health", "health_pct"), ("Stamina", "stamina_pct"),
+                ("Hunger", "hunger_pct"), ("Water", "thirst_pct"))
+
+
+def local_entity(pos, vitals, species: str = "") -> Entity:
+    """The local player as an Entity (``pos``: MovementCandidate | None, ``vitals``:
+    Vitals | None) so it shares the formatting path of feed entities: same cm units
+    and axes, vitals as 0-100 percentages."""
+    from .tracking import Vitals
+
+    def pct(cur, mx):
+        f = Vitals.fraction(cur, mx)
+        return None if f is None else f * 100.0
+
+    v = vitals or Vitals()
+    return Entity(
+        "local", "player", "You", species,
+        pos.x if pos is not None else 0.0, pos.y if pos is not None else 0.0, pos.z if pos is not None else None,
+        growth_pct=pct(v.growth, 1.0), health_pct=pct(v.health, v.max_health),
+        stamina_pct=pct(v.stamina, v.max_stamina), hunger_pct=pct(v.hunger, v.max_hunger),
+        thirst_pct=pct(v.thirst, v.max_thirst),
+    )
+
+
+def vital_lines(e: Entity) -> list[str]:
+    """"Label NN%" for every vital known for the entity (local player and feed alike)."""
+    return [f"{label} {v:.0f}%" for label, attr in VITAL_FIELDS if (v := getattr(e, attr)) is not None]
+
+
+def height_delta_m(n: Nearby, my_z: float | None) -> float | None:
+    """Entity height minus player height in metres (> 0: above you); None if either is unknown."""
+    if n.entity.z is None or my_z is None:
+        return None
+    return (n.entity.z - my_z) / 100.0
+
+
+def distance_3d_m(n: Nearby, my_z: float | None) -> float:
+    """sqrt(horizontal² + dZ²); falls back to the horizontal distance without heights."""
+    dz = height_delta_m(n, my_z)
+    return n.distance_m if dz is None else math.hypot(n.distance_m, dz)
+
+
+def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None) -> tuple[str, str]:
+    e, dz = n.entity, height_delta_m(n, my_z)
     head = truncate(e.name or e.id, name_max) + (f" ({truncate(e.species, 14)})" if e.species else "")
-    return head, f"HP {_pct(e.health_pct)} G {_pct(e.growth_pct)} {format_distance(n.distance_m)}"
+    tail = f"HP {_pct(e.health_pct)} G {_pct(e.growth_pct)} {format_distance(n.distance_m)}"
+    return head, tail if dz is None else f"{tail} {dz:+.0f}m"
+
+
+def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
+    """Table cells: name, species, health, growth, stamina, hunger, water, distance, 3D distance, height delta."""
+    e, dz = n.entity, height_delta_m(n, my_z)
+    return (truncate(e.name or e.id, 24), e.species or "-", _pct(e.health_pct), _pct(e.growth_pct),
+            _pct(e.stamina_pct), _pct(e.hunger_pct), _pct(e.thirst_pct),
+            format_distance(n.distance_m), f"{distance_3d_m(n, my_z):.0f} m",
+            "?" if dz is None else f"{dz:+.0f} m {'higher' if dz > 0 else 'lower' if dz < 0 else 'level'}")
 
 
 def entity_summary(n: Nearby, my_z: float | None = None) -> str:

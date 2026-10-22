@@ -87,3 +87,38 @@ def test_summary_shows_vitals_and_height_delta():
     assert "ST 70% HU 60% TH 80%" in s and "dZ +30m" in s
     bare = entity_summary(nearby_entities([(E("q", x=25_000), 25_000, 0)], 0, 0)[0], my_z=10_000)
     assert "ST" not in bare and "dZ" not in bare
+
+
+def test_row_and_3d_distance():
+    from isle_livemap.geo import distance_3d_m, entity_row
+    e = E("p", "player", 30_000, name="Alpha", species="Rex", health_pct=100, growth_pct=80, z=14_000)
+    n = nearby_entities([(e, 30_000, 0)], 0, 0)[0]  # 300 m east, 40 m up
+    assert math.isclose(distance_3d_m(n, 10_000), 50 * 0 + math.hypot(300, 40))
+    row = entity_row(n, my_z=10_000)
+    assert row[0] == "Alpha" and row[2] == "100%" and row[3] == "80%" and row[-1] == "+40 m higher"
+    assert entity_row(n)[-1] == "?" and distance_3d_m(n, None) == n.distance_m
+
+
+def test_label_shows_height_delta():
+    e = E("p", "player", 25_000, name="Alpha", z=13_000)
+    n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
+    assert entity_label_lines(n, my_z=10_000)[1].endswith("+30m")
+    assert not entity_label_lines(n)[1].endswith("+30m")
+
+
+def test_local_player_shares_entity_path():
+    from types import SimpleNamespace as NS
+    from isle_livemap.geo import entity_row, local_entity, vital_lines
+    from isle_livemap.tracking import Vitals
+    pos = NS(x=1000.0, y=-2000.0, z=5000.0)
+    v = Vitals(growth=0.5, health=50, max_health=200, stamina=10, max_stamina=10, hunger=None, max_hunger=100)
+    me = local_entity(pos, v, "Rex")
+    assert (me.x, me.y, me.z, me.growth_pct, me.health_pct, me.stamina_pct) == (1000.0, -2000.0, 5000.0, 50.0, 25.0, 100.0)
+    assert me.hunger_pct is None and me.thirst_pct is None
+    assert vital_lines(me) == ["Growth 50%", "Health 25%", "Stamina 100%"]
+    # a feed entity with the same values renders identically
+    twin = E("t", "player", 1000.0, name="You", species="Rex", growth_pct=50.0, health_pct=25.0, stamina_pct=100.0)
+    assert vital_lines(twin) == vital_lines(me)
+    n = nearby_entities([(twin, 1000.0, 0)], 0, 0)[0]
+    assert entity_row(n)[2:7] == ("25%", "50%", "100%", "?", "?")
+    assert local_entity(None, None).health_pct is None and vital_lines(local_entity(None, None)) == []

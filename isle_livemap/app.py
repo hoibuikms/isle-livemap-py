@@ -8,13 +8,14 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QColor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout,
+    QAbstractItemView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSystemTrayIcon,
+    QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .capture import TelemetryPipeline
 from .feed import insecure_warning, validate_url
 from .geo import (
-    MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_summary, format_distance, parse_radii,
+    MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance, parse_radii,
 )
 from .overlay import MapView
 
@@ -104,17 +105,24 @@ class MarkersPanel(QDialog):
 class NearbyPanel(QDialog):
     """Players / AI from the server feed, nearest first (refreshes while visible)."""
 
+    COLUMNS = ("Name", "Species", "Health", "Growth", "Stamina", "Hunger", "Water", "Distance", "3D", "Height Δ")
+
     def __init__(self, view: MapView) -> None:
         super().__init__()
         self.view = view
+        self._rows: list = []
         self.setWindowTitle("Nearby (server feed)")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.status = QLabel()
-        self.list = QListWidget()
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
         lay = QVBoxLayout(self)
         lay.addWidget(self.status)
-        lay.addWidget(self.list)
-        self.resize(520, 340)
+        lay.addWidget(self.table)
+        self.resize(720, 340)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
 
@@ -122,10 +130,13 @@ class NearbyPanel(QDialog):
         self.status.setText(self.view.feed_status or "feed: off (set a feed URL in Feed settings)")
         pos = self.view.pipeline.latest.position
         my_z = pos.z if pos is not None else None
-        rows = [entity_summary(n, my_z) for n in self.view.nearby()]
-        if [self.list.item(i).text() for i in range(self.list.count())] != rows:
-            self.list.clear()
-            self.list.addItems(rows)
+        rows = [entity_row(n, my_z) for n in self.view.nearby()]
+        if rows != self._rows:
+            self._rows = rows
+            self.table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                for c, text in enumerate(row):
+                    self.table.setItem(r, c, QTableWidgetItem(text))
 
     def showEvent(self, e) -> None:  # noqa: N802
         self.refresh()

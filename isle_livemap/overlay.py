@@ -13,7 +13,7 @@ from .capture import TelemetryPipeline
 from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
-    EntitySmoother, Nearby, entity_label_lines, nearby_entities, place_label,
+    EntitySmoother, Nearby, entity_label_lines, local_entity, nearby_entities, place_label, vital_lines,
 )
 from .tracking import Vitals
 
@@ -247,10 +247,12 @@ class MapView(QWidget):
         labelled = 0
         for n, pt in reversed(pts):  # far first so near dots end up on top
             self._draw_entity_dot(p, n, pt)
+        pos = self.pipeline.latest.position
+        my_z = pos.z if pos is not None else None
         for n, pt in pts:  # near first so near labels win placement
             if labelled >= max_labels:
                 break
-            lines = entity_label_lines(n)
+            lines = entity_label_lines(n, my_z=my_z)
             w = max(fm.horizontalAdvance(t) for t in lines) + 2
             h = fm.height() * 2
             r = place_label(pt.x(), pt.y(), w, h, placed, bounds)
@@ -310,14 +312,7 @@ class MapView(QWidget):
         name = self.settings.species.strip()
         if name:
             lines.append(name.upper())
-        if v is not None:
-            for label, cur, mx in (
-                ("Growth", v.growth, 1.0), ("Health", v.health, v.max_health), ("Stamina", v.stamina, v.max_stamina),
-                ("Hunger", v.hunger, v.max_hunger), ("Water", v.thirst, v.max_thirst),
-            ):
-                f = Vitals.fraction(cur, mx)
-                if f is not None:
-                    lines.append(f"{label} {f * 100:.0f}%")
+        lines += vital_lines(local_entity(self.pipeline.latest.position, v))
         if not lines:
             return
         p.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
