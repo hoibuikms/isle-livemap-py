@@ -11,31 +11,42 @@ from PySide6.QtWidgets import QWidget
 
 from .capture import TelemetryPipeline
 from .geo import (
-    ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
+    ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
-    EntitySmoother, Nearby, entity_label_lines, local_entity, nearby_entities, place_label, vital_lines,
+    ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
+    place_label, vital_lines, visible_entities,
 )
+from .peers import status_is_warning
 from .tracking import Vitals
 
 BASE_SIZE = 360  # minimap edge in px at 100 %
 BASE_VIEW_FRACTION = 0.2  # minimap shows 20 % of map width at zoom 1
 KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "dinosaur": "#ff6b6b", "other": "#c8c8c8"}
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
-STALE_AFTER_S = 3.0
-PLAYER_COLOR, AI_COLOR = QColor("#4dd0ff"), QColor("#ff8a3d")
+EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
 MAX_LABELS_MINIMAP, MAX_LABELS_FULL = 8, 24
 CROWDED_ON_SCREEN = 20  # above this only the nearest few get labels
 CROWDED_LABELS = 4
+LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
+
+
+def _qcolor(hex_color: str, alpha: int = 255) -> QColor:
+    c = QColor(hex_color)
+    c.setAlpha(alpha)
+    return c
 
 
 class MapView(QWidget):
-    def __init__(self, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings, feed=None) -> None:
+    def __init__(self, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings, peers=None) -> None:
         super().__init__()
         self.pipeline, self.store, self.settings = pipeline, store, settings
-        self.feed = feed  # FeedPoller / DemoFeed or None; only source of other entities
+        self.peers = peers  # a peers.PeerSource or None; the only source of other players
         self.ents = EntitySmoother()
-        self._feed_version = -1
-        self.feed_status = ""
+        self._peers_snap = None
+        self._peers_version = -1
+        self.peer_status = ""
+        self._marker_tools: dict[tuple[str, bool], tuple[QPen, QColor]] = {}
+        self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
         self.interp = Interpolator()
         self.full_map = False
         self.edit_mode = False
@@ -106,24 +117,33 @@ class MapView(QWidget):
             self._last_pos_at = t.position_at
             self.interp.set_target(t.position.x, t.position.y, t.position.map_heading_degrees)
         self.interp.step(dt)
-        if self.feed is not None:
-            snap = self.feed.snapshot()
-            self.feed_status = snap.status if snap.enabled else ""
-            if snap.version != self._feed_version:
-                self._feed_version = snap.version
-                self.ents.update(snap.entities)
+        if self.peers is not None:
+            snap = self.peers.snapshot()
+            self.peer_status = snap.status if snap.enabled else ""
+            # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
+            if snap is not self._peers_snap or snap.version != self._peers_version:
+                self._peers_snap, self._peers_version = snap, snap.version
+                self.ents.update(snap.entities, now)
+        else:
+            self.peer_status = ""
         self.ents.step(dt)
         self.update()
 
-    def nearby(self, radius_m: float | None = ...) -> list[Nearby]:
-        """Entities relative to the local player, nearest first. Default radius is
-        the configured one; pass None for unlimited."""
+    @property
+    def feed_status(self) -> str:  # old name, kept until the feed tests are retired (TRD-070)
+        return self.peer_status
+
+    def nearby(self, radius_m: float | None = ..., now: float | None = None) -> list[Nearby]:
+        """Other players relative to the local player, nearest first (``geo.visible_entities``,
+        also used by the Nearby panel). Default radius is the configured one; None = unlimited.
+        Empty without a position fix."""
         if not self.interp.has_fix:
             return []
         if radius_m is ...:
-            radius_m = self.settings.feed_radius_m
-        return nearby_entities(self.ents.items(), self.interp.x, self.interp.y, radius_m,
-                               self.settings.show_players, self.settings.show_ai)
+            radius_m = self.settings.peer_radius_m
+        now = time.monotonic() if now is None else now
+        return visible_entities(self.ents.items_aged(now), self.interp.x, self.interp.y, radius_m,
+                                self.settings.show_players, self.settings.show_ai, self.settings.peer_self_ids)
 
     def view(self) -> tuple[float, float, float]:
         """(centre_left, centre_top, view width as a fraction of the map)."""
@@ -161,7 +181,7 @@ class MapView(QWidget):
         p.setClipping(False)
         self._draw_border(p)
         self._draw_hud(p)
-        self._draw_feed_status(p)
+        self._draw_peer_status(p)
         p.end()
 
     def _circle_region(self):
@@ -230,13 +250,28 @@ class MapView(QWidget):
             p.drawText(pt + QPointF(8, 4), label)
 
     def _draw_entities(self, p: QPainter) -> None:
-        # Minimap: only within the configured radius. Full map: everything the feed sent.
-        near = self.nearby(None if self.full_map else self.settings.feed_radius_m)
+        # Minimap: only within the configured radius. Full map: every known peer.
+        near = self.nearby(None if self.full_map else self.settings.peer_radius_m)
         if not near:
             return
         bounds = (0.0, 0.0, float(self.width()), float(self.height()))
-        pts = [(n, self.to_screen(*project_unclamped(n.x, n.y))) for n in near]
-        pts = [(n, pt) for n, pt in pts if -10 <= pt.x() <= bounds[2] + 10 and -10 <= pt.y() <= bounds[3] + 10]
+        # one view() per frame instead of one per entity (to_screen recomputes it every call)
+        cl, ct, span = self.view()
+        scale = self.width() / span
+        sx, sy = scale / MAP_WIDTH / WORLD_SCALE, scale * (MAP_HEIGHT / MAP_WIDTH) / MAP_HEIGHT / WORLD_SCALE
+        ox, oy = self.width() / 2 + (X_OFFSET / MAP_WIDTH - cl) * scale, self.height() / 2 + (Y_OFFSET / MAP_HEIGHT - ct) * scale * MAP_HEIGHT / MAP_WIDTH
+        half = self.width() / 2
+        lim = (half + 4) ** 2 if not self.full_map else None
+        pts, off = [], []
+        for n in near:
+            pt = QPointF(ox + n.x * sx, oy + n.y * sy)
+            if lim is None:
+                inside = -10 <= pt.x() <= self.width() + 10 and -10 <= pt.y() <= self.height() + 10
+            else:
+                inside = (pt.x() - half) ** 2 + (pt.y() - self.height() / 2) ** 2 <= lim
+            (pts if inside else off).append((n, pt))
+        if off:
+            self._draw_edge_indicators(p, off)
         max_labels = MAX_LABELS_FULL if self.full_map else MAX_LABELS_MINIMAP
         if len(pts) > CROWDED_ON_SCREEN:
             max_labels = min(max_labels, CROWDED_LABELS)
@@ -244,44 +279,84 @@ class MapView(QWidget):
         fm = QFontMetricsF(font)
         p.setFont(font)
         placed: list[tuple[float, float, float, float]] = []
-        labelled = 0
-        for n, pt in reversed(pts):  # far first so near dots end up on top
-            self._draw_entity_dot(p, n, pt)
+        labelled = attempts = 0
+        widths = self._text_widths  # text measuring is the slow part of the layer: measure each string once
+        if len(widths) > 2000:
+            widths.clear()
+        for n, pt in reversed(pts):  # far first so near markers end up on top
+            self._draw_entity_marker(p, n, pt)
         pos = self.pipeline.latest.position
         my_z = pos.z if pos is not None else None
         for n, pt in pts:  # near first so near labels win placement
-            if labelled >= max_labels:
+            if labelled >= max_labels or attempts >= max_labels * LABEL_ATTEMPTS_PER_LABEL:
                 break
-            lines = entity_label_lines(n, my_z=my_z)
-            w = max(fm.horizontalAdvance(t) for t in lines) + 2
-            h = fm.height() * 2
+            attempts += 1
+            lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail)
+            w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
+            h = fm.height() * len(lines)
             r = place_label(pt.x(), pt.y(), w, h, placed, bounds)
             if r is None:
                 continue
             labelled += 1
-            color = PLAYER_COLOR if n.entity.kind == "player" else AI_COLOR
+            alpha = STALE_ALPHA if n.stale else 255
+            color = _qcolor(ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"]).color, alpha)
             for i, text in enumerate(lines):
                 base = QPointF(r[0], r[1] + fm.ascent() + i * fm.height())
-                p.setPen(QColor(0, 0, 0, 220))
+                p.setPen(QColor(0, 0, 0, min(220, alpha)))
                 p.drawText(base + QPointF(1, 1), text)
-                p.setPen(color if i == 0 else QColor(255, 255, 255))
+                p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
 
-    def _draw_entity_dot(self, p: QPainter, n: Nearby, pt: QPointF) -> None:
-        p.setPen(QPen(QColor(0, 0, 0, 230), 1.5))
-        if n.entity.kind == "player":  # circle
-            p.setBrush(PLAYER_COLOR)
-            p.drawEllipse(pt, 5, 5)
-        else:  # diamond
-            p.setBrush(AI_COLOR)
-            p.drawPolygon(QPolygonF([pt + QPointF(0, -6), pt + QPointF(6, 0), pt + QPointF(0, 6), pt + QPointF(-6, 0)]))
+    def _draw_entity_marker(self, p: QPainter, n: Nearby, pt: QPointF) -> None:
+        """Peer glyph: arrow when a heading is known, else a dot (diamond for ai); dim when stale.
+        Smaller and cyan, so it never looks like the red local arrow."""
+        st = ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"])
+        key = (n.entity.kind, n.stale)
+        pb = self._marker_tools.get(key)
+        if pb is None:  # one pen/brush per (kind, stale): creating them per marker dominated the layer
+            alpha = STALE_ALPHA if n.stale else 255
+            pb = self._marker_tools[key] = (QPen(_qcolor(st.outline, min(230, alpha)), 1.5), _qcolor(st.color, alpha))
+        p.setPen(pb[0])
+        p.setBrush(pb[1])
+        if n.entity.heading is not None:
+            p.save()
+            p.translate(pt)
+            p.rotate(n.entity.heading)
+            k = PEER_ARROW_SCALE
+            p.drawPolygon(QPolygonF([QPointF(0, -10 * k), QPointF(7 * k, 8 * k), QPointF(0, 4 * k), QPointF(-7 * k, 8 * k)]))
+            p.restore()
+        elif st.glyph == "diamond":
+            r = st.radius + 1
+            p.drawPolygon(QPolygonF([pt + QPointF(0, -r), pt + QPointF(r, 0), pt + QPointF(0, r), pt + QPointF(-r, 0)]))
+        else:
+            p.drawEllipse(pt, st.radius, st.radius)
 
-    def _draw_feed_status(self, p: QPainter) -> None:
-        if not self.feed_status:
+    def _draw_edge_indicators(self, p: QPainter, offscreen: list[tuple[Nearby, QPointF]]) -> None:
+        """In-radius players outside the minimap circle: a small pointer on the circle edge."""
+        if not offscreen:
+            return
+        cx, cy = self.width() / 2, self.height() / 2
+        r = self.width() / 2 - EDGE_INSET_PX
+        for n, pt in reversed(offscreen):
+            a = edge_anchor(cx, cy, pt.x(), pt.y(), r)
+            if a is None:
+                continue
+            st = ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"])
+            alpha = STALE_ALPHA if n.stale else 255
+            p.save()
+            p.translate(QPointF(*a))
+            p.rotate(math.degrees(math.atan2(pt.x() - cx, -(pt.y() - cy))))  # points outward
+            p.setPen(QPen(_qcolor(st.outline, min(230, alpha)), 1.2))
+            p.setBrush(_qcolor(st.color, alpha))
+            p.drawPolygon(QPolygonF([QPointF(0, -5), QPointF(4, 3), QPointF(-4, 3)]))
+            p.restore()
+
+    def _draw_peer_status(self, p: QPainter) -> None:
+        if not self.peer_status:
             return
         p.setFont(QFont("Segoe UI", 8))
-        p.setPen(QColor(255, 255, 255, 190) if "ok" in self.feed_status or "demo" in self.feed_status else QColor(255, 170, 90))
-        p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, self.feed_status)
+        p.setPen(QColor(255, 170, 90) if status_is_warning(self.peer_status) else QColor(255, 255, 255, 190))
+        p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, self.peer_status)
 
     def _draw_player(self, p: QPainter) -> None:
         if not self.interp.has_fix:
@@ -293,8 +368,9 @@ class MapView(QWidget):
         p.save()
         p.translate(c)
         p.rotate(self.interp.heading)
-        p.setPen(QPen(QColor(0, 0, 0), 1.5))
-        p.setBrush(QColor(255, 64, 64))
+        st = ENTITY_STYLE["self"]
+        p.setPen(QPen(_qcolor(st.outline), 1.5))
+        p.setBrush(_qcolor(st.color))
         p.drawPolygon(QPolygonF([QPointF(0, -10), QPointF(7, 8), QPointF(0, 4), QPointF(-7, 8)]))
         p.restore()
 

@@ -150,6 +150,11 @@ class TelemetryPipeline:
         self._vitals = VitalsTracker()
         self._server: str | None = None
         self._on_update = on_update
+        # Passive read-only taps for other consumers of the same decoded stream (peers.GamePeerSource).
+        # inbound: fn(datagram, own_net_ref_handle | None) for every inbound datagram from the learned server;
+        # reset: fn() when handles stop being valid (new server / game restart).
+        self._inbound_observers: list[Callable[[Datagram, int | None], None]] = []
+        self._reset_observers: list[Callable[[], None]] = []
         self._counts = {"outbound": 0, "inbound": 0, "dropped": 0, "udp_total": 0, "decoded": 0}
         self.latest = Telemetry()
 
@@ -160,12 +165,36 @@ class TelemetryPipeline:
                 status, dict(self._counts),
             )
 
+    def add_observer(self, on_inbound: Callable[[Datagram, int | None], None],
+                     on_reset: Callable[[], None] | None = None) -> None:
+        with self._lock:
+            self._inbound_observers.append(on_inbound)
+            if on_reset is not None:
+                self._reset_observers.append(on_reset)
+
+    def remove_observer(self, on_inbound: Callable[[Datagram, int | None], None],
+                        on_reset: Callable[[], None] | None = None) -> None:
+        with self._lock:
+            if on_inbound in self._inbound_observers:
+                self._inbound_observers.remove(on_inbound)
+            if on_reset is not None and on_reset in self._reset_observers:
+                self._reset_observers.remove(on_reset)
+
+    def _notify_reset(self, observers: list[Callable[[], None]]) -> None:
+        for fn in observers:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - an observer must never break own-player decoding
+                pass
+
     def reset(self) -> None:
         with self._lock:
             self._movement.reset()
             self._vitals.reset()
             self._server = None
             self.latest = Telemetry(status="waiting", stats=dict(self._counts))
+            observers = list(self._reset_observers)
+        self._notify_reset(observers)
 
     def note_dropped(self, n: int = 1) -> None:
         self._counts["dropped"] += n
@@ -183,6 +212,8 @@ class TelemetryPipeline:
 
     def handle(self, d: Datagram) -> Telemetry | None:
         """Decode one datagram; returns the new snapshot if something changed."""
+        tap: tuple[list, int | None] | None = None
+        reset_taps: list | None = None
         with self._lock:
             cur = self.latest
             pos, pos_at, vit, vit_at = cur.position, cur.position_at, cur.vitals, cur.vitals_at
@@ -194,6 +225,7 @@ class TelemetryPipeline:
                     self._server = server
                     self._vitals.reset()
                     vit, vit_at = None, 0.0
+                    reset_taps = list(self._reset_observers)
                 sample = self._movement.track(d.payload, d.observed_at)
                 if sample is not None:
                     self._counts["decoded"] += 1
@@ -204,12 +236,23 @@ class TelemetryPipeline:
                     obs: VitalsObservation | None = self._vitals.track(d.payload, d.observed_at)
                     if obs is not None:
                         vit, vit_at, changed = obs.vitals, d.observed_at, True
+                    if self._inbound_observers:
+                        tap = (list(self._inbound_observers), self._vitals.self_handle)
             if not changed:
-                return None
-            status = "tracking" if pos is not None else cur.status
-            self.latest = Telemetry(pos, pos_at, vit, vit_at, status, dict(self._counts))
-            snap = self.latest
-        if self._on_update:
+                snap = None
+            else:
+                status = "tracking" if pos is not None else cur.status
+                self.latest = Telemetry(pos, pos_at, vit, vit_at, status, dict(self._counts))
+                snap = self.latest
+        if reset_taps:
+            self._notify_reset(reset_taps)
+        if tap is not None:
+            for fn in tap[0]:
+                try:
+                    fn(d, tap[1])
+                except Exception:  # noqa: BLE001 - an observer must never break own-player decoding
+                    pass
+        if snap is not None and self._on_update:
             self._on_update(snap)
         return snap
 

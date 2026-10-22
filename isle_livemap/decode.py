@@ -233,6 +233,9 @@ class IrisPacket:
     is_complete: bool
     batches: list[IrisBatch] = field(default_factory=list)
     incomplete_reason: str | None = None
+    # First field of each destruction record (an Iris packed u64 in the same domain as ``net_ref_handle``).
+    # Read by the existing envelope walk; the semantics are NOT validated against a recorded despawn.
+    destroyed_handles: tuple[int, ...] = ()
 
 
 _MAX_BATCHES = 8192
@@ -421,7 +424,7 @@ def _skip_net_token_stream(r: _Reader) -> bool:
 
 
 def _parse_data_stream(
-    bits: Bits, start: int, bit_count: int, batches: list[IrisBatch]
+    bits: Bits, start: int, bit_count: int, batches: list[IrisBatch], destroyed: list[int] | None = None
 ) -> tuple[bool, bool, str | None]:
     """Returns (ok, complete, incomplete_reason)."""
     end = start + bit_count
@@ -442,8 +445,11 @@ def _parse_data_stream(
     if batch_count >= _MAX_BATCHES or destruction_count > batch_count:
         return False, True, None
     for _ in range(destruction_count):
-        if r.iris_packed_u64() is None:
+        dead = r.iris_packed_u64()
+        if dead is None:
             return False, True, None
+        if destroyed is not None:
+            destroyed.append(dead)
         has_info = r.bits(1)
         if has_info is None:
             return False, True, None
@@ -554,6 +560,7 @@ def parse_iris_packet(payload: bytes) -> IrisPacket | None:
             if has_byte is None or (has_byte != 0 and not r.skip(8)):
                 return None
     batches: list[IrisBatch] = []
+    destroyed: list[int] = []
     complete = True
     reason: str | None = None
     has_stream = False
@@ -565,7 +572,7 @@ def parse_iris_packet(payload: bytes) -> IrisPacket | None:
         start = r.pos
         if channel == 2:
             has_stream = True
-            ok, stream_complete, stream_reason = _parse_data_stream(bits, start, n, batches)
+            ok, stream_complete, stream_reason = _parse_data_stream(bits, start, n, batches, destroyed)
             if not ok:
                 return None
             complete = complete and stream_complete
@@ -574,4 +581,71 @@ def parse_iris_packet(payload: bytes) -> IrisPacket | None:
             return None
     if r.pos != bunches_end:
         return None
-    return IrisPacket(sequence, has_stream, complete, batches, reason)
+    return IrisPacket(sequence, has_stream, complete, batches, reason, tuple(destroyed))
+
+
+# ---------------------------------------------------------------- other actors' location (TRD-050)
+#
+# Derived from the recorded inbound packets in tests/fixtures (see docs/trd/other-players-on-minimap.md,
+# "TRD-050 Findings"). 55 batches of 28 distinct handles across 8 recorded packets share one layout:
+#
+#   33 bits  fixed state header, always 0x20E822A8 (LSB-first)      <- identifies this replicated state
+#    7 bits  FVector_NetQuantize100 header: (bit 6 set) | component bit count (6 bits)
+#  3*comp    x, y, z as signed raw = cm * 100 (same quantisation as the outbound own-player move)
+#   37 bits  trailing state, NOT decoded (rotation/velocity?; unverified)
+#
+# so data_bit_count == 77 + 3*comp exactly (155 -> comp 26, 158 -> comp 27 in every recorded batch).
+# Nothing here says what KIND of actor it is (player, AI, ...): the class is carried by object exports,
+# which the envelope walk skips and no fixture contains. Name and vitals of these actors are not decoded.
+
+ACTOR_STATE_HEADER = 0x20E822A8
+ACTOR_STATE_HEADER_BITS = 33
+ACTOR_STATE_TAIL_BITS = 37
+# Recorded batches only show 26 and 27 bits. The size equation plus the 33-bit state header are the real
+# discriminators, so narrower widths (actors near the world origin / low) are accepted; unobserved, 16 is a floor.
+ACTOR_MIN_COMP_BITS = 16
+
+
+@dataclass(frozen=True, slots=True)
+class ActorLocation:
+    net_ref_handle: int
+    x: float  # Unreal cm, same axes and units as MovementCandidate
+    y: float
+    z: float
+    component_bit_count: int
+
+
+def decode_actor_location(bits: Bits, batch: IrisBatch) -> ActorLocation | None:
+    """Location of the replicated actor in ``batch`` if it has the recorded location layout, else None."""
+    n = batch.data_bit_count
+    comp, rem = divmod(n - ACTOR_STATE_HEADER_BITS - _HEADER_BITS - ACTOR_STATE_TAIL_BITS, 3)
+    if rem or comp < ACTOR_MIN_COMP_BITS or comp > _MAX_COMP_BITS:
+        return None
+    base = batch.data_bit_offset
+    if bits.read(base, ACTOR_STATE_HEADER_BITS) != ACTOR_STATE_HEADER:
+        return None
+    header = bits.read(base + ACTOR_STATE_HEADER_BITS, _HEADER_BITS)
+    if not header & 64 or (header & 63) != comp:
+        return None
+    start = base + ACTOR_STATE_HEADER_BITS + _HEADER_BITS
+    rx, ry, rz = (_read_signed(bits, start + comp * i, comp) for i in range(3))
+    if not _canonical(rx, ry, rz, comp):
+        return None
+    x, y, z = rx / 100.0, ry / 100.0, rz / 100.0
+    if not _plausible_world(x, y, z):
+        return None
+    return ActorLocation(batch.net_ref_handle, x, y, z, comp)
+
+
+def decode_actor_locations(payload: bytes, packet: IrisPacket | None = None) -> list[ActorLocation]:
+    """Every actor location in one inbound replication datagram (the last one wins per handle)."""
+    packet = packet or parse_iris_packet(payload)
+    if packet is None:
+        return []
+    bits = Bits(payload)
+    found: dict[int, ActorLocation] = {}
+    for batch in packet.batches:
+        loc = decode_actor_location(bits, batch)
+        if loc is not None:
+            found[loc.net_ref_handle] = loc
+    return list(found.values())

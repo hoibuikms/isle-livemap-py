@@ -16,10 +16,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--iface", help="capture interface (default: scapy's default route)")
     ap.add_argument("--diagnose", action="store_true", help="print capture diagnostics (no UI) and exit")
     ap.add_argument("--seconds", type=float, default=10.0, help="--diagnose: sniff duration per run (default 10)")
-    ap.add_argument("--feed-url", help="URL of YOUR server's entity feed (env ISLE_FEED_URL); see docs/SERVER_FEED.md")
-    ap.add_argument("--feed-token", help="bearer token for the feed (env ISLE_FEED_TOKEN is safer: argv is visible to other processes)")
+    ap.add_argument("--lab-peers", nargs="?", const=7777, type=int, metavar="PORT",
+                    help="dev/testing: show other players from lab records on loopback 127.0.0.1:PORT (default 7777)")
+    ap.add_argument("--game-peers", action="store_true",
+                    help="owner-only, opt-in: other players from real game traffic (passive capture of the same inbound stream; position only)")
     ap.add_argument("--data-dir", type=Path, help="where markers.json/settings.json live")
     args = ap.parse_args(argv)
+    if args.lab_peers is not None and args.game_peers:
+        ap.error("--lab-peers and --game-peers are mutually exclusive")
 
     if args.diagnose:
         from .diagnose import run_diagnose
@@ -62,22 +66,34 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {err}", file=sys.stderr)
             return 2
 
-    from .feed import DemoFeed, FeedPoller, resolve_feed_config
+    from .peers import create_peer_source
 
-    feed_url, feed_token = resolve_feed_config(settings, args.feed_url, args.feed_token)
-    if args.replay and not feed_url:  # demo without a server: internal synthetic feed
-        def anchor():
-            pos = pipeline.latest.position
-            return (pos.x, pos.y) if pos is not None else None
+    def anchor():
+        pos = pipeline.latest.position
+        return (pos.x, pos.y) if pos is not None else None
 
-        feed = DemoFeed(anchor)
+    lab_port = args.lab_peers if args.lab_peers is not None else 7777
+
+    def make_peers(kind: str):
+        return create_peer_source(kind, anchor, lab_port=lab_port, self_ids=settings.peer_self_ids, pipeline=pipeline)
+
+    # Flags win over settings. --replay alone shows the synthetic demo peers. "game" is only ever
+    # chosen explicitly (--game-peers or peer_source = "game"); it is never the default.
+    if args.lab_peers is not None:
+        kind = "lab"
+    elif args.game_peers:
+        kind = "game"
+    elif args.replay:
+        kind = "synthetic"
     else:
-        feed = FeedPoller(feed_url, feed_token, settings.feed_interval_s)
-    feed.start()
+        kind = settings.peer_source
+    peers = create_peer_source("off", anchor, synthetic=True) if kind == "synthetic" else make_peers(kind)
+    if peers is not None:
+        peers.start()
 
-    app = App(qapp, pipeline, store, settings, feed)  # noqa: F841 (kept alive)
+    app = App(qapp, pipeline, store, settings, peers, make_peers)  # noqa: F841 (kept alive)
     qapp.aboutToQuit.connect(source.stop)
-    qapp.aboutToQuit.connect(feed.stop)
+    qapp.aboutToQuit.connect(lambda: app.peers.stop() if app.peers is not None else None)
     return qapp.exec()
 
 

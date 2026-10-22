@@ -24,3 +24,4 @@ isle_livemap = ["assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: performance smoke tests (run by default; deselect with -m 'not slow')"]

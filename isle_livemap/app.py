@@ -13,9 +13,9 @@ from PySide6.QtWidgets import (
 )
 
 from .capture import TelemetryPipeline
-from .feed import insecure_warning, validate_url
 from .geo import (
-    MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance, parse_radii,
+    MARKER_KINDS, PEER_SOURCES, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, canonical_id, entity_row, format_distance,
+    parse_radii,
 )
 from .overlay import MapView
 
@@ -103,7 +103,7 @@ class MarkersPanel(QDialog):
 
 
 class NearbyPanel(QDialog):
-    """Players / AI from the server feed, nearest first (refreshes while visible)."""
+    """Other players from the peer source, nearest first (same selection as the minimap)."""
 
     COLUMNS = ("Name", "Species", "Health", "Growth", "Stamina", "Hunger", "Water", "Distance", "3D", "Height Δ")
 
@@ -111,7 +111,7 @@ class NearbyPanel(QDialog):
         super().__init__()
         self.view = view
         self._rows: list = []
-        self.setWindowTitle("Nearby (server feed)")
+        self.setWindowTitle("Nearby players")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.status = QLabel()
         self.table = QTableWidget(0, len(self.COLUMNS))
@@ -127,7 +127,7 @@ class NearbyPanel(QDialog):
         self.timer.timeout.connect(self.refresh)
 
     def refresh(self) -> None:
-        self.status.setText(self.view.feed_status or "feed: off (set a feed URL in Feed settings)")
+        self.status.setText(self.view.peer_status or "peers: off (choose a source in Peers settings)")
         pos = self.view.pipeline.latest.position
         my_z = pos.z if pos is not None else None
         rows = [entity_row(n, my_z) for n in self.view.nearby()]
@@ -148,53 +148,53 @@ class NearbyPanel(QDialog):
         super().hideEvent(e)
 
 
-class FeedDialog(QDialog):
-    """URL / token / radius of the user's own server feed."""
+class PeersDialog(QDialog):
+    """Owner-facing settings for other players: source, radius, self ids, detail line."""
 
-    def __init__(self, parent, settings: Settings, current_url: str, token_set: bool) -> None:
+    def __init__(self, parent, settings: Settings) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Server feed settings")
+        self.setWindowTitle("Peers settings")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-        self.url = QLineEdit(current_url)
-        self.url.setPlaceholderText("https://my-server.example/feed")
-        self.token = QLineEdit()
-        self.token.setEchoMode(QLineEdit.EchoMode.Password)
-        self.token.setPlaceholderText("(unchanged)" if token_set else "(none)")
-        self.clear_token = QCheckBox("Clear token")
+        self.source = QComboBox()
+        self.source.addItems(PEER_SOURCES)
+        self.source.setCurrentText(settings.peer_source)
         self.radius = QDoubleSpinBox()
         self.radius.setRange(50, 20_000)
         self.radius.setSuffix(" m")
-        self.radius.setValue(settings.feed_radius_m)
-        self.warn = QLabel()
-        self.warn.setWordWrap(True)
-        self.warn.setStyleSheet("color: #c60;")
-        self.url.textChanged.connect(self._check)
+        self.radius.setValue(settings.peer_radius_m)
+        self.self_ids = QLineEdit(", ".join(settings.peer_self_ids))
+        self.self_ids.setPlaceholderText("ids that are you, comma separated")
+        self.detail = QCheckBox("Show vitals detail line on labels")
+        self.detail.setChecked(settings.show_vitals_detail)
         form = QFormLayout(self)
-        form.addRow(QLabel("Only a server you own/control can provide other players and AI."))
-        form.addRow("URL", self.url)
-        form.addRow("Token", self.token)
-        form.addRow("", self.clear_token)
+        form.addRow(QLabel("off = none, lab = loopback test records, game = owner-only passive capture, other actors' positions only."))
+        form.addRow("Source", self.source)
         form.addRow("Minimap radius", self.radius)
-        form.addRow(self.warn)
+        form.addRow("My ids", self.self_ids)
+        form.addRow("", self.detail)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         form.addRow(bb)
-        self._check()
 
-    def _check(self) -> None:
-        url = self.url.text().strip()
-        self.warn.setText((validate_url(url) if url else None) or insecure_warning(url) or "")
+    def apply(self, settings: Settings) -> None:
+        settings.peer_source = self.source.currentText()
+        settings.peer_radius_m = self.radius.value()
+        settings.peer_self_ids = [canonical_id(t) for t in self.self_ids.text().replace(";", ",").split(",") if t.strip()]
+        settings.show_vitals_detail = self.detail.isChecked()
+        settings.normalise()
 
 
 class App(QObject):
     def __init__(self, qapp: QApplication, pipeline: TelemetryPipeline, store: MarkerStore, settings: Settings,
-                 feed=None) -> None:
+                 peers=None, peer_factory=None) -> None:
+        """``peer_factory(kind) -> unstarted PeerSource | None`` lets the Peers dialog switch source."""
         super().__init__()
         self.qapp, self.settings, self.store = qapp, settings, store
         self.pipeline = pipeline
-        self.feed = feed
-        self.view = MapView(pipeline, store, settings, feed)
+        self.peers = peers
+        self.peer_factory = peer_factory
+        self.view = MapView(pipeline, store, settings, peers)
         self.view.request_marker_at_world = self.add_marker_at
         self.panel = MarkersPanel(self.view, store)
         self.nearby_panel = NearbyPanel(self.view)
@@ -250,16 +250,16 @@ class App(QObject):
             menu.addAction(a)
         menu.addSeparator()
         for text, fn in (
-            ("Zoom to feed radius", lambda: self.view.zoom_to_radius(self.settings.feed_radius_m)),
+            ("Zoom to peer radius", lambda: self.view.zoom_to_radius(self.settings.peer_radius_m)),
             ("Size…", self.ask_size), ("Range rings…", self.ask_rings), ("Species label…", self.ask_species),
-            ("Feed settings…", self.ask_feed),
+            ("Peers settings…", self.ask_peers),
         ):
             a = QAction(text, menu)
             a.triggered.connect(fn)
             menu.addAction(a)
         for text, attr in (
             ("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings"),
-            ("Show players (feed)", "show_players"), ("Show AI (feed)", "show_ai"),
+            ("Show other players", "show_players"),  # no "Show AI": packet sources never report an AI kind
         ):
             a = QAction(text, menu, checkable=True)
             a.setChecked(getattr(self.settings, attr))
@@ -282,18 +282,24 @@ class App(QObject):
         self.nearby_panel.show()
         self.nearby_panel.raise_()
 
-    def ask_feed(self) -> None:
-        if self.feed is None or not hasattr(self.feed, "token"):
-            return
-        dlg = FeedDialog(None, self.settings, self.feed.url if self.feed.url != "(demo)" else "", self.feed.token_set)
+    def ask_peers(self) -> None:
+        dlg = PeersDialog(None, self.settings)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        token = "" if dlg.clear_token.isChecked() else (dlg.token.text().strip() or self.feed.token)
-        self.settings.feed_url, self.settings.feed_token = dlg.url.text().strip(), token
-        self.settings.feed_radius_m = dlg.radius.value()
-        self.settings.normalise()
-        self.view.zoom_to_radius(self.settings.feed_radius_m)
-        self.feed.configure(self.settings.feed_url, self.settings.feed_token, self.settings.feed_interval_s)
+        before = self.settings.peer_source
+        dlg.apply(self.settings)
+        self.view.zoom_to_radius(self.settings.peer_radius_m)
+        if hasattr(self.peers, "store"):
+            self.peers.store.set_self_ids(self.settings.peer_self_ids)
+        if self.settings.peer_source != before and self.peer_factory is not None:
+            self.set_peers(self.peer_factory(self.settings.peer_source))
+
+    def set_peers(self, peers) -> None:
+        if self.peers is not None:
+            self.peers.stop()
+        self.peers = self.view.peers = peers
+        if peers is not None:
+            peers.start()
 
     def add_marker_here(self) -> None:
         pos = self.view.player_world()

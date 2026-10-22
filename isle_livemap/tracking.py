@@ -503,6 +503,11 @@ class VitalsTracker:
         self._last_self_hb = 0.0
         self._vitals = Vitals(max_thirst=_DEFAULT_MAX_THIRST)
 
+    @property
+    def self_handle(self) -> int | None:
+        """Iris handle of the own pawn once the heartbeat lock has chosen it, else None."""
+        return self._self_handle
+
     # -- lifecycle -----------------------------------------------------------
     def reset(self) -> None:
         self._candidates.clear()

@@ -11,7 +11,7 @@ import math
 import os
 import sys
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from .decode import normalize_degrees
@@ -216,6 +216,9 @@ def _clamp_num(value, lo: float, hi: float, default: float) -> float:
     return min(max(v, lo), hi) if math.isfinite(v) else default
 
 
+PEER_SOURCES = ("off", "lab", "game")
+
+
 @dataclass(slots=True)
 class Settings:
     size_percent: int = 100
@@ -228,13 +231,19 @@ class Settings:
     window_x: int | None = None
     window_y: int | None = None
     iface: str = ""  # last --iface used for live capture
-    # server feed (the ONLY source of other entities; needs a server you control)
+    # DEPRECATED feed fields: nothing in the app reads them any more. They stay only
+    # because feed.py / test_feed.py still use them; removed together with feed.py (TRD-070).
     feed_url: str = ""
-    feed_token: str = ""  # stored in plain text; prefer ISLE_FEED_TOKEN
-    feed_radius_m: float = 1000.0
+    feed_token: str = ""
+    feed_radius_m: float = 1000.0  # migrated to peer_radius_m on load
     feed_interval_s: float = 0.5
+    # other players (packet-sourced, see peers.py)
+    peer_source: str = "off"  # "off" | "lab" | "game"; never "game" by default (owner-only opt-in)
+    peer_radius_m: float = 1000.0
+    peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client)
+    show_vitals_detail: bool = False
     show_players: bool = True
-    show_ai: bool = True
+    show_ai: bool = True  # inert for packet sources (they never report an AI kind); kept for old feed data
 
     def normalise(self) -> "Settings":
         self.size_percent = clamp_size_percent(self.size_percent)
@@ -245,6 +254,11 @@ class Settings:
         self.feed_token = str(self.feed_token or "").strip()
         self.feed_radius_m = _clamp_num(self.feed_radius_m, 50.0, 20_000.0, 1000.0)
         self.feed_interval_s = _clamp_num(self.feed_interval_s, 0.25, 30.0, 0.5)
+        self.peer_source = self.peer_source if self.peer_source in PEER_SOURCES else "off"
+        self.peer_radius_m = _clamp_num(self.peer_radius_m, 50.0, 20_000.0, 1000.0)
+        ids = self.peer_self_ids if isinstance(self.peer_self_ids, (list, tuple, set)) else []
+        self.peer_self_ids = sorted({c for c in (canonical_id(i) for i in ids) if c}, key=str)[:32]
+        self.show_vitals_detail = bool(self.show_vitals_detail)
         self.show_players, self.show_ai = bool(self.show_players), bool(self.show_ai)
         return self
 
@@ -254,6 +268,8 @@ class Settings:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
+            if "peer_radius_m" not in known and "feed_radius_m" in raw:  # settings written before peers existed
+                known["peer_radius_m"] = raw["feed_radius_m"]
             return cls(**known).normalise()
         except (OSError, ValueError, TypeError, AttributeError):
             return cls()
@@ -311,9 +327,13 @@ class Interpolator:
         return self.x, self.y, self.heading
 
 
-# ----------------------------------------------------------------- server-feed entities
+# ----------------------------------------------------------------- other entities
 # World units are the same as the local telemetry: Unreal centimetres, same axes
-# (north = -Y). Entities come ONLY from the user's own server feed (see feed.py).
+# (north = -Y). Other players come from a local PeerSource (see peers.py).
+
+PEER_STALE_S = 3.0  # dimmed after this long without an update
+PEER_TTL_S = 5.0  # removed after this long (the only despawn rule; matches labsim NODE_TTL)
+LOCAL_ID = "local"  # id of geo.local_entity(); packet ids never equal it
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +350,11 @@ class Entity:
     stamina_pct: float | None = None
     hunger_pct: float | None = None
     thirst_pct: float | None = None
+    heading: float | None = None  # map heading, degrees clockwise from north (like the local arrow); None = unknown
+
+    def __post_init__(self) -> None:
+        h = self.heading
+        object.__setattr__(self, "heading", normalize_degrees(float(h)) if h is not None and math.isfinite(h) else None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +364,57 @@ class Nearby:
     y: float
     distance_m: float
     bearing: float
+    age_s: float | None = None  # seconds since the source last reported it (None = not tracked)
+
+    @property
+    def stale(self) -> bool:
+        return self.age_s is not None and self.age_s >= PEER_STALE_S
+
+
+# ---- marker styles: the one place colours / sizes / glyphs of map entities live
+@dataclass(frozen=True, slots=True)
+class EntityStyle:
+    color: str
+    outline: str
+    radius: float  # dot radius / arrow half-length scale, px
+    glyph: str  # "arrow" (self), "dot" (+ arrow when heading is known), "diamond"
+
+
+ENTITY_STYLE = {
+    "self": EntityStyle("#ff4040", "#000000", 10.0, "arrow"),  # local player: red, biggest, drawn last
+    "player": EntityStyle("#4dd0ff", "#00141c", 4.0, "dot"),  # other players: cyan, smaller, outlined
+    "ai": EntityStyle("#ff8a3d", "#1c0e00", 5.0, "diamond"),
+}
+STALE_ALPHA = 105  # 0-255 opacity of a stale (> PEER_STALE_S) peer
+PEER_ARROW_SCALE = 0.6  # peer arrow size relative to the local arrow
+
+
+def canonical_id(raw) -> str:
+    """Normalise an id for comparison: stripped text; integer ids are wrapped to signed
+    32 bit so the unsigned sniffer parse and the signed telemetry parse agree."""
+    text = str(raw).strip()
+    try:
+        n = int(text, 10)
+    except ValueError:
+        return text
+    if 2**31 <= n < 2**32:
+        n -= 2**32
+    return str(n)
+
+
+def is_self(entity_id: str, me_id: str = LOCAL_ID, self_ids=()) -> bool:
+    """True for the local player: the literal "local", ``me_id`` or any configured self id."""
+    cid = canonical_id(entity_id)
+    return cid in (LOCAL_ID, canonical_id(me_id)) or cid in {canonical_id(i) for i in self_ids}
+
+
+def edge_anchor(cx: float, cy: float, tx: float, ty: float, radius: float) -> tuple[float, float] | None:
+    """Point on the circle (centre cx,cy) in the direction of (tx,ty); None for a zero/invalid vector."""
+    dx, dy = tx - cx, ty - cy
+    n = math.hypot(dx, dy)
+    if not math.isfinite(n) or n == 0.0:
+        return None
+    return cx + dx / n * radius, cy + dy / n * radius
 
 
 def nearby_entities(items, px: float, py: float, radius_m: float | None = None,
@@ -413,13 +489,41 @@ def distance_3d_m(n: Nearby, my_z: float | None) -> float:
     return n.distance_m if dz is None else math.hypot(n.distance_m, dz)
 
 
-def nearby_3d(me: Entity, entities, max_distance_m: float) -> list[Nearby]:
+def visible_entities(items, px: float, py: float, radius_m: float | None = None, show_players: bool = True,
+                     show_ai: bool = True, self_ids=(), me_id: str = LOCAL_ID, my_z: float | None = None,
+                     use_3d: bool = False, ttl_s: float | None = PEER_TTL_S) -> list[Nearby]:
+    """The one selection used by the minimap, the Nearby panel and nearby.py.
+
+    ``items``: iterable of (Entity, x, y) or (Entity, x, y, age_s) from (px, py). Drops the
+    local player (``is_self``: "local", ``me_id``, ``self_ids``), kinds switched off, entries
+    older than ``ttl_s`` and anything beyond ``radius_m`` (None = unlimited). Horizontal mode
+    keeps the radius inclusive (``nearby_entities`` contract); ``use_3d`` measures sqrt(h²+dZ²)
+    from ``my_z`` and keeps it strict (``nearby_3d`` contract). Nearest first, ties by id."""
+    ids = {canonical_id(i) for i in self_ids} | {LOCAL_ID, canonical_id(me_id)}
+    out = []
+    for item in items:
+        e, x, y = item[0], item[1], item[2]
+        age = item[3] if len(item) > 3 else None
+        if canonical_id(e.id) in ids:
+            continue
+        if (e.kind == "player" and not show_players) or (e.kind == "ai" and not show_ai):
+            continue
+        if age is not None and ttl_s is not None and age >= ttl_s:
+            continue
+        n = Nearby(e, x, y, distance_m(px, py, x, y), bearing_deg(px, py, x, y), age)
+        d = distance_3d_m(n, my_z) if use_3d else n.distance_m
+        if radius_m is not None and (d >= radius_m if use_3d else d > radius_m):
+            continue
+        out.append((d, n))
+    out.sort(key=lambda t: (t[0], t[1].entity.id))
+    return [n for _, n in out]
+
+
+def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[Nearby]:
     """Entities with 3D distance < ``max_distance_m`` from ``me`` (e.g. ``local_entity``),
-    nearest first, skipping ``me`` itself. Positions/heights are read exactly like
-    ``nearby_entities`` / ``height_delta_m`` do, so local player and feed entities agree."""
-    near = nearby_entities([(e, e.x, e.y) for e in entities if e.id != me.id], me.x, me.y)
-    near = [(distance_3d_m(n, me.z), n) for n in near]
-    return [n for d, n in sorted(near, key=lambda t: (t[0], t[1].entity.id)) if d < max_distance_m]
+    nearest first, skipping ``me`` itself and ``self_ids`` (see ``visible_entities``)."""
+    return visible_entities([(e, e.x, e.y) for e in entities], me.x, me.y, max_distance_m,
+                            self_ids=self_ids, me_id=me.id, my_z=me.z, use_3d=True)
 
 
 def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None) -> tuple[str, str]:
@@ -427,6 +531,14 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None)
     head = truncate(e.name or e.id, name_max) + (f" ({truncate(e.species, 14)})" if e.species else "")
     tail = f"HP {_pct(e.health_pct)} G {_pct(e.growth_pct)} {format_distance(n.distance_m)}"
     return head, tail if dz is None else f"{tail} {dz:+.0f}m"
+
+
+def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False) -> list[str]:
+    """Minimap label: ``entity_label_lines`` plus, with ``detail``, the known vitals (``vital_lines``)."""
+    lines = list(entity_label_lines(n, my_z=my_z))
+    if detail and (v := vital_lines(n.entity)):
+        lines.append(truncate("  ".join(v), 44))
+    return lines
 
 
 def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
@@ -472,22 +584,50 @@ def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bo
 
 
 class EntitySmoother:
-    """Per-entity exponential smoothing between ~2 Hz feed updates (like Interpolator)."""
+    """Per-entity exponential smoothing between source updates (like Interpolator).
 
-    def __init__(self, tau_s: float = 0.15, snap_distance_units: float = 200_000.0) -> None:
-        self.tau, self.snap = tau_s, snap_distance_units
+    ``update(entities)`` (no ``now``) keeps the old contract: ids missing from an update vanish
+    at once. ``update(entities, now)`` tracks ``last_seen`` and keeps a missing id until
+    ``ttl_s`` has passed, so one missed packet does not flicker. Entries may be ``Entity`` or
+    anything with ``.entity`` / ``.last_seen`` (``peers.PeerEntity``). Heading is smoothed along
+    the shortest arc when the source supplies one."""
+
+    def __init__(self, tau_s: float = 0.15, snap_distance_units: float = 200_000.0, ttl_s: float = PEER_TTL_S) -> None:
+        self.tau, self.snap, self.ttl = tau_s, snap_distance_units, ttl_s
         self.entities: dict[str, Entity] = {}
         self.pos: dict[str, list[float]] = {}
+        self.heading: dict[str, float] = {}
+        self.last_seen: dict[str, float] = {}
 
-    def update(self, entities) -> None:
-        new = {e.id: e for e in entities}
+    def update(self, entities, now: float | None = None) -> None:
+        new: dict[str, Entity] = {}
+        seen: dict[str, float] = {}
+        for item in entities:
+            e = getattr(item, "entity", item)
+            new[e.id] = e
+            ls = getattr(item, "last_seen", None)
+            seen[e.id] = ls if ls is not None else (now if now is not None else 0.0)
         for eid, e in new.items():
             cur = self.pos.get(eid)
             if cur is None or math.hypot(e.x - cur[0], e.y - cur[1]) > self.snap:
                 self.pos[eid] = [e.x, e.y]
-        for eid in set(self.pos) - set(new):
-            del self.pos[eid]
-        self.entities = new
+                if e.heading is not None:
+                    self.heading[eid] = e.heading
+            if e.heading is None:
+                self.heading.pop(eid, None)
+            elif eid not in self.heading:
+                self.heading[eid] = e.heading
+        self.last_seen.update(seen)
+        if now is None:
+            gone = set(self.pos) - set(new)
+        else:  # keep missing ids until their TTL runs out
+            gone = {i for i in self.pos if i not in new and now - self.last_seen.get(i, now) >= self.ttl}
+        for eid in gone:
+            self.pos.pop(eid, None)
+            self.heading.pop(eid, None)
+            self.last_seen.pop(eid, None)
+            self.entities.pop(eid, None)
+        self.entities = {**{i: e for i, e in self.entities.items() if i in self.pos}, **new}
 
     def step(self, dt: float) -> None:
         a = 1.0 - math.exp(-max(dt, 0.0) / self.tau) if self.tau > 0 else 1.0
@@ -495,9 +635,25 @@ class EntitySmoother:
             p = self.pos[eid]
             p[0] += (e.x - p[0]) * a
             p[1] += (e.y - p[1]) * a
+            h = self.heading.get(eid)
+            if h is not None and e.heading is not None:
+                self.heading[eid] = (h + shortest_arc(h, e.heading) * a) % 360.0
+
+    def _shown(self, eid: str, e: Entity) -> Entity:
+        h = self.heading.get(eid)
+        return e if h is None or e.heading is None else replace(e, heading=h)
 
     def items(self):
         return [(e, *self.pos[eid]) for eid, e in self.entities.items()]
+
+    def items_aged(self, now: float):
+        """[(Entity with smoothed heading, x, y, age_s)] for ids younger than the TTL."""
+        out = []
+        for eid, e in self.entities.items():
+            age = max(now - self.last_seen.get(eid, now), 0.0)
+            if age < self.ttl:
+                out.append((self._shown(eid, e), *self.pos[eid], age))
+        return out
 
 
 # ----------------------------------------------------------------- bundled data

@@ -1,0 +1,258 @@
+"""Real-game peer backend (TRD-051): other actors decoded from the same inbound stream as the own vitals.
+
+Golden numbers come from the recorded inbound packets in tests/fixtures (TRD-050 findings); synthetic
+batches are built with the repo's own ``replay.BitWriter`` / ``_needed``."""
+
+from __future__ import annotations
+
+import logging
+import math
+
+import pytest
+
+from isle_livemap import peers
+from isle_livemap.capture import INBOUND, OUTBOUND, Datagram, TelemetryPipeline
+from isle_livemap.decode import (
+    ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, Bits, IrisBatch, decode_actor_location,
+    decode_actor_locations, parse_iris_packet,
+)
+from isle_livemap.geo import peer_label_lines, visible_entities
+from isle_livemap.peers import GamePeerSource, create_peer_source
+from isle_livemap.replay import CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT, BitWriter, _needed, encode_move_payload
+
+T0 = 1_000.0
+OWN = 103_940  # the own pawn in FirstHeartbeat/SecondHeartbeat (see test_vitals)
+
+
+class Clock:
+    def __init__(self, t: float = 100.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def inbound(payload: bytes, at: float = T0) -> Datagram:
+    return Datagram(at, SERVER_IP, SERVER_PORT, CLIENT_IP, CLIENT_PORT, payload, INBOUND)
+
+
+def outbound(at: float = T0) -> Datagram:
+    return Datagram(at, CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT, encode_move_payload(1e5, 2e5, 3e4, 10.0, 41.0), OUTBOUND)
+
+
+def actor_batch(x: float, y: float, z: float, handle: int = 7, header: int = ACTOR_STATE_HEADER, comp: int | None = None):
+    """A batch in the recorded location layout, built with the repo's BitWriter."""
+    raw = [round(v * 100) for v in (x, y, z)]
+    comp = comp or max(_needed(r) for r in raw)
+    w = BitWriter()
+    w.write(header, ACTOR_STATE_HEADER_BITS)
+    w.write(comp | 64, 7)
+    for r in raw:
+        w.write(r, comp)
+    w.write(0x1ABCDEF123 & ((1 << ACTOR_STATE_TAIL_BITS) - 1), ACTOR_STATE_TAIL_BITS)
+    return Bits(w.to_bytes()), IrisBatch(handle, 0, w.nbits, True, False)
+
+
+# ---------------------------------------------------------------- decoder on recorded packets
+def test_recorded_packet_yields_other_actor_positions(b64):
+    locs = {l.net_ref_handle: l for l in decode_actor_locations(b64("SecondHeartbeat"))}
+    assert len(locs) == 15 and OWN not in locs  # the own pawn has no such batch
+    a = locs[93_362]  # 155-bit batch, 26-bit components
+    assert (a.x, a.y, a.z, a.component_bit_count) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88), 26)
+    b = locs[84_466]  # 158-bit batch, 27-bit components (|y|... a component beyond 335 544 cm)
+    assert b.component_bit_count == 27 and b.x == pytest.approx(413_642.88)
+
+
+def test_every_recorded_location_batch_is_a_canonical_world_position(b64, recorded):
+    total = 0
+    for name in ("FirstHeartbeat", "SecondHeartbeat", "PeriodicAttributes", "PteranodonHeartbeat1", "PteranodonHeartbeat2",
+                 "SparseMaximumAttributes", "SparseMaximumHeartbeat2", "TrailingAttributesHeartbeat1", "TrailingAttributesHeartbeat2"):
+        pkt = parse_iris_packet(b64(name))
+        locs = decode_actor_locations(b64(name), pkt)
+        sized = [b for b in pkt.batches if b.data_bit_count in (155, 158)]
+        assert len(locs) == len({b.net_ref_handle for b in sized})  # every 155/158-bit batch decodes, nothing else does
+        for l in locs:
+            assert -800_000 <= l.x <= 800_000 and -800_000 <= l.y <= 800_000 and 1_000 < l.z < 100_000
+        total += len(locs)
+    assert total >= 40
+
+
+def test_same_handle_moves_continuously_between_packets(b64):
+    a = {l.net_ref_handle: l for l in decode_actor_locations(b64("TrailingAttributesHeartbeat1"))}[206_308]
+    b = {l.net_ref_handle: l for l in decode_actor_locations(b64("TrailingAttributesHeartbeat2"))}[206_308]
+    assert math.dist((a.x, a.y, a.z), (b.x, b.y, b.z)) < 500  # < 5 m between two packets: same actor, same layout
+
+
+def test_destruction_record_is_exposed_by_the_envelope_walk(b64):
+    pkt = parse_iris_packet(b64("DetachedDamagedAttributes"))
+    assert pkt is not None and pkt.destroyed_handles == (86_078,)
+    assert parse_iris_packet(b64("SecondHeartbeat")).destroyed_handles == ()
+
+
+# ---------------------------------------------------------------- decoder on synthetic batches
+@pytest.mark.parametrize("pos", [(201_852.74, -249_768.68, 30_398.88), (413_642.88, -232_348.96, 37_593.69),
+                                 (-45_000.5, 12_000.25, 20_000.0), (1.0, 1.0, 20_000.0), (-5.0, 7.0, 9_000.0)])
+def test_synthetic_batch_round_trips(pos):
+    bits, batch = actor_batch(*pos)
+    loc = decode_actor_location(bits, batch)
+    assert loc is not None and loc.net_ref_handle == 7
+    assert (loc.x, loc.y, loc.z) == pytest.approx(pos, abs=0.006)
+
+
+def test_synthetic_batch_matches_recorded_sizes():
+    assert actor_batch(201_852.74, -249_768.68, 30_398.88)[1].data_bit_count == 155
+    assert actor_batch(413_642.88, -232_348.96, 37_593.69)[1].data_bit_count == 158
+
+
+def test_decoder_rejects_other_layouts():
+    bits, batch = actor_batch(1e5, 2e5, 3e4)
+    assert decode_actor_location(bits, batch) is not None
+    assert decode_actor_location(bits, IrisBatch(7, 0, batch.data_bit_count + 1, True, False)) is None  # size != 77 + 3*comp
+    assert decode_actor_location(bits, IrisBatch(7, 1, batch.data_bit_count, True, False)) is None  # shifted: header mismatch
+    assert decode_actor_location(*actor_batch(1e5, 2e5, 3e4, header=ACTOR_STATE_HEADER ^ 1)) is None  # another state class
+    assert decode_actor_location(*actor_batch(1e5, 2e5, 3e4, comp=27)) is None  # non-canonical component width
+    assert decode_actor_location(*actor_batch(9e5, 2e5, 3e4)) is None  # outside the world
+    assert decode_actor_location(*actor_batch(1e5, 2e5, 3e6)) is None
+
+
+def test_decoder_never_raises_on_junk():
+    assert decode_actor_locations(b"") == [] and decode_actor_locations(bytes(range(200))) == []
+
+
+# ---------------------------------------------------------------- GamePeerSource
+def make(**kw):
+    clk = Clock()
+    kw.setdefault("pipeline", TelemetryPipeline())  # attached but not started: on_inbound is driven by hand
+    return GamePeerSource(clock=clk, **kw), clk
+
+
+def test_peers_come_from_inbound_batches_with_unknown_fields_none(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    snap = g.snapshot()
+    assert len(snap.entities) == 15 and g.locations == 15
+    e = {p.id: p.entity for p in snap.entities}["93362"]
+    assert (e.kind, e.name, e.species) == ("player", "Actor #93362", "")
+    assert (e.x, e.y, e.z) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88))
+    assert (e.health_pct, e.growth_pct, e.stamina_pct, e.hunger_pct, e.thirst_pct, e.heading) == (None,) * 6
+    assert "position only" in snap.status and "not decoded" in snap.status and not peers.status_is_warning(snap.status)
+
+
+def test_labels_show_question_marks_for_undecoded_vitals(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    near = visible_entities([(p.entity, p.entity.x, p.entity.y) for p in g.snapshot().entities], 200_000.0, -250_000.0, 5_000.0)
+    assert near and "HP ? G ?" in peer_label_lines(near[0])[1]
+
+
+def test_provisional_peer_is_purged_when_own_handle_locks(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    assert "93362" in {p.id for p in g.snapshot().entities}
+    v = g.store.version
+    g.on_inbound(inbound(b64("SecondHeartbeat")), 93_362)  # heartbeat lock says: that handle is me
+    ids = {p.id for p in g.snapshot().entities}
+    assert "93362" not in ids and len(ids) == 14 and g.store.version > v and g.own_handle == 93_362
+    g.on_inbound(inbound(b64("SecondHeartbeat")), 93_362)
+    assert "93362" not in {p.id for p in g.snapshot().entities}  # stays excluded
+
+
+def test_own_handle_change_replaces_the_exclusion(b64):
+    g, _ = make(self_ids=["84466"])
+    g.on_inbound(inbound(b64("SecondHeartbeat")), 93_362)
+    g.on_inbound(inbound(b64("SecondHeartbeat")), 82_008)  # respawn: new pawn, old handle may belong to someone else
+    ids = {p.id for p in g.snapshot().entities}
+    assert "82008" not in ids and "84466" not in ids  # configured self id kept
+    assert "93362" in ids
+
+
+def test_destruction_record_removes_a_tracked_peer_only(b64):
+    g, _ = make()
+    g.store.update(peers.Entity("86078", "player", "Actor #86078", "", 1.0, 2.0, 3.0))
+    g.store.update(peers.Entity("5", "player", "Actor #5", "", 1.0, 2.0, 3.0))
+    g.on_inbound(inbound(b64("DetachedDamagedAttributes")), None)
+    assert {p.id for p in g.snapshot().entities} == {"5"} and g.destroyed == 1
+    g.on_inbound(inbound(b64("DetachedDamagedAttributes")), None)  # untracked handle: no effect, no error
+    assert g.destroyed == 1
+
+
+def test_silent_peer_expires_after_ttl(b64):
+    g, clk = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    clk.t += peers.PEER_STALE_S + 0.1
+    sn = g.snapshot()
+    assert sn.entities and all(clk.t - p.last_seen >= peers.PEER_STALE_S for p in sn.entities)  # overlay dims these
+    clk.t += peers.PEER_TTL_S
+    assert g.snapshot().entities == ()
+
+
+def test_garbage_and_non_replication_datagrams_are_ignored():
+    g, _ = make()
+    for junk in (b"", b"\x00", bytes(range(200)), encode_move_payload(1e5, 2e5, 3e4, 10.0, 41.0)):
+        g.on_inbound(inbound(junk), None)
+    assert g.snapshot().entities == () and "waiting" in g.snapshot().status and peers.status_is_warning(g.snapshot().status)
+
+
+# ---------------------------------------------------------------- wired into the real capture pipeline
+def test_pipeline_tap_uses_heartbeat_self_and_leaves_local_decoding_alone(b64):
+    pipe = TelemetryPipeline()
+    g, _ = make(pipeline=pipe)
+    g.start()
+    pipe.handle(outbound(T0 - 0.1))  # learn the server, as in live capture
+    pipe.handle(inbound(b64("FirstHeartbeat"), T0))
+    assert g.own_handle is None and len(g.snapshot().entities) > 0  # provisional peers before the lock
+    pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 1.056))
+    pipe.handle(inbound(b64("PeriodicAttributes"), T0 + 2))
+    assert g.own_handle == OWN and str(OWN) not in {p.id for p in g.snapshot().entities}
+    assert g.snapshot().entities  # others still shown
+    v = pipe.latest.vitals  # own vitals decoded exactly as without the tap
+    assert v is not None and v.health == 4.601197242736816 and v.growth == 0.10464542359113693
+    assert f"own handle {OWN}" in g.snapshot().status
+
+
+def test_pipeline_ignores_other_endpoints_and_stop_detaches(b64):
+    pipe = TelemetryPipeline()
+    g, _ = make(pipeline=pipe)
+    g.start()
+    pipe.handle(outbound(T0 - 0.1))
+    pipe.handle(Datagram(T0, "6.6.6.6", 7777, CLIENT_IP, CLIENT_PORT, b64("SecondHeartbeat"), INBOUND))
+    assert g.packets == 0 and g.snapshot().entities == ()
+    g.stop()
+    pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 1))
+    assert g.packets == 0
+
+
+def test_server_change_and_game_restart_clear_the_handles(b64):
+    pipe = TelemetryPipeline()
+    g, _ = make(pipeline=pipe, self_ids=["9"])
+    g.start()
+    pipe.handle(outbound(T0 - 0.1))
+    pipe.handle(inbound(b64("SecondHeartbeat"), T0))
+    assert g.snapshot().entities
+    pipe.handle(Datagram(T0 + 1, CLIENT_IP, CLIENT_PORT, "10.9.9.9", 7777, b"\x00" * 8, OUTBOUND))  # joined another server
+    assert g.snapshot().entities == () and g.own_handle is None
+    pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 2))
+    assert g.snapshot().entities == ()  # old server's datagrams are not trusted any more
+    pipe.reset()  # game exit: supervisor resets the pipeline
+    assert g.snapshot().entities == ()
+
+
+def test_a_failing_observer_cannot_break_own_player_decoding(b64):
+    pipe = TelemetryPipeline()
+
+    def boom(*_a):
+        raise RuntimeError("observer bug")
+
+    pipe.add_observer(boom, boom)
+    pipe.handle(outbound(T0 - 0.1))
+    pipe.handle(inbound(b64("FirstHeartbeat"), T0))
+    assert pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 1.056)) is not None
+
+
+def test_factory_wires_the_pipeline_and_start_without_one_logs(caplog):
+    pipe = TelemetryPipeline()
+    g = create_peer_source("game", pipeline=pipe)
+    assert isinstance(g, GamePeerSource) and g.pipeline is pipe
+    with caplog.at_level(logging.WARNING, logger="isle_livemap.peers"):
+        GamePeerSource().start()
+    assert "no capture pipeline" in caplog.text
