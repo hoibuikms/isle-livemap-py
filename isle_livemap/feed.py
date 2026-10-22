@@ -13,6 +13,7 @@ import ipaddress
 import json
 import logging
 import math
+import socket
 import threading
 import time
 import urllib.error
@@ -20,7 +21,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from .geo import Entity
+from .geo import Entity, vital_pct
 
 log = logging.getLogger("isle_livemap.feed")
 
@@ -52,8 +53,8 @@ def _num(v) -> float | None:
 
 
 def _pct(v) -> float | None:
-    n = _num(v)
-    return None if n is None else min(max(n, 0.0), 100.0)
+    """Feed vitals are already 0-100; decoded by the same ``geo.vital_pct`` as the local player's."""
+    return vital_pct(_num(v), 100.0)
 
 
 def parse_entity(raw) -> Entity | None:
@@ -165,6 +166,22 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
+def describe_net_error(err: BaseException, url: str) -> str:
+    """Short reason for a failed request: refused / timeout / DNS / other."""
+    reason = getattr(err, "reason", err)
+    parts = urlsplit(url)
+    where = f"{parts.hostname}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return f"timeout after {REQUEST_TIMEOUT_S:g}s at {where} - host not answering/firewall"
+    if isinstance(reason, ConnectionRefusedError):
+        return f"connection refused at {where} - is the feed server running on that port?"
+    if isinstance(reason, socket.gaierror):
+        return f"cannot resolve host '{parts.hostname}'"
+    if isinstance(reason, ConnectionResetError):
+        return f"connection reset by {where} (http vs https mismatch?)"
+    return f"{type(reason).__name__}: {reason}"[:80]
+
+
 def fetch(url: str, token: str = "", timeout: float = REQUEST_TIMEOUT_S) -> bytes:
     """GET the feed. Raises FeedError with a user-facing status. Never logs the token."""
     if validate_url(url):
@@ -177,9 +194,12 @@ def fetch(url: str, token: str = "", timeout: float = REQUEST_TIMEOUT_S) -> byte
         with _opener().open(req, timeout=timeout) as resp:
             body = resp.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as err:
-        raise FeedError(ST_UNAUTH if err.code in (401, 403) else ST_UNREACHABLE) from None
-    except (urllib.error.URLError, OSError, ValueError):  # incl. timeouts, refused, bad URL
-        raise FeedError(ST_UNREACHABLE) from None
+        if err.code in (401, 403):
+            raise FeedError(ST_UNAUTH) from None
+        hint = " - wrong path? check the URL" if err.code == 404 else ""
+        raise FeedError(f"{ST_UNREACHABLE} (HTTP {err.code}{hint})") from None
+    except (urllib.error.URLError, OSError, ValueError) as err:  # incl. timeouts, refused, bad URL
+        raise FeedError(f"{ST_UNREACHABLE} ({describe_net_error(err, url)})") from None
     if len(body) > MAX_BODY_BYTES:
         raise FeedError(ST_BAD)
     return body

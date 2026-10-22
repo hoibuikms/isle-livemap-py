@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -131,7 +132,7 @@ def test_redirect_not_followed(srv):
     srv.mode = "redirect"
     with pytest.raises(FeedError) as ei:
         fetch(srv.url, "tok")
-    assert ei.value.status == ST_UNREACHABLE
+    assert ei.value.status.startswith(ST_UNREACHABLE)
 
 
 def test_poller_states(srv):
@@ -146,7 +147,7 @@ def test_poller_states(srv):
     srv.mode = "500"
     with pytest.raises(FeedError):
         p.poll_once()
-    assert p.snapshot().status == ST_UNREACHABLE
+    assert p.snapshot().status.startswith(ST_UNREACHABLE) and "HTTP 500" in p.snapshot().status
     srv.mode = "auth"
     with pytest.raises(FeedError):
         p.poll_once()
@@ -157,7 +158,7 @@ def test_poller_unreachable_and_off_and_bad_url():
     p = FeedPoller("http://127.0.0.1:1/feed", "", 1.0, timeout=0.5)
     with pytest.raises(FeedError):
         p.poll_once()
-    assert p.snapshot().status == ST_UNREACHABLE and not p.snapshot().entities
+    assert p.snapshot().status.startswith(ST_UNREACHABLE) and not p.snapshot().entities
     assert FeedPoller("").snapshot().status == ST_OFF and not FeedPoller("").snapshot().enabled
     assert FeedPoller("file:///etc/passwd").snapshot().status == ST_BAD_URL
 
@@ -185,3 +186,27 @@ def test_synthetic_payload_roundtrips_schema():
     d = DemoFeed(lambda: (0.0, 0.0)).snapshot()
     assert d.entities and d.enabled
     assert DemoFeed(lambda: None).snapshot().entities == ()
+
+
+def test_unreachable_says_why_refused():
+    with pytest.raises(FeedError) as ei:
+        fetch("http://127.0.0.1:1/feed", timeout=0.5)
+    assert "refused" in ei.value.status and "127.0.0.1:1" in ei.value.status
+
+
+def test_unreachable_says_why_404_and_dns():
+    from isle_livemap.feed import describe_net_error
+    import socket
+    assert "cannot resolve" in describe_net_error(urllib.error.URLError(socket.gaierror(8, "x")), "http://nope.invalid/feed")
+    assert "timeout" in describe_net_error(TimeoutError(), "http://10.0.0.1:9/feed")
+
+
+def test_feed_vitals_use_shared_local_player_decoding():
+    # a feed entity and the local player with the same vitals must yield identical percentages
+    from isle_livemap.feed import parse_entity
+    from isle_livemap.geo import local_entity
+    from isle_livemap.tracking import Vitals
+    me = local_entity(None, Vitals(health=37.0, max_health=100.0, growth=0.5))
+    e = parse_entity({"id": "a", "kind": "player", "x": 0, "y": 0, "health_pct": 37, "growth_pct": 50})
+    assert (e.health_pct, e.growth_pct) == pytest.approx((me.health_pct, me.growth_pct))
+    assert parse_entity({"id": "b", "kind": "ai", "x": 0, "y": 0, "health_pct": -5}).health_pct == 0.0
