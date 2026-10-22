@@ -120,7 +120,9 @@ class NearbyPanel(QDialog):
 
     def refresh(self) -> None:
         self.status.setText(self.view.feed_status or "feed: off (set a feed URL in Feed settings)")
-        rows = [entity_summary(n) for n in self.view.nearby()]
+        pos = self.view.pipeline.latest.position
+        my_z = pos.z if pos is not None else None
+        rows = [entity_summary(n, my_z) for n in self.view.nearby()]
         if [self.list.item(i).text() for i in range(self.list.count())] != rows:
             self.list.clear()
             self.list.addItems(rows)

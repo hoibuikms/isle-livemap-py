@@ -28,13 +28,13 @@ PyInstaller, and builds a one-folder, windowed app from `IsleLiveMap.spec`:
 
 ## Controls (global hotkeys on Windows; also tray menu)
 
-| Key | Action |
-|---|---|
-| Alt+M | Toggle full map |
-| Ctrl+Shift+O | Edit mode (window becomes interactive: drag to move, wheel = zoom, Ctrl+wheel = size 65-175 %, drag = pan on full map, right-click = drop marker). Otherwise the overlay is click-through. |
-| Ctrl+Shift+P | Marker at your position (name / type / notes prompt) |
-| Ctrl+Shift+L | Marker list (distance + bearing, delete) |
-| Ctrl+Shift+= / - | Zoom |
+| Key              | Action                                                                                                                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Alt+M            | Toggle full map                                                                                                                                                                            |
+| Ctrl+Shift+O     | Edit mode (window becomes interactive: drag to move, wheel = zoom, Ctrl+wheel = size 65-175 %, drag = pan on full map, right-click = drop marker). Otherwise the overlay is click-through. |
+| Ctrl+Shift+P     | Marker at your position (name / type / notes prompt)                                                                                                                                       |
+| Ctrl+Shift+L     | Marker list (distance + bearing, delete)                                                                                                                                                   |
+| Ctrl+Shift+= / - | Zoom                                                                                                                                                                                       |
 
 Tray menu: size, range-ring radii (default 250 m / 500 m / 1 km), species label,
 zone / food-source / ring toggles.
@@ -65,20 +65,6 @@ entities is taken from the game's network packets or memory.
     python -m isle_livemap --replay                                # internal synthetic feed
 
 Schema, units, security notes and how to expose the feed from your mod: `docs/SERVER_FEED.md`.
-
-## Anti-cheat safety
-
-* Passive packet capture only (Npcap, read-only sniffing of your own UDP flow).
-* No DLL injection, no process-memory access (no OpenProcess / ReadProcessMemory on
-  the game), no hooks. The game is found with a Toolhelp32 process-list snapshot and
-  its UDP ports with `GetExtendedUdpTable`, neither of which opens the game process.
-* Nothing is sent or modified; no evasion or obfuscation.
-* Separate window. Global hotkeys use `RegisterHotKey` (not a keyboard hook).
-* Other players / AI are never decoded from traffic or memory. The only source of other
-  entities is the optional server feed below, which needs a server you control.
-
-**The author cannot guarantee that this complies with any anti-cheat or server rules.
-Check your server's rules; use at your own risk.**
 
 ## Troubleshooting (overlay stuck on "waiting" / "capturing")
 

@@ -372,10 +372,16 @@ def entity_label_lines(n: Nearby, name_max: int = 16) -> tuple[str, str]:
     return head, f"HP {_pct(e.health_pct)} G {_pct(e.growth_pct)} {format_distance(n.distance_m)}"
 
 
-def entity_summary(n: Nearby) -> str:
+def entity_summary(n: Nearby, my_z: float | None = None) -> str:
     e = n.entity
     sp = f" {e.species}" if e.species else ""
-    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}  HP {_pct(e.health_pct)}  G {_pct(e.growth_pct)}  "
+    extra = ""
+    for tag, v in (("ST", e.stamina_pct), ("HU", e.hunger_pct), ("TH", e.thirst_pct)):
+        if v is not None:
+            extra += f" {tag} {v:.0f}%"
+    if e.z is not None and my_z is not None:
+        extra += f" dZ {(e.z - my_z) / 100.0:+.0f}m"
+    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}  HP {_pct(e.health_pct)}  G {_pct(e.growth_pct)}{extra}  "
             f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°)")
 
 

@@ -78,3 +78,12 @@ def test_settings_roundtrip_and_normalise(tmp_path):
     assert bad.feed_radius_m == 1000.0 and bad.feed_interval_s == 0.25
     assert Settings(feed_radius_m=1e9).normalise().feed_radius_m == 20_000
     assert Settings().feed_radius_m == 1000.0 and Settings().feed_url == ""
+
+
+def test_summary_shows_vitals_and_height_delta():
+    e = E("p", "player", 25_000, stamina_pct=70, hunger_pct=60, thirst_pct=80, z=13_000)
+    n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
+    s = entity_summary(n, my_z=10_000)
+    assert "ST 70% HU 60% TH 80%" in s and "dZ +30m" in s
+    bare = entity_summary(nearby_entities([(E("q", x=25_000), 25_000, 0)], 0, 0)[0], my_z=10_000)
+    assert "ST" not in bare and "dZ" not in bare
