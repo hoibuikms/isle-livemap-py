@@ -227,7 +227,7 @@ class App(QObject):
             menu.addAction(a)
         for text, attr in (
             ("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings"),
-            ("Show other players", "show_players"),  # no "Show AI": packet sources never report an AI kind
+            ("Show other players", "show_players"),  # players and dinosaurs; animals (fish) have show_ai, settings file only
             ("Vitals detail on labels", "show_vitals_detail"),
         ):
             a = QAction(text, menu, checkable=True)

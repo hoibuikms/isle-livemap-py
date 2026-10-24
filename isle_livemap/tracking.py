@@ -299,6 +299,7 @@ _REQUIRED_HEARTBEAT_HITS = 2
 _ATTR_BITS = 66
 _MAX_HEARTBEAT_BATCH_BITS = 1200
 _MAX_TRAILING_BITS = _ATTR_BITS * 4
+_MAX_HEARTBEAT_EXTRA_SLOTS = 2  # slots allowed between thirst and the repeated hunger
 _DEFAULT_MAX_THIRST = 1000.0
 _MIN_PLAUSIBLE_MAX = 0.01
 _MIN_UNVERIFIED_HEALTH = 0.1
@@ -399,41 +400,50 @@ def _find_heartbeat(bits: Bits, batch: IrisBatch, expected: Vitals | None) -> _H
         return None
     matches: list[_Heartbeat] = []
     for rel in range(0, batch.data_bit_count - _ATTR_BITS * 3 + 1):
-        trailing = batch.data_bit_count - (rel + _ATTR_BITS * 3)
-        if trailing < 0 or trailing > _MAX_TRAILING_BITS or trailing % _ATTR_BITS != 0:
-            continue
         hunger = _read_batch_attr(bits, batch, rel)
         if hunger is None:
             continue
         thirst = _read_batch_attr(bits, batch, rel + _ATTR_BITS)
-        dup = _read_batch_attr(bits, batch, rel + _ATTR_BITS * 2)
-        if thirst is None or dup is None:
+        if thirst is None:
             continue
-        if (
-            abs(hunger - dup) > max(0.0001, hunger * 0.00001)
-            or hunger > 10_000.0
-            or thirst > 2_000.0
-            or (expected is None and max(hunger, thirst) < 0.05)
-            or ((expected is not None and (expected.max_thirst or 0) > 0) and thirst > expected.max_thirst * 1.05)
-        ):
-            continue
-        if expected is not None and (expected.max_hunger or 0) > 0 and hunger > expected.max_hunger * 1.05:
-            continue
-        health = stamina = None
-        if trailing >= _ATTR_BITS:
-            cur_st = _read_batch_attr(bits, batch, rel + _ATTR_BITS * 3 + trailing - _ATTR_BITS)
-            if cur_st is not None and (
-                _plausible_optional_stamina(expected, cur_st) or _can_bootstrap_stamina(expected, cur_st)
+        # hunger, thirst, [attributes that changed in between], hunger repeated. Without the optional ones this is the
+        # classic triple; a live capture shows one extra slot (a value that drifts every second, e.g. while gliding)
+        # inserted before the repeat from then on, which the triple-only match lost for good (own vitals froze).
+        for extra in range(_MAX_HEARTBEAT_EXTRA_SLOTS + 1):
+            span = _ATTR_BITS * (3 + extra)
+            trailing = batch.data_bit_count - (rel + span)
+            if trailing < 0:
+                break
+            if trailing > _MAX_TRAILING_BITS or trailing % _ATTR_BITS != 0:
+                continue
+            dup = _read_batch_attr(bits, batch, rel + _ATTR_BITS * (2 + extra))
+            if dup is None:
+                continue
+            if (
+                abs(hunger - dup) > max(0.0001, hunger * 0.00001)
+                or hunger > 10_000.0
+                or thirst > 2_000.0
+                or (expected is None and max(hunger, thirst) < 0.05)
+                or ((expected is not None and (expected.max_thirst or 0) > 0) and thirst > expected.max_thirst * 1.05)
             ):
-                stamina = cur_st
-        if stamina is not None and trailing >= _ATTR_BITS * 2:
-            cur_hp = _read_batch_attr(bits, batch, rel + _ATTR_BITS * 3 + trailing - _ATTR_BITS * 2)
-            if cur_hp is not None and (
-                _plausible_optional_health(expected, cur_hp)
-                or _can_bootstrap_vitals(expected, cur_hp, stamina)
-            ):
-                health = cur_hp
-        matches.append(_Heartbeat(hunger, thirst, health, stamina))
+                continue
+            if expected is not None and (expected.max_hunger or 0) > 0 and hunger > expected.max_hunger * 1.05:
+                continue
+            health = stamina = None
+            if trailing >= _ATTR_BITS:
+                cur_st = _read_batch_attr(bits, batch, rel + span + trailing - _ATTR_BITS)
+                if cur_st is not None and (
+                    _plausible_optional_stamina(expected, cur_st) or _can_bootstrap_stamina(expected, cur_st)
+                ):
+                    stamina = cur_st
+            if stamina is not None and trailing >= _ATTR_BITS * 2:
+                cur_hp = _read_batch_attr(bits, batch, rel + span + trailing - _ATTR_BITS * 2)
+                if cur_hp is not None and (
+                    _plausible_optional_health(expected, cur_hp)
+                    or _can_bootstrap_vitals(expected, cur_hp, stamina)
+                ):
+                    health = cur_hp
+            matches.append(_Heartbeat(hunger, thirst, health, stamina))
     if not matches:
         return None
     if expected is not None and expected.hunger is not None and expected.thirst is not None:

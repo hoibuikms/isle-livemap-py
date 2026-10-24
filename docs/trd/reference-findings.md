@@ -247,3 +247,20 @@ false positives; verify on fixtures that the 55 locations are unchanged and that
   (reference saw 201 creation records and 228 destroy records in 180 s on a populated server).
 - Write down: that neighbour's name, species and (if available) in-game handle, to match against the first creation records.
 - We should also decide whether to confirm the MIT claim with upstream `klong-dev/IsleLiveMap`, since the Undo fork has no LICENSE file.
+
+## 8. Addendum (2026-10-22): checked against a real join capture
+
+A 193 s capture that started before joining (5419 creation records, 6122 export sections, 431 destruction records) was run through the code written from this document. Details in `docs/trd/other-players-on-minimap.md`, section 13.
+
+| Claim of this document | Result |
+|---|---|
+| 3.1 destruction record = packed u64, has-info bit (+packed u64), 1 bit | WRONG for this build: packed u64 + ONE bit (always 1). The has-info reading missed 143 of the 431 records and cut 245 datagrams short |
+| 3.4 export lists: token strings, object references (recursive, depth 32), must-be-mapped list | CONFIRMED, all 6122 sections parse. Added: token type 1 = names, 2 = gameplay tags; a name token is defined once; some handles are only ever must-be-mapped (never exported) |
+| 3.4 creation record layout (3 bits skipped, has-state, is-creation, baseline +2, factory 3, protocol 32, archetype reference, persistent level, location) | CONFIRMED field by field; the archetype reference flags are always 0,0,1 |
+| 3.4 "scaled spawn locations divided by 8" | WRONG for what was measured: the creation vector is 1/16 of the state vector (exactly for one fish, 15.99..16.00 for four more) |
+| 3.4 archetype -> `BP_<Species>_C` path gives the species, but "an asset name alone cannot establish species/control" | CONFIRMED both ways: Gallimimus is a clean path; pteranodon archetype 2221 is never exported and its species rests on the assets named by its creation records; handles that only mention a species' sounds (the own handle lists 13) must not be taken as that species |
+| 3.4 player proof = PlayerState / pawn structure | CONFIRMED structurally: a pawn creation record references its PlayerState handle; 382 of 388 PlayerState records hold a decodable name (the reference calls the protocol name-free; it is not) |
+| 3.9 / 6.4 the 33-bit header is "prefix + change mask" | CONFIRMED: 386 distinct headers among creature batches, the vector sits at header-dependent offsets |
+| 3.6 vitals of others not in the stream | WRONG: a 9-slot health/stamina block exists (health, max, stamina, max, then repeats) |
+| 3.8 destroy records are the despawn signal | CONFIRMED: 431 records, all handles seen, 430 created in the capture |
+

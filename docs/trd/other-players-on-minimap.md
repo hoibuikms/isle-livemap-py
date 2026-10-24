@@ -1,6 +1,6 @@
 # TRD: Show Other Players on the Minimap (parity with the Local Player), packet-sourced
 
-- Status: rev 6, implemented; remaining open items are blocked on a new game capture (see section 10)
+- Status: rev 8, implemented. Rev 8 (section 13) answers most of the items that were blocked on a join capture: class, species, kind, player names, destruction records, health and stamina of others, and the positions of fish and pteranodons. Sections 11 and 12 describe the state BEFORE that capture; where they say "NOT decodable" for name, class, health or destruction, section 13 supersedes them.
 - Date: 2026-10-22
 - Repo: isle-livemap-py, branch `main`
 - Revision note: rev 1 sourced other players from the server feed URL. New constraint: NO feed URL. Other players must come from the same local data path as the local player and the nearby radar. Every feed dependency is removed or marked DEPRECATED (section 9).
@@ -347,3 +347,68 @@ Implementation (TRD-051): `decode.py` (additive: `destroyed_handles`, `ActorLoca
 - Lag: decode and store writes are immediate (0.04..3 ms per packet); the repaint runs at 16 ms in the same tick as the own marker. The lag came from (a) dots only moving after the next sample with a slower filter than the own marker (0.15 s vs 0.09 s), (b) idle actors, which Iris does not re-send, being dimmed at 3 s and deleted at 5 s. Fixed with dead reckoning, the same tau and 8 s / 30 s game timeouts (REQ-013, REQ-016). The server's own send interval and network latency remain. Fixtures hold no packet timestamps, so that interval is not measured.
 - Labels: no `?` placeholders on the minimap (REQ-008, REQ-015).
 - Parity with the own player: not possible. Own slots are named by position inside batches that carry the hunger/thirst heartbeat or a full frame; other actors' 364..516 bit batches hold lone slots with no heartbeat and no maxima, and no creation/export data exists in any fixture, so species and name are unavailable. Nothing was implemented for this; see `docs/PEERS.md`.
+
+
+## 13. Rev 8: the join capture (identity, species, positions, vitals of others)
+
+Date: 2026-10-22. Input: `session_20261022_212006.pcap` (the app's own recorder: it starts before the server is joined), analysed offline with `python -I`, copied to an empty directory first, scripts kept elsewhere. Nothing from the capture is committed; `tests/fixtures/recorded_join_payloads.json` holds 46 inbound datagrams as payload bytes only (no IP/UDP headers, no addresses; Epic/EOS account ids, SteamID64 strings and player names were overwritten in place with synthetic text of the same length so every packet still parses).
+
+### 13.1 The capture
+
+193.6 s; 3003 inbound and 3961 outbound datagrams of one flow, plus ONE outbound datagram of 1300 bytes from a second local port to another host at 169.17 s (see 13.9). First creation record at 5.64 s, join burst 11..14 s. Of 2958 inbound datagrams that carry an Iris sequence number, 62 sequence numbers (2.1 %) are missing, 40 of them before 15 s (bursts of 20 at 5.6 s, 12 at 9.8 s, 6 at 11.2 s). The creation records of the own pawn (handle 85864) and of six creatures (84700, 77060, 7442, 45338, 80364, 47752) are not in the capture although their state arrives from 12.2..29.5 s on; the most likely reason is those missing datagrams (capture loss during the join burst; the log's `dropped=0` counts only the app's queue). This is a conjecture, not measured.
+
+### 13.2 Envelope: two bugs found with this capture
+
+1. **Destruction record = packed u64 handle + one bit** (always 1 in 431 records). The old reading (handle, "has info" bit, optional second handle, trailing bit) is only right when that bit happens to be 1 in the right place; otherwise it ate neighbouring bits and produced handles such as 3590495952, 16240516816 or 172, and the walk of 245 datagrams ended at an "inline destruction" with 0 batches parsed. With the new layout all 2849 parseable data streams end exactly on their last batch (`batch_count - destruction_count` batches follow the records).
+   Before / after: datagrams not parsed as Iris 111 -> 44 (the 18-byte non-replication keep-alives); incomplete envelopes 247 -> 0; batches 34 964 -> 39 665 (33 362 state, 5 419 creation, 884 other prefixes); destruction records 288 -> 431; of the destruction handles, the share that is a handle seen in the capture 258/288 (90 %, and 11 above 200 000) -> 431/431 (100 %, none above 200 000); 430 of the 431 match a creation record seen earlier. Real handles are below ~90 000.
+2. Export sections are now parsed, not skipped (6122 export-bearing batches, all parse).
+
+### 13.3 Exports, net tokens, strings
+
+An export section follows its batch: (1) net-token string exports (index, authority bit, 3-bit type id; type 1 = names, type 2 = gameplay tags such as `Ability.Skill.Use`), (2) object-reference exports, (3) the must-be-mapped handle list. An object reference is a chain of levels (handle, then optionally a name token with its string inline the first time, then the outer): `Default__BP_PlayerController_C` inside `/Game/TheIsle/Core/Player/BP_PlayerController`. Full path = names joined by ".". Name tokens are only sent once per connection; the three default sub-objects of every pawn (tokens 414..416) were defined before the capture and stay unnamed. A handle can be referenced in a must-be-mapped list without ever being exported in the capture: archetype 1693 (85 fruit actors, whose mesh asset `Papaya_Fruit_3` is exported) and archetype 2221 (the pawn archetype of six pteranodons).
+Encoded net strings (flag bit 1) are one code point per base-128 group, most significant group first, bit 7 set on all but the last (`0x81 0x60` = U+00E0, `0x82 0x10` = U+0110, `0x80 0xBD 0x27` = U+1EA7). That is how Vietnamese names come out readable ("Cường Sinh Tồn" style); a PlayerState name is a packed-u32 length followed by those bytes.
+
+### 13.4 Creation records
+
+Layout (LSB-first): 5 prefix bits (3 zero, has-state, is-creation), has-baseline (+2 bits), factory (3), protocol id (32), has-archetype, archetype reference (flags 0,0,1 in all 5338 records that have one, then packed u64), persistent-level bit, has-location, valid bit, quantised vector. Level-placed actors (81) have no archetype: they are named by their own export (`BP_EdiblePlantsSpawnable_C_UAID_...` inside `PersistentLevel`). 4747 of 5419 records carry a location.
+**The creation vector is 1/16 of the world position.** BP_Longear, handle 61004: creation raw 2812035, later 193 state vectors (cm x 100) have x = 44992560 = 16 x 2812035 exactly; four BP_Fish_RainbowFish actors give 15.9916..16.0024 in x and y. The reference's "divide by 8" is not what the data shows. Independent frame checks: the rainbow-fish positions in the older fixtures, (932, -3140) and (701, -3502) m, lie in the same lake region as this capture's (890, -3092) and (1241, -3355) m (63 m apart for the closest pair) although the handles of the two sessions differ; the older fixtures' Longear-layout actors are spread over the island (x -2.5..5.9 km, y -3.5..2.9 km), fish schools. One vector in a handle-0 batch at 20.8 s (the player's spawn) equals the outbound own position to the cm, so a quantised vector in the replication stream has the own-position scale and frame.
+The fixed 155/158-bit layout of the older fixtures is the state of **BP_Longear, an AI fish**, in this capture (same 33-bit header, same size equation, 193 of 193 batches); the older fixtures' 53 handles that were drawn as "players" are therefore most likely fish (the same file also holds three rainbow-fish batches). Only the handle's class can prove it, and those fixtures hold no creation record for them.
+
+### 13.5 Classes, kinds, species
+
+126 distinct class labels (124 resolved paths, plus two unresolved buckets) in 5419 creation records (`tools/inspect_capture.py`). 5307 are world objects: plants and fruit (34 classes, 3962 records), gore and meat (341), `TICorpseSmell` (295), PlayerStates (388), level actors (81). Creatures (27 records):
+
+| Species (from) | Creation records | Notes |
+|---|---|---|
+| Rainbow Fish (`Core/Characters/Fishes/Schools/BP_Fish_RainbowFish`) | 19 | kind ai; layout 0x1680A4328 |
+| Pteranodon (archetype 2221, path never exported; 5 of 6 records name Pteranodon animation montages, none another species) | 6 (5 with a PlayerState, so kind player) | species from assets, flagged as such in code |
+| Longear (`Core/AI/Characters/Fish/BP_Longear`) | 1 | kind ai |
+| Gallimimus (`Core/Characters/Dinosaurs/Gallimimus/BP_Gallimimus`) | 1 (at 182 s) | kind player (PlayerState reference) |
+
+No Triceratops, Tyrannosaurus or Deinosuchus pawn was ever created in the capture, but their assets appear: animation montages of Deinosuchus (handles 84700, 77060, 7442), Triceratops (47752) and Pteranodon (45338) in the export sections of those handles' batches, and 13 species' call sounds (`MS_<Species>_Call_*`) in the own handle's batches (sounds of creatures that called nearby; not tied to a handle). Those are evidence, not classes, and are not used. `species.py`: `CLASS_RULES` (`/Characters/Dinosaurs/` -> dino, `/AI/Characters/` and `/Characters/Fishes/` -> ai, any other known path -> other, no path -> unknown), `DISPLAY_NAMES`, cleaned class name otherwise; tested in `tests/test_identity.py`.
+
+### 13.6 Player names
+
+PlayerState creation records (388) hold the EOS account id as a string and the player name (packed-u32 length + base-128 code points) 460..520 bits in (469 or 477, one byte of variation); 382 of 388 decode to plausible text. A pawn's creation record references its PlayerState (anchor bits `0 1 0 0 0 0 0 0 0 0 0 1` + packed u64 handle, at bit 638..873 of the record; found in 6 of the 7 pawn records): that gives a name and proves "player". It is structural, not confirmed by a person standing next to the creature (the PlayerState never references the pawn back in the capture). AI animals have no name. Names and account ids are other people's data: the tool counts them, `--names` lists them, the fixture has synthetic ones, and no log line contains a name.
+
+### 13.7 Positions: why only one handle decoded, and what decodes now
+
+Creature state batches (handles with a creature class): 3080 (193 Longear, 1197 Rainbow Fish, 1674 Pteranodon, 16 Gallimimus). The old check (header 0x20E822A8 + 77+3*comp size) passed 193 (all Longear): **2887 fail**. They carry 386 distinct 33-bit headers (the first 5 bits are the state prefix, the other 28 a change mask: which members changed) and 308 distinct sizes; the top headers are 0x1680A4328 (421), 0x060000128 (393), 0x060000108 (309), 0x20E822A8 (193); the top sizes 48 bits (741: tiny updates), 192 (363), 158 (194), 70 (117). 28 % of the batches are 48/70-bit updates that cannot hold a position.
+What now decodes (all checked by plausibility AND continuity of the same handle):
+- Fixed layouts (header + size equation): 0x20E822A8 @33 (Longear, 193 batches) and **0x1680A4328 @69, tail 38** (Rainbow Fish, 421 batches, comp 26/27; x and y equal 16 x the creation position, z runs away at 8 m/s so it is not claimed). 614 batches.
+- Pawns: the same header has the vector at different offsets (0xC0000348 at 61, 79, 91, 94; no size equation). `ActorLocationTracker` accepts a vector only when it lies within 20 m + 100 m/s x dt (dt capped at 3 s) of the actor's last accepted position or of its creation position (anchors expire after 120 s), and trusts a (header, offset) pair after 2 such confirmations; 52 samples of 3 pteranodons (speeds up to 47 m/s between consecutive packets). False-positive check: with every creation anchor moved 300 km, the same tracker accepts 0 of about 25 000 anchored state batches (and trusts no layout), against 52 accepted with the true anchors.
+- Creation position (x16) for every creature record that carries one.
+At the end of the capture the minimap shows, around the perch of the player 105 079, -244 599: 3 Rainbow Fish, 2 Pteranodon, 1 Gallimimus within 1 km (picture in `/tmp/isle_real`, not committed).
+
+### 13.8 Vitals of other creatures
+
+A 9-slot block (66-bit GAS slots: float, flag, float): health, maxHealth, stamina, maxStamina, maxHealth, maxHealth/2, maxHealth/2, maxHealth, maxHealth. 26 blocks in the batches of 8 handles (74400: 11, 80364: 6, 80376: 3, 77060: 2, and four with one). Seven equality constraints per block; values continuous: pteranodon 74400 health 78.4 -> 85.8 % over 160 s (max 14.7 -> 20.7, growing), stamina 52..76 %. Implemented: `decode.decode_vitals_block` -> `Entity.health_pct`, `stamina_pct`. A false positive found on the way (denormal floats at 5e-36 passing a relative check) is covered by a test. NOT determinable: growth (the slot one position earlier is present only when growth changed: never beside a block), hunger and thirst of others.
+
+### 13.9 The 21:23:02 "reset" and the frozen vitals
+
+1. At 169.17 s the game sent a 1300-byte datagram (payload starts `01 02 "sdping"`) from a second local port to another host. The pipeline took any outbound destination for the server: reset (observers wiped), and 26 ms later the next game datagram "learned" the real server again: second reset. Fixed: a different destination replaces the server only after 5 datagrams in a row while the old one has been silent for 1 s; the first learning after `reset()` notifies nobody. Replaying the whole capture with both sockets: 3 -> 0 reset notifications (the first of the three was the initial server learning).
+2. The own lock was already lost at 153.3 s: from 141.2 s the heartbeat batch is hunger, thirst, STAMINA, hunger repeated (the extra slot falls from 154 to 0 at 8.3 per second between 142 s and 161 s, in the range of the character's max-stamina slots, 139..165: stamina), which the triple-only match never saw; the 12 s timeout dropped the lock and no later batch matched. `_find_heartbeat` accepts up to two slots between thirst and the repeat. Lock now holds from 13.2 s to the last recognised heartbeat at 161.3 s. At 162.2 s the spacing between thirst and the repeated hunger is 68 bits instead of 66 or 132 (stamina 0) and the matcher does not recognise it; no heartbeat-sized batch follows and `State.Dead` / `GE_ExecuteHandleDead` are exported at 172.5 s: the character died, so the last freeze is the game, not the decoder.
+
+### 13.10 Still unknown
+
+Growth, hunger, thirst and heading of others; land dinosaurs (none came into relevance); whether the PlayerState link names the right player (needs a known neighbour); the structure of handle-0 batches (they mention the six creation-less creatures at join); the semantics of the destruction record's bit and of the one undecoded bit in export chains; why creation vectors are 1/16; the reason the rainbow-fish z runs away; layouts of land dinosaurs.

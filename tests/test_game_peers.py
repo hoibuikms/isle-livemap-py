@@ -12,7 +12,7 @@ import re
 import pytest
 
 from isle_livemap import peers
-from isle_livemap.capture import INBOUND, OUTBOUND, Datagram, TelemetryPipeline
+from isle_livemap.capture import INBOUND, OUTBOUND, SERVER_SWITCH_DATAGRAMS, Datagram, TelemetryPipeline
 from isle_livemap.decode import (
     ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, Bits, IrisBatch, PacketCounts, batch_kind,
     count_batches, decode_actor_location, decode_actor_locations, parse_iris_packet,
@@ -70,10 +70,14 @@ def test_every_recorded_location_batch_is_a_canonical_world_position(b64, record
                  "SparseMaximumAttributes", "SparseMaximumHeartbeat2", "TrailingAttributesHeartbeat1", "TrailingAttributesHeartbeat2"):
         pkt = parse_iris_packet(b64(name))
         locs = decode_actor_locations(b64(name), pkt)
-        sized = [b for b in pkt.batches if b.data_bit_count in (155, 158)]
-        assert len(locs) == len({b.net_ref_handle for b in sized})  # every 155/158-bit batch decodes, nothing else does
+        bits = Bits(b64(name))
+        sized = [b for b in pkt.batches if b.data_bit_count in (155, 158)
+                 or (b.data_bit_count in (192, 195) and bits.read(b.data_bit_offset, 33) == 0x1680A4328)]
+        # every 155/158-bit batch (first layout) and every 192/195-bit batch of the second layout decodes, nothing else
+        assert len(locs) == len({b.net_ref_handle for b in sized})
         for l in locs:
-            assert -800_000 <= l.x <= 800_000 and -800_000 <= l.y <= 800_000 and 1_000 < l.z < 100_000
+            assert -800_000 <= l.x <= 800_000 and -800_000 <= l.y <= 800_000
+            assert not l.z_reliable or 1_000 < l.z < 100_000  # the second layout's z runs away; only x and y are claimed
         total += len(locs)
     assert total >= 40
 
@@ -133,10 +137,11 @@ def test_peers_come_from_inbound_batches_with_unknown_fields_none(b64):
     snap = g.snapshot()
     assert len(snap.entities) == 15 and g.locations == 15
     e = {p.id: p.entity for p in snap.entities}["93362"]
-    assert (e.kind, e.name, e.species) == ("player", "Actor #93362", "")
+    # these fixtures hold no creation record for the handle: its class is unknown, so it is neither a player nor a dino
+    assert (e.kind, e.name, e.species) == ("unknown", "Actor #93362", "")
     assert (e.x, e.y, e.z) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88))
     assert (e.health_pct, e.growth_pct, e.stamina_pct, e.hunger_pct, e.thirst_pct, e.heading) == (None,) * 6
-    assert "position only" in snap.status and "not available" in snap.status and not peers.status_is_warning(snap.status)
+    assert "not available" in snap.status and not peers.status_is_warning(snap.status)
 
 
 def test_game_labels_have_no_placeholders_only_id_distance_bearing_and_height(b64):
@@ -176,7 +181,8 @@ def test_destruction_record_removes_a_tracked_peer_only(b64):
     g.store.update(peers.Entity("86078", "player", "Actor #86078", "", 1.0, 2.0, 3.0))
     g.store.update(peers.Entity("5", "player", "Actor #5", "", 1.0, 2.0, 3.0))
     g.on_inbound(inbound(b64("DetachedDamagedAttributes")), None)
-    assert {p.id for p in g.snapshot().entities} == {"5"} and g.destroyed == 1
+    ids = {p.id for p in g.snapshot().entities}
+    assert "86078" not in ids and "5" in ids and g.destroyed == 1  # the packet also carries locations of other actors
     g.on_inbound(inbound(b64("DetachedDamagedAttributes")), None)  # untracked handle: no effect, no error
     assert g.destroyed == 1
 
@@ -239,12 +245,47 @@ def test_server_change_and_game_restart_clear_the_handles(b64):
     pipe.handle(outbound(T0 - 0.1))
     pipe.handle(inbound(b64("SecondHeartbeat"), T0))
     assert g.snapshot().entities
-    pipe.handle(Datagram(T0 + 1, CLIENT_IP, CLIENT_PORT, "10.9.9.9", 7777, b"\x00" * 8, OUTBOUND))  # joined another server
+    # joined another server: the old one goes silent and the new destination sends datagram after datagram
+    for i in range(SERVER_SWITCH_DATAGRAMS):
+        pipe.handle(Datagram(T0 + 2 + i * 0.03, CLIENT_IP, CLIENT_PORT, "10.9.9.9", 7777, b"\x00" * 8, OUTBOUND))
     assert g.snapshot().entities == () and g.own_handle is None
-    pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 2))
+    pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 3))
     assert g.snapshot().entities == ()  # old server's datagrams are not trusted any more
     pipe.reset()  # game exit: supervisor resets the pipeline
     assert g.snapshot().entities == ()
+
+
+def test_a_stray_datagram_to_another_host_is_not_a_server_change(b64):
+    """Live capture: a 1300-byte probe from a second socket to another host arrived mid-session. It used to wipe the
+    own-vitals lock, the identity tables and every peer (two resets within 30 ms, the second one when the real server
+    was 'learned' again)."""
+    pipe = TelemetryPipeline()
+    resets = []
+    pipe.add_observer(lambda d, own: None, lambda: resets.append(1))
+    g, _ = make(pipeline=pipe)
+    g.start()
+    pipe.handle(outbound(T0 - 0.1))
+    pipe.handle(inbound(b64("FirstHeartbeat"), T0))
+    pipe.handle(inbound(b64("SecondHeartbeat"), T0 + 1.056))
+    assert g.own_handle == OWN and g.snapshot().entities
+    n = len(resets)
+    pipe.handle(Datagram(T0 + 2.0, CLIENT_IP, 65_396, "10.9.9.9", 27_038, b"\x01\x02sdping" + bytes(1290), OUTBOUND))
+    pipe.handle(outbound(T0 + 2.026))  # the next game datagram, 26 ms later
+    assert len(resets) == n and pipe.server == f"{SERVER_IP}:{SERVER_PORT}"
+    assert g.own_handle == OWN and g.snapshot().entities  # nothing was wiped
+    assert pipe._vitals.self_handle == OWN  # noqa: SLF001 - the heartbeat lock survived too
+
+
+def test_learning_the_server_after_a_reset_does_not_notify_twice(b64):
+    pipe = TelemetryPipeline()
+    resets = []
+    pipe.add_observer(lambda d, own: None, lambda: resets.append(1))
+    pipe.handle(outbound(T0))
+    assert pipe.server and resets == []  # first server: nothing to wipe
+    pipe.reset()
+    assert resets == [1]
+    pipe.handle(outbound(T0 + 1))  # the same server again: state is already clear
+    assert resets == [1]
 
 
 def test_a_failing_observer_cannot_break_own_player_decoding(b64):
@@ -295,7 +336,7 @@ def test_batch_kind_of_the_recorded_location_batch_is_state():
 
 
 def test_every_recorded_batch_is_a_state_update(recorded, b64):
-    total = states = 0
+    total = states = creations = exports = 0
     for name in recorded:
         try:
             payload = b64(name)
@@ -305,15 +346,19 @@ def test_every_recorded_batch_is_a_state_update(recorded, b64):
         if pkt is None:
             continue
         c = count_batches(payload, pkt)
-        assert (c.creation, c.unknown, c.exports) == (0, 0, 0) and c.state == len(pkt.batches)
+        assert c.unknown == 0 and c.creation + c.state == len(pkt.batches)
+        creations += c.creation
+        exports += c.exports
         total += len(pkt.batches)
         states += c.state
-    assert total == states == 126
+    # one creation record, in the packet that also carries a destruction record. It used to be invisible: the old
+    # destruction-record layout ended that packet's walk before its first batch (0 of 36 parsed).
+    assert (total, states, creations, exports) == (162, 161, 1, 2)
 
 
 def test_counts_per_packet_on_the_destruction_fixture(b64):
     c = count_batches(b64("DetachedDamagedAttributes"))
-    assert (c.creation, c.exports, c.destroyed) == (0, 0, 1) and c.unknown == 0
+    assert (c.state, c.creation, c.exports, c.destroyed) == (35, 1, 2, 1) and c.unknown == 0
     assert count_batches(b"") == PacketCounts() and count_batches(bytes(range(200))) == PacketCounts()
 
 
@@ -325,10 +370,10 @@ def test_source_counters_on_recorded_traffic_and_status_text(b64, recorded):
         except Exception:
             continue
         g.on_inbound(inbound(payload), None)
-    assert (g.creation_records, g.export_batches, g.destruction_records) == (0, 0, 1)
+    assert (g.creation_records, g.export_batches, g.destruction_records) == (1, 2, 1)
     st = g.snapshot().status
-    assert "creation 0, exports 0, destroyed 1" in st and not peers.status_is_warning(st)
-    assert len(st) < 140
+    assert "creation 1, exports 2, destroyed 1" in st and not peers.status_is_warning(st)
+    assert len(st) < 170
 
 
 def test_destruction_records_count_even_when_the_handle_is_untracked(b64):

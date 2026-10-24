@@ -5,7 +5,7 @@ Backends (all produce ``geo.Entity`` so everything downstream is source-neutral)
                          127.0.0.1 through ``labsim.payload_sniffer.PayloadSniffer`` (socket).
   * ``SyntheticPeers`` - bare ``--replay`` demo (dev only): moving peers anchored to the replayed local player.
   * ``GamePeerSource`` - real-game traffic, the default source. Passive capture only: taps the same
-                         inbound datagrams the local-player vitals decoder reads (position only).
+                         inbound datagrams the local-player vitals decoder reads (class, species, name, position, health, stamina).
 
 Units: ``geo`` is Unreal centimetres, X/Y horizontal, Z height, north = -Y. The lab record is
 Y-up metres; it is converted exactly once, in ``from_record`` (through ``nearby._cm``).
@@ -23,7 +23,7 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Protocol
 
 from .geo import GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, canonical_id, is_self, vital_pct
@@ -166,6 +166,13 @@ class PeerStore:
             self._version += 1
             self._cached = self._snap = None
             return True
+
+    def get(self, raw_id) -> Entity | None:
+        """The entity stored under ``raw_id`` (None if absent or expired)."""
+        with self._lock:
+            self._expire(self.clock())
+            p = self._seen.get(canonical_id(raw_id))
+            return p.entity if p else None
 
     def clear(self) -> None:
         with self._lock:
@@ -327,30 +334,31 @@ class SyntheticPeers:
 
 # ----------------------------------------------------------------- backend G: real game
 class GamePeerSource:
-    """Other replicated actors from the game's own inbound traffic, through the SAME capture path as the
+    """Other replicated creatures from the game's own inbound traffic, through the SAME capture path as the
     local player. This is the default and only user-facing source (owner's personal tool; decision in TRD rev 6).
     Passive: it only reads datagrams that ``TelemetryPipeline`` already delivers (no memory access,
     no injection, nothing is sent).
 
-    How it reuses the local-player path (TRD-050 findings in docs/trd/other-players-on-minimap.md):
-      * ``TelemetryPipeline`` hands every inbound datagram from the learned server, together with the
-        own pawn's Iris handle (``VitalsTracker.self_handle``, chosen by the survival heartbeat), to
-        ``on_inbound``.
-      * ``decode.parse_iris_packet`` (the envelope walk the vitals decoder uses) yields one batch per
-        replicated object keyed by ``net_ref_handle``; ``decode.decode_actor_locations`` reads the
-        quantised world position from the batches that have the recorded location layout (same
-        FVector_NetQuantize100 / cm units as the own movement decoder, so ``geo`` treats them alike).
-      * A peer is keyed by its handle. The own handle is excluded as soon as the heartbeat lock gives it;
-        a provisional peer with that handle is purged retroactively (``PeerStore.set_owned_self_ids``).
-      * The envelope's destruction records remove a tracked handle immediately. Iris replicates changes
-        only, so an actor that stands still goes quiet: the fallback is therefore generous (dim after
-        ``STALE_S`` = 8 s, remove after ``TTL_S`` = 30 s without any location), not the 3 s / 5 s of the lab feed.
-      * Every decoded location is written to the store at once (no buffering); the overlay smooths and
+    How it works (evidence in docs/trd/other-players-on-minimap.md, "Identity" and "Positions"):
+      * ``decode.parse_iris_packet`` yields one batch per replicated object keyed by ``net_ref_handle``, plus the
+        export sections and destruction records.
+      * ``decode.IdentityTracker`` keeps the export tables of the connection and the creation record of every actor:
+        handle -> archetype -> class path (``/Game/.../BP_X.Default__BP_X_C``), and player names from PlayerState
+        records. ``species.describe`` turns a class path into ``kind`` (dino / player / ai / other) and a species
+        name. Objects of kind "other" (plants, fruit, gore, items, level actors) are never drawn.
+      * ``decode.ActorLocationTracker`` decodes positions: the two verified fixed layouts, plus layouts learned
+        from creation anchors and continuity (pawns). ``decode.decode_vitals_block`` reads health and stamina.
+      * A peer is keyed by its handle. The own handle is excluded as soon as the heartbeat lock gives it; a
+        provisional peer with that handle is purged retroactively (``PeerStore.set_owned_self_ids``).
+      * A destruction record removes the peer at once and forgets its identity (the server reuses handles). Iris
+        replicates changes only, so a creature that stands still goes quiet: the fallback is generous (dim after
+        ``STALE_S`` = 8 s, remove after ``TTL_S`` = 30 s without any report), not the 3 s / 5 s of the lab feed.
+      * Every decoded position is written to the store at once (no buffering); the overlay smooths and
         dead-reckons between samples (``geo.EntitySmoother``).
 
-    Decoded: handle, x/y/z. NOT decoded (left None and simply not printed): name (shown as ``Actor #<handle>``),
-    species/kind (every actor is shown as ``player``, but the class is unknown, so AI/animals with the
-    same state layout may appear), heading, growth, health, stamina, hunger, thirst."""
+    Decoded: handle, x/y/z, class, species, kind, player name (when the creature references its PlayerState),
+    health and stamina percentages (when the 9-slot attribute block is sent). NOT decoded: growth, hunger, thirst,
+    heading."""
 
     STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim) and the smoother (TTL)
     TTL_S = GAME_PEER_TTL_S
@@ -359,16 +367,23 @@ class GamePeerSource:
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
 
     def __init__(self, self_ids: Iterable[str] = (), pipeline=None, clock: Callable[[], float] = time.monotonic) -> None:
+        from .decode import ActorLocationTracker, IdentityTracker
+
         self._config_self = tuple(canonical_id(i) for i in self_ids)
         self.store = PeerStore(ttl=self.TTL_S, clock=clock, self_ids=self._config_self)
         self.pipeline = pipeline
         self.own_handle: int | None = None
+        self.identity = IdentityTracker()
+        self.locator = ActorLocationTracker()
+        self._vitals: dict[int, object] = {}  # handle -> decode.ActorVitals
         self.packets = 0  # inbound datagrams seen
-        self.locations = 0  # actor locations decoded
+        self.locations = 0  # actor locations decoded (all sources)
         self.destroyed = 0  # destruction records that removed a tracked peer
-        self.creation_records = 0  # batches whose prefix says "creation" (identity is sent there; not decoded yet)
+        self.creation_records = 0  # batches whose prefix says "creation"
         self.export_batches = 0  # batches followed by an export section (object paths / net-token strings)
         self.destruction_records = 0  # destruction records seen in the envelope (tracked or not)
+        self.filtered_world_objects = 0  # location/vitals batches skipped because the class is a world object
+        self.vitals_blocks = 0  # health/stamina blocks decoded
         self._attached = False
         self.error = ""
 
@@ -384,7 +399,7 @@ class GamePeerSource:
             self.error = str(err)
             return
         self._attached = True
-        log.info("game peers: decoding other actors' positions from inbound replication (passive)")
+        log.info("game peers: decoding other creatures from inbound replication (passive)")
 
     def stop(self) -> None:
         if self._attached and self.pipeline is not None:
@@ -397,14 +412,46 @@ class GamePeerSource:
         self.own_handle = None
         self.store.set_owned_self_ids(())
         self.store.clear()
+        self.identity.reset()
+        self.locator.reset()
+        self._vitals.clear()
+
+    def _identity(self, handle: int) -> tuple[str, str, str]:
+        """(kind, species, name) of an actor from what its creation record and the export tables say."""
+        from . import species as sp
+
+        info = self.identity.actors.get(handle)
+        if info is None:
+            return sp.KIND_UNKNOWN, "", ""
+        path = self.identity.class_path(handle)
+        kind, species = sp.describe(path, self.identity.species_hint(handle), info.player_state is not None)
+        if kind == sp.KIND_DINO and not species and info.asset_species:
+            species = sp.display_name(info.asset_species[0])
+        return kind, species, self.identity.name_of(handle) or ""
+
+    def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str) -> None:
+        eid = str(handle)
+        old = self.store.get(eid)
+        vit = self._vitals.get(handle)
+        self.store.update(Entity(
+            eid, kind, name or f"Actor #{eid}", species, x, y, z,
+            health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
+            heading=old.heading if old else None))
+
+    def _drop(self, handle: int) -> None:
+        if self.store.remove(str(handle)):
+            self.destroyed += 1
+        self.locator.forget(handle)
+        self._vitals.pop(handle, None)
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
+        from . import species as sp
+        from .decode import Bits, batch_kind, count_batches, decode_vitals_block, parse_iris_packet, KIND_STATE
+
         self.packets += 1
         if own_handle is not None and own_handle != self.own_handle:
             self.own_handle = own_handle  # replaces (not adds to) the previous own handle
             self.store.set_owned_self_ids((str(own_handle),))
-        from .decode import count_batches, decode_actor_locations, parse_iris_packet
-
         packet = parse_iris_packet(d.payload)
         if packet is None:
             return
@@ -412,13 +459,38 @@ class GamePeerSource:
         self.creation_records += counts.creation
         self.export_batches += counts.exports
         self.destruction_records += counts.destroyed
+        t = d.observed_at
         for handle in packet.destroyed_handles:
-            if self.store.remove(str(handle)):
-                self.destroyed += 1
-        for loc in decode_actor_locations(d.payload, packet):
-            self.locations += 1
-            eid = str(loc.net_ref_handle)
-            self.store.update(Entity(eid, "player", f"Actor #{eid}", "", loc.x, loc.y, loc.z))
+            self._drop(handle)
+        for creation in self.identity.feed(d.payload, packet):
+            handle = creation.net_ref_handle
+            self.store.remove(str(handle))  # a reused handle is a new actor
+            self._vitals.pop(handle, None)
+            self.locator.note_creation(handle, creation.location, t)
+            kind, species, name = self._identity(handle)
+            if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
+                self._emit(handle, *creation.location, kind, species, name)  # the spawn position is a position
+        bits = Bits(d.payload)
+        for batch in packet.batches:
+            handle = batch.net_ref_handle
+            if handle == self.own_handle:
+                continue
+            kind, species, name = self._identity(handle)
+            if kind == sp.KIND_OTHER:
+                self.filtered_world_objects += 1
+                continue
+            if batch_kind(bits, batch) != KIND_STATE:
+                continue
+            vit = decode_vitals_block(bits, batch) if batch.data_bit_count >= 593 else None
+            if vit is not None:
+                self._vitals[handle] = vit
+                self.vitals_blocks += 1
+            loc = self.locator.update(bits, batch, t, learn=kind in (sp.KIND_DINO, sp.KIND_PLAYER, sp.KIND_AI))
+            if loc is not None:
+                self.locations += 1
+                self._emit(handle, loc.x, loc.y, loc.z if loc.z_reliable else None, kind, species, name)
+            elif vit is not None and (old := self.store.get(str(handle))) is not None:
+                self.store.update(replace(old, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct))
 
     # -- PeerSource --------------------------------------------------------
     def status(self) -> str:
@@ -426,14 +498,27 @@ class GamePeerSource:
             return self.STATUS_NO_PIPELINE
         if self.error:
             return f"game: unavailable ({self.error})"
-        n = len(self.store.entities())
+        peers = self.store.entities()
         own = f"own handle {self.own_handle}" if self.own_handle is not None else "own handle not locked yet"
         if self.packets == 0:
             return "game: waiting for server traffic"
-        if n == 0:
+        if not peers:
             return f"game: waiting for actor locations ({self.packets} pkts, {own})"
-        seen = f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}"
-        return f"game: {n} actors ({seen}; position only; name, class and vitals not available; {own})"
+        known = sum(1 for p in peers if p.entity.species)
+        seen = (f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}")
+        return (f"game: {len(peers)} actors ({known} with species; {seen}; "
+                f"growth, hunger, thirst and heading not available; {own})")
+
+    def summary(self) -> str:
+        """One line for the session log: what is on the map, how it was decoded and what was filtered."""
+        kinds: dict[str, int] = {}
+        for p in self.store.entities():
+            kinds[p.entity.kind] = kinds.get(p.entity.kind, 0) + 1
+        shown = " ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"
+        return (f"on map: {shown} | positions fixed={self.locator.fixed} learned={self.locator.learned} "
+                f"(layouts {self.locator.trusted_layouts}) | vitals blocks={self.vitals_blocks} | "
+                f"world-object batches skipped={self.filtered_world_objects} | classes known="
+                f"{len(self.identity.actors)} player names={len(self.identity.player_names)}")
 
     def snapshot(self) -> PeerSnapshot:
         return self.store.snapshot(self.status(), True)

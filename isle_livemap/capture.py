@@ -35,6 +35,9 @@ GAME_PROCESS_NAME = "TheIsleClient-Win64-Shipping"  # without .exe
 
 GAME_PROCESS_PREFIX = "TheIsleClient"  # fallback for renamed shipping builds
 
+SERVER_SWITCH_DATAGRAMS = 5  # outbound datagrams in a row to a new destination before it counts as the new server
+SERVER_SWITCH_SILENCE_S = 1.0  # ... and the old server must have been silent this long
+
 INBOUND = "inbound"  # server -> game
 OUTBOUND = "outbound"  # game -> server
 
@@ -149,6 +152,8 @@ class TelemetryPipeline:
         self._movement = MovementTracker()
         self._vitals = VitalsTracker()
         self._server: str | None = None
+        self._server_seen = 0.0  # datagram time of the last outbound datagram to ``_server``
+        self._rival: tuple[str, int] | None = None  # (destination, consecutive outbound datagrams) that is not _server
         self._on_update = on_update
         # Passive read-only taps for other consumers of the same decoded stream (peers.GamePeerSource).
         # inbound: fn(datagram, own_net_ref_handle | None) for every inbound datagram from the learned server;
@@ -219,6 +224,7 @@ class TelemetryPipeline:
             self._movement.reset()
             self._vitals.reset()
             self._server = None
+            self._rival = None
             self.latest = Telemetry(status="waiting", stats=dict(self._counts))
             observers = list(self._reset_observers)
         self._notify_reset(observers)
@@ -252,12 +258,25 @@ class TelemetryPipeline:
             changed = False
             if d.direction == OUTBOUND:
                 self._counts["outbound"] += 1
-                server = f"{d.dst_ip}:{d.dst_port}"
-                if server != self._server:
-                    self._server = server
-                    self._vitals.reset()
-                    vit, vit_at = None, 0.0
-                    reset_taps = list(self._reset_observers)
+                dest = f"{d.dst_ip}:{d.dst_port}"
+                if self._server is None:  # first outbound datagram, or the first one after reset(): nothing to wipe
+                    self._server, self._server_seen, self._rival = dest, d.observed_at, None
+                elif dest == self._server:
+                    self._server_seen, self._rival = d.observed_at, None
+                else:
+                    # The game also sends the odd datagram from a second socket to another host (a 1300-byte latency
+                    # probe in a live capture). That is not a server change: wiping the identity and vitals state for
+                    # it lost the own-vitals lock for good. Switch only when the new destination takes over, i.e. it
+                    # sent SERVER_SWITCH_DATAGRAMS in a row and the old one has been silent for SERVER_SWITCH_SILENCE s.
+                    n = self._rival[1] + 1 if self._rival and self._rival[0] == dest else 1
+                    self._rival = (dest, n)
+                    if n >= SERVER_SWITCH_DATAGRAMS and d.observed_at - self._server_seen >= SERVER_SWITCH_SILENCE_S:
+                        self._server, self._server_seen, self._rival = dest, d.observed_at, None
+                        self._vitals.reset()
+                        vit, vit_at = None, 0.0
+                        reset_taps = list(self._reset_observers)
+                    else:
+                        return None  # a stray datagram: not game traffic of the learned server
                 sample = self._movement.track(d.payload, d.observed_at)
                 if sample is not None:
                     self._counts["decoded"] += 1

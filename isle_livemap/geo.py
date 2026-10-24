@@ -233,7 +233,7 @@ class Settings:
     peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client); settings-file only
     show_vitals_detail: bool = False
     show_players: bool = True
-    show_ai: bool = True  # inert for packet sources (they never report an AI kind)
+    show_ai: bool = True  # server-controlled animals (fish) from the game source; settings-file only, no tray item
     # automatic session recording (live capture only; see sessionlog.py). Settings-file only.
     record_sessions: bool = True
     record_dir: str = ""  # "" = <data dir>/logs/sessions
@@ -338,7 +338,7 @@ LOCAL_ID = "local"  # id of geo.local_entity(); packet ids never equal it
 @dataclass(frozen=True, slots=True)
 class Entity:
     id: str
-    kind: str  # "player" | "ai"
+    kind: str  # "player" | "dino" | "unknown" (drawn as players) | "ai" (see PLAYER_KINDS)
     name: str
     species: str
     x: float
@@ -385,6 +385,11 @@ ENTITY_STYLE = {
     "player": EntityStyle("#4dd0ff", "#00141c", 4.0, "dot"),  # other players: cyan, smaller, outlined
     "ai": EntityStyle("#ff8a3d", "#1c0e00", 5.0, "diamond"),
 }
+# Entity kinds from the game source (species.py): "player" (a creature that references a PlayerState), "dino" (a
+# dinosaur class, controller unknown), "unknown" (no class information) are all "other players" for the toggles and
+# the style; "ai" is a server controlled animal. World objects ("other") never become entities.
+PLAYER_KINDS = ("player", "dino", "unknown")
+ENTITY_STYLE.update({k: ENTITY_STYLE["player"] for k in PLAYER_KINDS if k not in ENTITY_STYLE})
 STALE_ALPHA = 105  # 0-255 opacity of a stale (> PEER_STALE_S) peer
 PEER_ARROW_SCALE = 0.6  # peer arrow size relative to the local arrow
 
@@ -423,7 +428,7 @@ def nearby_entities(items, px: float, py: float, radius_m: float | None = None,
     filtered by kind toggles and radius (None = unlimited), nearest first."""
     out = []
     for e, x, y in items:
-        if (e.kind == "player" and not show_players) or (e.kind == "ai" and not show_ai):
+        if (e.kind in PLAYER_KINDS and not show_players) or (e.kind == "ai" and not show_ai):
             continue
         d = distance_m(px, py, x, y)
         if radius_m is not None and d > radius_m:
@@ -507,7 +512,7 @@ def visible_entities(items, px: float, py: float, radius_m: float | None = None,
         age = item[3] if len(item) > 3 else None
         if canonical_id(e.id) in ids:
             continue
-        if (e.kind == "player" and not show_players) or (e.kind == "ai" and not show_ai):
+        if (e.kind in PLAYER_KINDS and not show_players) or (e.kind == "ai" and not show_ai):
             continue
         if age is not None and ttl_s is not None and age >= ttl_s:
             continue
