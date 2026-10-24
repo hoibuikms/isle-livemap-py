@@ -189,10 +189,10 @@ def test_log_of_a_replayed_recording(tmp_path):
     sf.close()
     text = sf.log_path.read_text()
     for needle in ("app start", "recorder started", "server learned: 203.0.113.5:7777", "own handle locked: 103940",
-                   "peer source: game:", "counters: in=", "destruction record: handle=", "app stop",
+                   "peer source: game:", "counters: in=", "destruction record: handle=", "on map:", "app stop",
                    "recorder stopped"):
         assert needle in text, needle
-    assert "first creation record" not in text  # the fixtures hold none
+    assert "first creation record: handle=91180" in text  # in the packet that also holds the destruction record
     assert len(list(pcap_datagrams(sf.pcap_path))) == n
     # concise: no per-packet lines
     assert len(text.splitlines()) < 40 < n

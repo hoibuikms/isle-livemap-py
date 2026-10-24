@@ -299,11 +299,13 @@ class SessionLog:
             c = self.pipeline.counts()
             actors = len(self.peers.store.entities()) if self.peers is not None else 0
             rec = self.recorder
+            summary = getattr(self.peers, "summary", None)
             self.event("%s: in=%d out=%d decoded=%d dropped=%d | creation=%d exports=%d destroyed=%d | "
-                       "actors tracked=%d distinct handles=%d | recorded=%s",
+                       "actors tracked=%d distinct handles=%d | recorded=%s%s",
                        label, c.get("inbound", 0), c.get("outbound", 0), c.get("decoded", 0), c.get("dropped", 0),
                        self.creation, self.exports, self.destroyed, actors, len(self.handles),
-                       f"{rec.packets} pkts in {rec.path.name}" if rec is not None else "no")
+                       f"{rec.packets} pkts in {rec.path.name}" if rec is not None else "no",
+                       f" | {summary()}" if callable(summary) else "")
         except Exception:  # noqa: BLE001
             pass
 

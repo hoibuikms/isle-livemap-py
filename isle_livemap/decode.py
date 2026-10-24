@@ -1,7 +1,9 @@
-"""Bit-level decoders for the player's OWN game traffic.
+"""Bit-level decoders for the player's OWN game traffic and, from the same inbound stream, for other actors.
 
-Ported from the open-source (MIT) UnrealMovementPacketDecoder.cs and
-UnrealIrisPacketParser.cs of Undo-IsleLiveMap. Everything here is a pure
+The movement and envelope walks are ported from the open-source (MIT) UnrealMovementPacketDecoder.cs and
+UnrealIrisPacketParser.cs of Undo-IsleLiveMap (the destruction-record layout differs, see the envelope walk). The
+export sections, creation records, identity tracker, location layouts and the other-creature vitals block are own
+code written from a live capture (docs/trd/other-players-on-minimap.md, section 13). Everything here is a pure
 function of captured bytes: nothing is sent, modified or injected.
 
 Bit order is Unreal's: LSB-first inside each byte, bytes in stream order. That
@@ -13,7 +15,10 @@ from __future__ import annotations
 
 import math
 import struct
+from collections import Counter
 from dataclasses import dataclass, field
+
+from .species import folder_species
 
 # ---------------------------------------------------------------- helpers
 
@@ -218,12 +223,46 @@ def decode_movement(payload: bytes) -> list[MovementCandidate]:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenExport:
+    """One net-token string export: the sender defines ``text`` for ``(type_id, index)``.
+
+    Observed type ids in a live capture: 1 = names (bone/socket names, player names), 2 = gameplay tags
+    ("Ability.Skill.Use"). ``raw`` is the string as sent; ``text`` is the decoded form (see ``decode_net_string``)."""
+
+    index: int
+    type_id: int
+    authority: int
+    text: str
+    raw: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectExport:
+    """One level of an exported object reference chain: ``handle`` is named ``name`` (inline string, or the
+    earlier-defined object-name token ``name_token``) inside ``outer_handle`` (None = root/package or unknown)."""
+
+    handle: int
+    name_token: int | None = None
+    name: str | None = None
+    outer_handle: int | None = None
+    flag: int = 0  # the one undecoded bit between "has path" and "has name"; 0 and 1 both occur
+
+
+@dataclass(frozen=True, slots=True)
+class ExportSection:
+    tokens: tuple[TokenExport, ...] = ()
+    objects: tuple[ObjectExport, ...] = ()
+    must_be_mapped: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class IrisBatch:
     net_ref_handle: int
     data_bit_offset: int
     data_bit_count: int
     has_owner_data: bool
     has_exports: bool
+    exports: ExportSection | None = None  # set when ``has_exports`` and the section parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,23 +340,62 @@ class _Reader:
         return self.skip(bit_count) and self.skip(32)
 
 
-def _skip_net_token(r: _Reader, includes_type_id: bool) -> bool:
+def decode_net_string(encoded: bool, raw: bytes) -> str:
+    """Text of a net string. Unencoded strings (flag bit 0: asset paths, tags) are plain bytes. Encoded ones
+    (flag bit 1: names that may hold non-ASCII text) carry one code point per base-128 group, most significant
+    group first, every group but the last having bit 7 set: ``0x41`` = "A", ``0x81 0x60`` = U+00E0, ``0x82 0x10`` =
+    U+0110, ``0x80 0xBD 0x27`` = U+1EA7. Checked against Vietnamese player names in a real capture ("Cuong Sinh Ton"
+    with diacritics comes out readable). A malformed tail never raises: it becomes U+FFFD."""
+    if not encoded:
+        return raw.decode("utf-8", "replace")
+    out: list[str] = []
+    value, pending = 0, False
+    for byte in raw:
+        value = (value << 7) | (byte & 0x7F)
+        if byte & 0x80:
+            pending = True
+            continue
+        pending = False
+        out.append(chr(value) if 0 < value <= 0x10FFFF and not 0xD800 <= value <= 0xDFFF else "\ufffd")
+        value = 0
+    if pending:
+        out.append("\ufffd")
+    return "".join(out)
+
+
+def _read_net_token(r: _Reader, includes_type_id: bool) -> tuple[int, int, int] | None:
+    """(index, authority bit, type id) of a net token; index 0 (= no token) gives (0, 0, 0). None = truncated."""
     token = r.iris_packed_u32()
     if token is None:
-        return False
-    return token == 0 or (r.skip(1) and (not includes_type_id or r.skip(3)))
+        return None
+    if token == 0:
+        return 0, 0, 0
+    authority = r.bits(1)
+    type_id = r.bits(3) if includes_type_id else 0
+    if authority is None or type_id is None:
+        return None
+    return token, authority, type_id
 
 
-def _skip_net_string(r: _Reader) -> bool:
-    if not r.skip(1):
-        return False
+def _read_net_string(r: _Reader) -> tuple[int, bytes] | None:
+    """(encoded flag, bytes) of a net string: 1 flag bit, 16-bit byte count, the bytes."""
+    encoded = r.bits(1)
     n = r.bits(16)
-    return n is not None and r.skip(n * 8)
+    if encoded is None or n is None or r.pos > r.limit - n * 8:
+        return None
+    raw = bytes(r.bits(8) for _ in range(n))
+    return encoded, raw
 
 
-def _skip_conditional_net_string(r: _Reader) -> bool:
+def _read_conditional_net_string(r: _Reader) -> tuple[bool, tuple[int, bytes] | None]:
+    """(ok, string | None): a presence bit, then the string when set."""
     has = r.bits(1)
-    return has is not None and (has == 0 or _skip_net_string(r))
+    if has is None:
+        return False, None
+    if has == 0:
+        return True, None
+    got = _read_net_string(r)
+    return got is not None, got
 
 
 def _skip_net_ref_handle(r: _Reader) -> bool:
@@ -330,79 +408,95 @@ def _skip_net_ref_handle(r: _Reader) -> bool:
     return h is not None and h != 0
 
 
-def _skip_object_reference_body(r: _Reader, depth: int) -> bool:
-    if depth > 32:
-        return False
-    has_ref = r.bits(1)
-    if has_ref is None:
-        return False
-    if has_ref == 0:
-        return True
-    handle = r.iris_packed_u64()
-    if handle is None or handle == 0:
-        return False
-    has_path = r.bits(1)
-    if has_path is None:
-        return False
-    if has_path == 0:
-        return True
-    if not r.skip(1):
-        return False
-    has_outer = r.bits(1)
-    if has_outer is None:
-        return False
-    return has_outer == 0 or (
-        _skip_net_token(r, False)
-        and _skip_conditional_net_string(r)
-        and _skip_object_reference_body(r, depth + 1)
-    )
-
-
-def _skip_inline_full_object_reference(r: _Reader, depth: int) -> bool:
-    if depth > 32:
-        return False
-    exported = r.bits(1)
-    if exported is None:
-        return False
-    if exported:
-        return (
-            _skip_net_ref_handle(r)
-            and _skip_net_token(r, False)
-            and _skip_conditional_net_string(r)
-        )
-    return _skip_object_reference_body(r, depth)
-
-
-def _skip_exports(r: _Reader) -> bool:
-    for _ in range(_MAX_BATCHES):
-        has = r.bits(1)
-        if has is None:
+def _read_object_chain(r: _Reader, out: list[ObjectExport]) -> bool:
+    """One exported object reference: the object, then its outer, and so on up to the root (a level whose
+    presence bit is 0). A level with no path is a reference to an object whose path was exported earlier and
+    ends the chain; a level with a path names itself with a net token (string inline the first time)."""
+    levels: list[tuple[int, int | None, str | None, int]] = []
+    for _ in range(33):
+        has_ref = r.bits(1)
+        if has_ref is None:
             return False
-        if has == 0:
+        if has_ref == 0:
             break
-        if not _skip_net_token(r, True) or not _skip_net_string(r):
-            return False
-    for _ in range(_MAX_BATCHES):
-        has = r.bits(1)
-        if has is None:
-            return False
-        if has == 0:
-            break
-        if not _skip_inline_full_object_reference(r, 0):
-            return False
-    for _ in range(_MAX_BATCHES):
-        has = r.bits(1)
-        if has is None:
-            return False
-        if has == 0:
-            return True
-        has_handle = r.bits(1)
-        if not has_handle:
-            return False
         handle = r.iris_packed_u64()
         if handle is None or handle == 0:
             return False
-    return False
+        has_path = r.bits(1)
+        if has_path is None:
+            return False
+        if has_path == 0:
+            levels.append((handle, None, None, 0))
+            break
+        flag = r.bits(1)
+        has_name = r.bits(1)
+        if flag is None or has_name is None:
+            return False
+        if has_name == 0:
+            levels.append((handle, None, None, flag))
+            break
+        token = _read_net_token(r, False)
+        if token is None:
+            return False
+        ok, got = _read_conditional_net_string(r)
+        if not ok:
+            return False
+        levels.append((handle, token[0] or None, decode_net_string(bool(got[0]), got[1]) if got else None, flag))
+    else:
+        return False  # deeper than 32 levels: not a path
+    for i, (handle, token, name, flag) in enumerate(levels):
+        outer = levels[i + 1][0] if i + 1 < len(levels) else None
+        out.append(ObjectExport(handle, token, name, outer, flag))
+    return True
+
+
+def _read_inline_full_object_reference(r: _Reader, out: list[ObjectExport]) -> bool:
+    exported = r.bits(1)
+    if exported is None:
+        return False
+    if exported:  # never seen in a capture: parsed so the cursor stays aligned, contents not recorded
+        return _skip_net_ref_handle(r) and _read_net_token(r, False) is not None and _read_conditional_net_string(r)[0]
+    return _read_object_chain(r, out)
+
+
+def _read_exports(r: _Reader) -> ExportSection | None:
+    """The export section that follows a batch: (1) net-token string exports, (2) object reference exports,
+    (3) the must-be-mapped handle list. None when the section does not parse (the cursor is then undefined)."""
+    tokens: list[TokenExport] = []
+    objects: list[ObjectExport] = []
+    mapped: list[int] = []
+    for _ in range(_MAX_BATCHES):
+        has = r.bits(1)
+        if has is None:
+            return None
+        if has == 0:
+            break
+        token = _read_net_token(r, True)
+        got = _read_net_string(r) if token is not None else None
+        if token is None or got is None:
+            return None
+        tokens.append(TokenExport(token[0], token[2], token[1], decode_net_string(bool(got[0]), got[1]), got[1]))
+    for _ in range(_MAX_BATCHES):
+        has = r.bits(1)
+        if has is None:
+            return None
+        if has == 0:
+            break
+        if not _read_inline_full_object_reference(r, objects):
+            return None
+    for _ in range(_MAX_BATCHES):
+        has = r.bits(1)
+        if has is None:
+            return None
+        if has == 0:
+            return ExportSection(tuple(tokens), tuple(objects), tuple(mapped))
+        if not r.bits(1):
+            return None
+        handle = r.iris_packed_u64()
+        if handle is None or handle == 0:
+            return None
+        mapped.append(handle)
+    return None
 
 
 def _skip_net_token_stream(r: _Reader) -> bool:
@@ -444,20 +538,18 @@ def _parse_data_stream(
         return False, True, None
     if batch_count >= _MAX_BATCHES or destruction_count > batch_count:
         return False, True, None
+    # Destruction record = packed u64 handle + ONE bit (always 1 in the recorded capture; meaning unknown). The
+    # earlier reading (a "has info" bit, an optional second handle, a trailing bit) put every record after a
+    # 0-valued bit out of step and produced garbage handles. Checked on a 193 s capture: with this layout all
+    # 2849 parseable data streams end exactly on their last batch, and the batches that follow number
+    # ``batch_count - destruction_count``.
     for _ in range(destruction_count):
         dead = r.iris_packed_u64()
-        if dead is None:
+        if dead is None or r.bits(1) is None:
             return False, True, None
         if destroyed is not None:
             destroyed.append(dead)
-        has_info = r.bits(1)
-        if has_info is None:
-            return False, True, None
-        if has_info and r.iris_packed_u64() is None:
-            return False, True, None
-        if not r.skip(1):
-            return False, True, None
-    for _ in range(destruction_count, batch_count):
+    for _ in range(batch_count - destruction_count):
         inline = r.bits(1)
         if inline is None:
             return False, True, None
@@ -473,9 +565,12 @@ def _parse_data_stream(
             return False, True, None
         has_owner = bits.is_set(b_start)
         has_exports = bits.is_set(b_start + 1)
-        batches.append(IrisBatch(handle, b_start + 2, n - 2, has_owner, has_exports))
         r.pos = b_end
-        if has_exports and not _skip_exports(r):
+        section = None
+        if has_exports:
+            section = _read_exports(r)
+        batches.append(IrisBatch(handle, b_start + 2, n - 2, has_owner, has_exports, section))
+        if has_exports and section is None:
             return True, False, "unsupported-object-exports"
     if r.pos == end:
         return True, True, None
@@ -587,8 +682,8 @@ def parse_iris_packet(payload: bytes) -> IrisPacket | None:
 # ---------------------------------------------------------------- batch kind (state update vs creation)
 #
 # Fact base (docs/trd/reference-findings.md, 3.4 and 5): a batch payload starts with 3 bits that are zero, then
-# a "has state" bit, then an "is creation" bit. All 126 recorded batches begin 0,0,0,1,0 (LSB-first), i.e. a
-# state update; none is a creation. Only this prefix is classified: the creation record itself is NOT decoded.
+# a "has state" bit, then an "is creation" bit. The older fixtures' batches all begin 0,0,0,1,0 (LSB-first), i.e. a
+# state update; the live join capture has 33 362 state, 5 419 creation (0,0,0,1,1) and 884 other-prefix batches. ``batch_kind`` classifies this prefix only; ``decode_creation`` reads the record.
 
 KIND_STATE = "state"
 KIND_CREATION = "creation"
@@ -607,6 +702,283 @@ def batch_kind(bits: Bits, batch: IrisBatch) -> str:
     if prefix & _KIND_SKIPPED_MASK or not prefix & _KIND_HAS_STATE:
         return KIND_UNKNOWN
     return KIND_CREATION if prefix & _KIND_IS_CREATION else KIND_STATE
+
+
+# ---------------------------------------------------------------- actor creation records
+#
+# Facts (193 s live capture, 5419 creation batches; see docs/trd/other-players-on-minimap.md, "Identity"). A
+# creation batch payload is, LSB-first:
+#
+#    5 bits  prefix: 3 zero bits, has-state = 1, is-creation = 1
+#    1 bit   has-baseline; when set, 2 more bits follow
+#    3 bits  factory id (0 in every record)
+#   32 bits  protocol id (a hash of the replicated state layout; the same class always repeats it)
+#    1 bit   has-archetype; 0 for level-placed (static) actors, which are named by their own object export instead
+#    3 bits  archetype reference flags, always 0,0,1 (client-ref, exported, valid), then a packed u64 handle: the
+#            archetype's object handle, resolved to a path through the export sections (``IdentityTracker``)
+#    1 bit   persistent level; 0 would be followed by a level reference (not decoded: no location is read then)
+#    1 bit   has-location; then 1 valid bit and a quantised vector (7-bit header, bit 6 set | component bit count,
+#            then 3 signed components). Divided by 100 it is the world position in cm WITHOUT the factor
+#            ``CREATION_LOCATION_SCALE``: the same actor's later state vector (the layouts below, which are in the
+#            own-position frame) is exactly 16 times larger in x and y (raw 44992560 vs 2812035 for one fish; 15.99..16.00
+#            for five actors). Creation positions therefore land inside +-700 m of the world origin, while the
+#            world is +-8 km wide.
+#
+# The state payload after the header is class specific and is NOT decoded here.
+
+_CREATION_FLAGS_ARCHETYPE = 0b100  # LSB-first (0, 0, 1)
+CREATION_LOCATION_SCALE = 16.0
+
+
+@dataclass(frozen=True, slots=True)
+class Creation:
+    net_ref_handle: int
+    archetype_handle: int | None  # None: level-placed actor (no archetype in the record)
+    protocol_id: int
+    location: tuple[float, float, float] | None  # world cm (scaled, see CREATION_LOCATION_SCALE), None if absent
+    header_bits: int  # bits of the batch consumed by the fields above
+
+
+def decode_creation(bits: Bits, batch: IrisBatch) -> Creation | None:
+    """The creation record at the start of ``batch`` (None when it is not a creation or does not parse)."""
+    if batch_kind(bits, batch) != KIND_CREATION:
+        return None
+    start = batch.data_bit_offset
+    r = _Reader(bits.big, start + batch.data_bit_count, start + _KIND_PREFIX_BITS)
+    baseline = r.bits(1)
+    if baseline is None or (baseline and not r.skip(2)):
+        return None
+    factory, protocol, has_archetype = r.bits(3), r.bits(32), r.bits(1)
+    if factory is None or protocol is None or has_archetype is None:
+        return None
+    archetype = None
+    if has_archetype:
+        flags = r.bits(3)
+        if flags != _CREATION_FLAGS_ARCHETYPE:
+            return Creation(batch.net_ref_handle, None, protocol, None, r.pos - start)
+        archetype = r.iris_packed_u64()
+        if archetype is None:
+            return None
+    persistent, has_location = r.bits(1), r.bits(1)
+    location = None
+    if persistent and has_location and r.bits(1) == 1:
+        header = r.bits(_HEADER_BITS)
+        comp = None if header is None else header & 63
+        if header is not None and header & 64 and _MIN_COMP_BITS <= comp <= _MAX_COMP_BITS and r.pos + 3 * comp <= r.limit:
+            raw = [_read_signed(bits, r.pos + comp * i, comp) for i in range(3)]
+            x, y, z = (v / 100.0 * CREATION_LOCATION_SCALE for v in raw)
+            if _canonical(*raw, comp) and _plausible_world(x, y, z):
+                location = (x, y, z)
+                r.pos += 3 * comp
+    return Creation(batch.net_ref_handle, archetype, protocol, location, r.pos - start)
+
+
+# ---------------------------------------------------------------- identity tracker: handle -> class (-> name)
+#
+# Export sections arrive with (before, or in the same batch as) the data that uses them, but an archetype
+# handle can also be exported by an earlier datagram, so the tracker keeps the tables for the whole connection
+# and resolves a path lazily (``class_path``). Handles are reused by the server, so a destruction record drops
+# the actor's record and a later creation of the same handle starts afresh. Two kinds of handles are
+# referenced but never exported in the recorded capture (the archetype of 85 fruit actors and of 6 pteranodon
+# pawns): their path stays unknown; only the asset paths that accompany their creation records are known.
+
+_PLAYER_STATE_MARKER = "BP_PlayerState"
+# A PlayerState creation record holds the player's name as a packed-u32 length + bytes (``decode_net_string``
+# varint encoding) about 460..560 bits into the payload; the position moves by one byte (469 or 477 in the
+# recorded capture), so a window is scanned and the first plausible text wins.
+_NAME_SCAN_FROM = 460
+_NAME_SCAN_TO = 600
+_NAME_MAX_BYTES = 48
+# A pawn's creation record references its PlayerState as ... 0000000001 + packed u64 handle (anchor seen in 4 of 4
+# pawn records that reference one); the anchor is what keeps a random bit run from matching a handle.
+_PS_REF_ANCHOR = (1 << 1) | (1 << 11)  # bits in stream order 0,1,0,0,0,0,0,0,0,0,0,1
+_PS_REF_ANCHOR_BITS = 12
+
+
+def _plausible_name(text: str) -> bool:
+    """Printable, Latin script (ASCII plus Latin-1 / Extended-A/B / Latin Extended Additional, where Vietnamese
+    lives): rejects the random code points a mis-aligned scan decodes."""
+    if not text or len(text) > 40:
+        return False
+    for ch in text:
+        o = ord(ch)
+        if not (0x20 <= o < 0x7F or 0xA0 <= o <= 0x24F or 0x1E00 <= o <= 0x1EFF) or not ch.isprintable():
+            return False
+    return text.strip() != ""
+
+
+def decode_player_name(bits: Bits, batch: IrisBatch) -> str | None:
+    """The player name inside a PlayerState creation payload, or None when no plausible text is found."""
+    base, n = batch.data_bit_offset, batch.data_bit_count
+    for o in range(_NAME_SCAN_FROM, min(_NAME_SCAN_TO, n - 18)):
+        if bits.read(base + o, 2):
+            continue
+        ln = bits.read(base + o + 2, 8)
+        if not 1 <= ln <= _NAME_MAX_BYTES or o + 10 + ln * 8 > n:
+            continue
+        raw = bits.read(base + o + 10, ln * 8).to_bytes(ln, "little")
+        if raw[-1] & 0x80:
+            continue
+        text = decode_net_string(True, raw)
+        if _plausible_name(text):
+            return text
+    return None
+
+
+@dataclass(slots=True)
+class ActorInfo:
+    """What the creation record of one actor handle says (all of it from the wire; nothing guessed)."""
+
+    handle: int
+    archetype_handle: int | None
+    location: tuple[float, float, float] | None
+    protocol_id: int
+    asset_species: tuple[str, ...] = ()  # /Characters/Dinosaurs/<folder>/ assets named in the creation batch
+    player_state: int | None = None  # handle of the PlayerState the record references (pawns)
+    name: str | None = None  # PlayerState records only: the player name
+
+
+class IdentityTracker:
+    """Export tables + creation records of one connection. Feed it every inbound datagram, in order."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._object_names: dict[int, str] = {}  # object-name token index -> text (the implicit-type token space)
+        self.tokens: dict[tuple[int, int], str] = {}  # (type id, index) -> text: names, gameplay tags
+        self.objects: dict[int, ObjectExport] = {}
+        self.actors: dict[int, ActorInfo] = {}
+        self._arch_votes: dict[int, Counter] = {}  # archetype handle -> {species folder: creations that named it}
+        self.player_names: dict[int, str] = {}  # PlayerState handle -> name
+        self.creations = 0
+        self.exports_seen = 0  # object-export levels recorded
+        self.destroyed_known = 0  # destruction records that matched a creation seen in this connection
+        self.destroyed_unknown = 0
+
+    # -- queries ------------------------------------------------------------
+    def object_path(self, handle: int | None) -> str | None:
+        """Full path ``/Package.Name`` of an exported object (outer chain joined with "."), None if unknown."""
+        parts: list[str] = []
+        seen: set[int] = set()
+        while handle is not None and handle not in seen:
+            seen.add(handle)
+            obj = self.objects.get(handle)
+            if obj is None:
+                return None if not parts else ".".join(reversed(parts))
+            name = obj.name if obj.name is not None else self._object_names.get(obj.name_token or 0)
+            if name is None:
+                return None if not parts else ".".join(reversed(parts))
+            parts.append(name)
+            handle = obj.outer_handle
+        return ".".join(reversed(parts)) if parts else None
+
+    def class_path(self, handle: int) -> str | None:
+        """Path of the archetype of actor ``handle`` (level-placed actors: of the actor itself), None if unknown."""
+        info = self.actors.get(handle)
+        if info is None:
+            return None
+        return self.object_path(info.archetype_handle if info.archetype_handle is not None else handle)
+
+    def archetype_species(self, archetype: int | None) -> str | None:
+        """Species of an archetype whose class path was never exported, from the dinosaur assets that accompany the
+        creation records of that archetype: used only when at least two creations name one folder and none names
+        another (in the recorded capture: archetype 2221, five creations, all Pteranodon animation montages)."""
+        votes = self._arch_votes.get(archetype) if archetype is not None else None
+        if not votes or len(votes) != 1:
+            return None
+        folder, count = next(iter(votes.items()))
+        return folder if count >= 2 else None
+
+    def species_hint(self, handle: int) -> str | None:
+        """``archetype_species`` for actor ``handle``; None when its class path is known (the path decides)."""
+        info = self.actors.get(handle)
+        if info is None or self.class_path(handle):
+            return None
+        return self.archetype_species(info.archetype_handle)
+
+    # -- ingestion ----------------------------------------------------------
+    def _record_exports(self, section: ExportSection) -> None:
+        for t in section.tokens:
+            self.tokens[(t.type_id, t.index)] = t.text
+        for o in section.objects:
+            if o.name_token and o.name is not None:
+                self._object_names[o.name_token] = o.name
+            if o.name is not None or o.name_token:
+                self.objects[o.handle] = o
+                self.exports_seen += 1
+
+    def _folders_of(self, section: ExportSection | None) -> tuple[str, ...]:
+        """Dinosaur species folders named by the objects an export section defines or maps (must-be-mapped)."""
+        if section is None:
+            return ()
+        found: list[str] = []
+        for handle in [o.handle for o in section.objects] + list(section.must_be_mapped):
+            folder = folder_species(self.object_path(handle))
+            if folder and folder not in found:
+                found.append(folder)
+        return tuple(found)
+
+    def _find_player_state_ref(self, bits: Bits, batch: IrisBatch, start: int) -> int | None:
+        """Handle of a known PlayerState referenced after ``start`` bits of ``batch`` (anchor + packed u64)."""
+        if not self.player_names:
+            return None
+        base, n = batch.data_bit_offset, batch.data_bit_count
+        found: set[int] = set()
+        for o in range(max(start, _PS_REF_ANCHOR_BITS), n - 11):
+            if bits.read(base + o - _PS_REF_ANCHOR_BITS, _PS_REF_ANCHOR_BITS) != _PS_REF_ANCHOR:
+                continue
+            size = bits.read(base + o, 3)
+            if o + 3 + (size + 1) * 8 > n:
+                continue
+            handle = bits.read(base + o + 3, (size + 1) * 8)
+            if handle in self.player_names:
+                found.add(handle)
+        return next(iter(found)) if len(found) == 1 else None
+
+    def feed(self, payload: bytes, packet: IrisPacket | None = None) -> list[Creation]:
+        """Update from one datagram; returns the creation records it carried."""
+        packet = packet or parse_iris_packet(payload)
+        if packet is None:
+            return []
+        for b in packet.batches:
+            if b.exports is not None:
+                self._record_exports(b.exports)
+        for handle in packet.destroyed_handles:
+            if self.actors.pop(handle, None) is not None:
+                self.destroyed_known += 1
+            else:
+                self.destroyed_unknown += 1
+            self.player_names.pop(handle, None)
+        bits = Bits(payload)
+        out: list[Creation] = []
+        for b in packet.batches:
+            creation = decode_creation(bits, b)
+            if creation is None:
+                continue
+            self.creations += 1
+            info = ActorInfo(creation.net_ref_handle, creation.archetype_handle, creation.location, creation.protocol_id,
+                             self._folders_of(b.exports))
+            self.actors[info.handle] = info  # a reused handle replaces the old record
+            if info.archetype_handle is not None:
+                votes = self._arch_votes.setdefault(info.archetype_handle, Counter())
+                votes.update(info.asset_species)
+            path = self.class_path(info.handle) or ""
+            if _PLAYER_STATE_MARKER in path:
+                info.name = decode_player_name(bits, b)
+                if info.name:
+                    self.player_names[info.handle] = info.name
+            elif folder_species(path) or info.asset_species or not path:
+                info.player_state = self._find_player_state_ref(bits, b, creation.header_bits)
+            out.append(creation)
+        return out
+
+    def name_of(self, handle: int) -> str | None:
+        """Player name of actor ``handle`` through the PlayerState its creation record references."""
+        info = self.actors.get(handle)
+        if info is None:
+            return None
+        return self.player_names.get(info.player_state) if info.player_state is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,19 +1004,30 @@ def count_batches(payload: bytes, packet: IrisPacket | None = None) -> PacketCou
         sum(1 for b in packet.batches if b.has_exports), len(packet.destroyed_handles))
 
 
-# ---------------------------------------------------------------- other actors' location (TRD-050)
+# ---------------------------------------------------------------- other actors' location
 #
-# Derived from the recorded inbound packets in tests/fixtures (see docs/trd/other-players-on-minimap.md,
-# "TRD-050 Findings"). 55 batches of 28 distinct handles across 8 recorded packets share one layout:
+# Two kinds of evidence, kept apart.
 #
-#   33 bits  fixed state header, always 0x20E822A8 (LSB-first)      <- identifies this replicated state
-#    7 bits  FVector_NetQuantize100 header: (bit 6 set) | component bit count (6 bits)
-#  3*comp    x, y, z as signed raw = cm * 100 (same quantisation as the outbound own-player move)
-#   37 bits  trailing state, NOT decoded (rotation/velocity?; unverified)
+# 1. Fixed layouts (``ACTOR_LAYOUTS``). A state batch whose first 33 bits equal ``header`` carries a quantised
+#    vector at bit ``offset`` and exactly ``tail_bits`` more bits after it, so
 #
-# so data_bit_count == 77 + 3*comp exactly (155 -> comp 26, 158 -> comp 27 in every recorded batch).
-# Nothing here says what KIND of actor it is (player, AI, ...): the class is carried by object exports,
-# which the envelope walk skips and no fixture contains. Name and vitals of these actors are not decoded.
+#        data_bit_count == offset + 7 + 3 * comp + tail_bits
+#
+#    (7 = vector header: bit 6 set | comp = bits per component; 3 signed components, raw = cm * 100, the SAME
+#    frame and scale as the own outbound position). The header + the size equation + a canonical component width
+#    + a plausible world position make an accidental match practically impossible. Verified layouts:
+#
+#      0x20E822A8 @33, tail 37   155/158-bit batches in the old fixtures AND in the live capture, where the one actor
+#                                 using it (handle 61004, BP_Longear, an AI fish) updates 193 times: x/y constant,
+#                                 z bobbing +-1 m, and 16 x its creation position exactly.
+#      0x1680A4328 @69, tail 38  192-bit batches of four BP_Fish_RainbowFish actors (351 batches), each 15.99..16.00 x
+#                                 its creation position in x and y, continuous over 130 s.
+#
+# 2. Learned layouts (``ActorLocationTracker``). Pawns (pteranodon in the capture) have a state layout that depends on
+#    which members changed: the vector sits at a different bit offset for the same header (e.g. 0xC0000348 at 61, 91
+#    and 94). No size equation exists, so a vector is only accepted when it is close to the actor's previous
+#    position (or creation position) given the time passed, and an (header, offset) pair is only trusted after
+#    ``TRUST_VOTES`` such confirmations. That is plausibility AND temporal continuity of the same handle.
 
 ACTOR_STATE_HEADER = 0x20E822A8
 ACTOR_STATE_HEADER_BITS = 33
@@ -655,38 +1038,69 @@ ACTOR_MIN_COMP_BITS = 16
 
 
 @dataclass(frozen=True, slots=True)
+class LocationLayout:
+    header: int  # the first ACTOR_STATE_HEADER_BITS bits of the batch payload
+    offset: int  # bit offset of the vector header inside the payload
+    tail_bits: int  # bits after the vector
+    note: str = ""
+    z_reliable: bool = True  # False: x and y are verified, z is not (see ACTOR_LAYOUTS)
+
+
+ACTOR_LAYOUTS: tuple[LocationLayout, ...] = (
+    LocationLayout(ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, "BP_Longear (AI fish)"),
+    # z of this one runs away downwards at a constant ~8 m/s for as long as the fish is replicated (25 629 -> -181 639 cm
+    # in 100 s) while x and y stay put and equal 16 x the creation position: x and y are positions, z is not trusted.
+    LocationLayout(0x1680A4328, 69, 38, "BP_Fish_RainbowFish (AI fish)", z_reliable=False),
+)
+
+
+@dataclass(frozen=True, slots=True)
 class ActorLocation:
     net_ref_handle: int
     x: float  # Unreal cm, same axes and units as MovementCandidate
     y: float
     z: float
     component_bit_count: int
+    z_reliable: bool = True
+
+
+def _vector_at(bits: Bits, base: int, n: int, offset: int, min_comp: int,
+               check_z: bool = True) -> tuple[int, float, float, float] | None:
+    """(comp, x, y, z) of a canonical, plausible quantised vector at ``offset`` inside a batch of ``n`` bits."""
+    if offset < 0 or offset + _HEADER_BITS > n:
+        return None
+    header = bits.read(base + offset, _HEADER_BITS)
+    comp = header & 63
+    if not header & 64 or comp < min_comp or comp > _MAX_COMP_BITS or offset + _HEADER_BITS + 3 * comp > n:
+        return None
+    start = base + offset + _HEADER_BITS
+    raw = [_read_signed(bits, start + comp * i, comp) for i in range(3)]
+    if not _canonical(raw[0], raw[1], raw[2], comp):
+        return None
+    x, y, z = raw[0] / 100.0, raw[1] / 100.0, raw[2] / 100.0
+    return (comp, x, y, z) if _plausible_world(x, y, z if check_z else 0.0) else None
 
 
 def decode_actor_location(bits: Bits, batch: IrisBatch) -> ActorLocation | None:
-    """Location of the replicated actor in ``batch`` if it has the recorded location layout, else None."""
-    n = batch.data_bit_count
-    comp, rem = divmod(n - ACTOR_STATE_HEADER_BITS - _HEADER_BITS - ACTOR_STATE_TAIL_BITS, 3)
-    if rem or comp < ACTOR_MIN_COMP_BITS or comp > _MAX_COMP_BITS:
+    """Location of the replicated actor in ``batch`` if it has a verified fixed layout, else None."""
+    n, base = batch.data_bit_count, batch.data_bit_offset
+    if n < ACTOR_STATE_HEADER_BITS:
         return None
-    base = batch.data_bit_offset
-    if bits.read(base, ACTOR_STATE_HEADER_BITS) != ACTOR_STATE_HEADER:
-        return None
-    header = bits.read(base + ACTOR_STATE_HEADER_BITS, _HEADER_BITS)
-    if not header & 64 or (header & 63) != comp:
-        return None
-    start = base + ACTOR_STATE_HEADER_BITS + _HEADER_BITS
-    rx, ry, rz = (_read_signed(bits, start + comp * i, comp) for i in range(3))
-    if not _canonical(rx, ry, rz, comp):
-        return None
-    x, y, z = rx / 100.0, ry / 100.0, rz / 100.0
-    if not _plausible_world(x, y, z):
-        return None
-    return ActorLocation(batch.net_ref_handle, x, y, z, comp)
+    header = bits.read(base, ACTOR_STATE_HEADER_BITS)
+    for layout in ACTOR_LAYOUTS:
+        if header != layout.header:
+            continue
+        comp, rem = divmod(n - layout.offset - _HEADER_BITS - layout.tail_bits, 3)
+        if rem or comp < ACTOR_MIN_COMP_BITS or comp > _MAX_COMP_BITS:
+            continue
+        vec = _vector_at(bits, base, n, layout.offset, comp, check_z=layout.z_reliable)
+        if vec is not None and vec[0] == comp:
+            return ActorLocation(batch.net_ref_handle, vec[1], vec[2], vec[3], comp, layout.z_reliable)
+    return None
 
 
 def decode_actor_locations(payload: bytes, packet: IrisPacket | None = None) -> list[ActorLocation]:
-    """Every actor location in one inbound replication datagram (the last one wins per handle)."""
+    """Every fixed-layout actor location in one inbound replication datagram (the last one wins per handle)."""
     packet = packet or parse_iris_packet(payload)
     if packet is None:
         return []
@@ -697,3 +1111,176 @@ def decode_actor_locations(payload: bytes, packet: IrisPacket | None = None) -> 
         if loc is not None:
             found[loc.net_ref_handle] = loc
     return list(found.values())
+
+
+class ActorLocationTracker:
+    """Positions of replicated actors: fixed layouts always, learned layouts when anchored (see section header).
+
+    ``note_creation`` gives an actor its anchor (creation position, world cm). ``update(bits, batch, t, learn=True)``
+    returns the actor's position for a state batch, or None. Times are datagram times in seconds."""
+
+    MAX_SPEED = 10_000.0  # cm/s, 100 m/s: faster than any creature
+    SLACK = 2_000.0  # cm: quantisation, lag and the actor moving between the two packets
+    MAX_GAP = 3.0  # s: a silent actor is assumed to have moved at most this long
+    ANCHOR_LIFETIME = 120.0  # s: an anchor older than this is not trusted
+    TRUST_VOTES = 2
+    MIN_COMP = 22  # learned vectors: 22 bits = |raw| up to 21 km: world positions, not velocities
+    SCAN_FROM, SCAN_TAIL = 5, 60
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._last: dict[int, tuple[float, float, float, float]] = {}  # handle -> (t, x, y, z)
+        self._votes: Counter = Counter()
+        self._trusted: dict[int, set[int]] = {}  # header -> trusted vector offsets
+        self.fixed = self.learned = self.rejected = 0
+
+    @property
+    def trusted_layouts(self) -> int:
+        return sum(len(v) for v in self._trusted.values())
+
+    MAX_ANCHORS = 20_000
+
+    def note_creation(self, handle: int, location: tuple[float, float, float] | None, t: float) -> None:
+        if location is None:
+            self._last.pop(handle, None)
+            return
+        if len(self._last) >= self.MAX_ANCHORS:  # plants are created by the thousand: keep only anchors that can still be used
+            self._last = {h: v for h, v in self._last.items() if t - v[0] <= self.ANCHOR_LIFETIME}
+        self._last[handle] = (t, *location)
+
+    def forget(self, handle: int) -> None:
+        self._last.pop(handle, None)
+
+    def last_known(self, handle: int) -> tuple[float, float, float] | None:
+        last = self._last.get(handle)
+        return last[1:] if last else None
+
+    def _radius(self, dt: float) -> float:
+        return self.SLACK + self.MAX_SPEED * min(max(dt, 0.0), self.MAX_GAP)
+
+    def update(self, bits: Bits, batch: IrisBatch, t: float, learn: bool = False) -> ActorLocation | None:
+        handle = batch.net_ref_handle
+        loc = decode_actor_location(bits, batch)
+        if loc is not None:
+            self._last[handle] = (t, loc.x, loc.y, loc.z)
+            self.fixed += 1
+            return loc
+        if not learn:
+            return None
+        last = self._last.get(handle)
+        n = batch.data_bit_count
+        if last is None or not 0.0 <= t - last[0] <= self.ANCHOR_LIFETIME or n < self.SCAN_FROM + self.SCAN_TAIL:
+            return None
+        if batch_kind(bits, batch) != KIND_STATE:
+            return None
+        base, radius = batch.data_bit_offset, self._radius(t - last[0])
+        header = bits.read(base, ACTOR_STATE_HEADER_BITS)
+
+        def nearest(offsets) -> tuple[float, int, tuple[int, float, float, float]] | None:
+            best = None
+            for off in offsets:
+                vec = _vector_at(bits, base, n, off, self.MIN_COMP)
+                if vec is None:
+                    continue
+                d = math.dist(vec[1:], last[1:])
+                if d <= radius and (best is None or d < best[0]):
+                    best = (d, off, vec)
+            return best
+
+        best = nearest(sorted(self._trusted.get(header, ())))
+        if best is None:
+            best = nearest(range(self.SCAN_FROM, n - self.SCAN_TAIL))
+            if best is None:
+                return None
+            key = (header << 16) | best[1]
+            self._votes[key] += 1
+            if self._votes[key] < self.TRUST_VOTES:
+                return None  # a lone coincidence is not a layout
+            self._trusted.setdefault(header, set()).add(best[1])
+        _, _, vec = best
+        self._last[handle] = (t, vec[1], vec[2], vec[3])
+        self.learned += 1
+        return ActorLocation(handle, vec[1], vec[2], vec[3], vec[0])
+
+
+# ---------------------------------------------------------------- vitals of OTHER creatures
+#
+# The own decoder reads GAS attribute slots (float, set flag bit, repeated float; 66 bits) by position. Creature
+# pawns carry the same slots, and at least one 9-slot block is always laid out the same way:
+#
+#     health, maxHealth, stamina, maxStamina, maxHealth, maxHealth/2, maxHealth/2, maxHealth, maxHealth
+#
+# (the order of the own full frame, whose slot names the app already uses). The last five slots repeat maxHealth,
+# which makes an accidental match impossible, and the values are continuous over time: 74400 health/max
+# 0.784, 0.792, 0.799, 0.806, ... 0.858 over 160 s while maxHealth grows 14.7 -> 20.7; stamina varies freely.
+# Growth is NOT sent with this block (its slot, one slot earlier, is only present when it changed).
+
+_VITALS_BLOCK_SLOTS = 9
+_VITALS_BLOCK_BITS = _VITALS_BLOCK_SLOTS * 66 - 1
+
+
+@dataclass(frozen=True, slots=True)
+class ActorVitals:
+    net_ref_handle: int
+    health: float
+    max_health: float
+    stamina: float
+    max_stamina: float
+
+    @property
+    def health_pct(self) -> float:
+        return min(100.0, 100.0 * self.health / self.max_health)
+
+    @property
+    def stamina_pct(self) -> float:
+        return min(100.0, 100.0 * self.stamina / self.max_stamina)
+
+
+def _slot(bits: Bits, absolute: int) -> float | None:
+    """A GAS attribute slot at an absolute bit: float, flag bit 1, the same float again; None otherwise."""
+    if absolute < 0 or absolute + 65 > bits.nbits or not bits.is_set(absolute + 32):
+        return None
+    raw = bits.read(absolute, 32)
+    if raw != bits.read(absolute + 33, 32):
+        return None
+    value = f32(raw)
+    return value if math.isfinite(value) and 0.0 <= value <= 1_000_000.0 else None
+
+
+_MIN_VITAL_MAX = 0.5  # recorded maxima: maxHealth 2.99..1231, maxStamina 120..640; below 0.5 is a denormal coincidence
+
+
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= max(1e-6, abs(b) * 1e-4)
+
+
+def decode_vitals_block(bits: Bits, batch: IrisBatch) -> ActorVitals | None:
+    """Health / stamina of the creature in ``batch`` if it holds the 9-slot block described above, else None."""
+    n, base = batch.data_bit_count, batch.data_bit_offset
+    if n < _VITALS_BLOCK_BITS:
+        return None
+    big = bits.big
+    for rel in range(0, n - _VITALS_BLOCK_BITS + 1):
+        a = base + rel
+        # cheap rejects first: the maxHealth slot (2nd) must have its flag bit set and its two floats equal
+        if not (big >> (a + 66 + 32)) & 1:
+            continue
+        v1 = _slot(bits, a + 66)
+        if v1 is None or v1 < _MIN_VITAL_MAX:
+            continue
+        v0 = _slot(bits, a)
+        if v0 is None or v0 > v1 * 1.001:
+            continue
+        vals = [_slot(bits, a + 66 * i) for i in range(2, _VITALS_BLOCK_SLOTS)]
+        if any(v is None for v in vals):
+            continue
+        stamina, max_stamina, again, half1, half2, again2, again3 = vals
+        if (max_stamina < _MIN_VITAL_MAX or stamina > max_stamina * 1.001 or not _close(again, v1) or not _close(half1, v1 / 2)
+                or not _close(half2, v1 / 2) or not _close(again2, v1) or not _close(again3, v1)):
+            continue
+        return ActorVitals(batch.net_ref_handle, v0, v1, stamina, max_stamina)
+    return None
+
+
