@@ -197,11 +197,11 @@ def test_blind_session_with_cache_marks_species_as_inferred_and_hides_world_obje
 def test_inferred_species_is_marked_in_the_label():
     e = Entity("1", "player", "Rex Fan", "Alpha", 0.0, 0.0, inferred=True)
     head, _ = entity_label_lines(Nearby(e, 0.0, 0.0, 10.0, 0.0))
-    assert head.endswith("(Alpha~)")
+    assert head == "Rex Fan - Alpha~ - 10 m"
     head, _ = entity_label_lines(Nearby(Entity("1", "player", "Rex Fan", "Alpha", 0.0, 0.0), 0.0, 0.0, 10.0, 0.0))
-    assert head.endswith("(Alpha)")
+    assert head == "Rex Fan - Alpha - 10 m"
     nameless = Entity("1", "dino", "Actor #1", "Alpha", 0.0, 0.0, inferred=True)  # no player name: species alone, marked
-    assert entity_label_lines(Nearby(nameless, 0.0, 0.0, 10.0, 0.0))[0] == "Alpha~"
+    assert entity_label_lines(Nearby(nameless, 0.0, 0.0, 10.0, 0.0))[0] == "Alpha~ - 10 m"
 
 
 def test_class_cache_is_saved_when_the_source_stops(tmp_path, join_packets):

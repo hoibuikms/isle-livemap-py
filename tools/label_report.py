@@ -372,7 +372,7 @@ def labels_at(pcap: Path, at_s: float, cache=None, local_port: int | None = None
 
 
 def _labels_at_without_qt(pcap: Path, at_s: float, cache, local_port) -> dict:
-    from isle_livemap.geo import Settings, label_limits, peer_label_lines, visible_entities
+    from isle_livemap.geo import Settings, label_limits, peer_label_lines, priority_key, visible_entities
 
     result = collect(pcap, cache, local_port, stop_s=at_s)
     peers = result["peers"]
@@ -382,9 +382,10 @@ def _labels_at_without_qt(pcap: Path, at_s: float, cache, local_port) -> dict:
     items = [(p.entity, p.entity.x, p.entity.y, 0.0, None if p.entity.vitals_t is None else max(peers._clock() - p.entity.vitals_t, 0.0))
              for p in peers.store.entities()]
     near = visible_entities(items, own[0], own[1], settings.peer_radius_m) if own else []
-    total, _ = label_limits(len(near), sum(1 for n in near if n.entity.kind == "ai"), False)
+    caps, ai_cap = label_limits(len(near), sum(1 for n in near if n.entity.kind == "ai"), False)
+    total = sum(caps[:3]) + ai_cap
     dots = []
-    for i, n in enumerate(sorted(near, key=lambda n: (n.entity.kind == "ai", n.distance_m))):
+    for i, n in enumerate(sorted(near, key=priority_key)):
         dots.append({"id": n.entity.id, "kind": n.entity.kind, "row": rows.get(n.entity.id), "distance_m": n.distance_m,
                      "bearing": n.bearing, "lines": peer_label_lines(n, own[2]) if i < total else None, "stale": False,
                      "inside": None})
@@ -414,6 +415,8 @@ def render_at(result: dict, at_s: float, first_epoch: float | None, offset_s: fl
         src = row.get("source") or "-"
         if d["lines"]:
             label = " / ".join(d["lines"])
+            if hide_names and row.get("name"):
+                label = label.replace(row["name"], "<name hidden>")
         elif d.get("inside") is False:
             label = "(outside the minimap circle: only an edge arrow, no label)"
         else:

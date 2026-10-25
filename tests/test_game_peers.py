@@ -150,10 +150,9 @@ def test_game_labels_say_unknown_as_question_mark_and_never_show_growth_hunger_t
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     near = visible_entities([(p.entity, p.entity.x, p.entity.y) for p in g.snapshot().entities], 200_000.0, -250_000.0, 5_000.0)
     assert near
-    head, tail, *rest = peer_label_lines(near[0], my_z=30_000.0)
-    assert head == f"Animal ? #{near[0].entity.id}" and not rest  # a server animal with no class: unknown, marked, with its handle
-    assert "?" not in tail and "HP" not in tail and "G " not in tail  # no vitals line for fish, no growth / hunger / thirst
-    assert re.fullmatch(r"\d+ m (N|NE|E|SE|S|SW|W|NW) ((▲|▼)\d+ m|level)", tail), tail
+    lines = peer_label_lines(near[0], my_z=30_000.0)
+    assert len(lines) == 1 and re.fullmatch(r"AI - \? - \d+ m", lines[0]), lines  # a server animal with no class: "AI - ?"
+    assert "HP" not in lines[0] and "G " not in lines[0]  # no vitals line for fish, no growth / hunger / thirst
 
 
 def test_provisional_peer_is_purged_when_own_handle_locks(b64):

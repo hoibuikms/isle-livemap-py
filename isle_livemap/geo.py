@@ -11,6 +11,7 @@ import math
 import os
 import sys
 import uuid
+from bisect import bisect_left
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from functools import lru_cache
@@ -251,7 +252,6 @@ class Settings:
     # other players (packet-sourced, see peers.py)
     peer_radius_m: float = 1000.0
     peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client); settings-file only
-    show_vitals_detail: bool = False
     show_vitals_bars: bool = True  # a thin health / stamina bar under the dot of a creature whose vitals are known
     show_players: bool = True
     show_ai: bool = True  # server-controlled animals (fish) from the game source; settings-file only, no tray item
@@ -269,7 +269,6 @@ class Settings:
         self.peer_radius_m = _clamp_num(self.peer_radius_m, 50.0, 20_000.0, 1000.0)
         ids = self.peer_self_ids if isinstance(self.peer_self_ids, (list, tuple, set)) else []
         self.peer_self_ids = sorted({c for c in (canonical_id(i) for i in ids) if c}, key=str)[:32]
-        self.show_vitals_detail = bool(self.show_vitals_detail)
         self.show_vitals_bars = bool(self.show_vitals_bars)
         self.show_players, self.show_ai = bool(self.show_players), bool(self.show_ai)
         self.record_sessions = bool(self.record_sessions)
@@ -402,6 +401,7 @@ class Entity:
     heading: float | None = None  # map heading, degrees clockwise from north (like the local arrow); None = unknown
     inferred: bool = False  # the species comes from the saved class cache (the join tables were missed), not the server
     vitals_t: float | None = None  # source clock time of the newest health / stamina reading (None: no timestamp)
+    max_health: float | None = None  # maximum health in points, when the creature's records gave it (health points = pct * max)
 
     def __post_init__(self) -> None:
         h = self.heading
@@ -649,82 +649,99 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
                             self_ids=self_ids, me_id=me.id, my_z=me.z, use_3d=True)
 
 
+def species_text(e: Entity) -> str:
+    """The species as a label says it: plain when confirmed, "Name~" when remembered from an earlier session, "?" when unknown."""
+    if not e.species:
+        return "?"
+    return truncate(e.species, 14) + ("~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else "")
+
+
+def vitals_line(e: Entity, tier: str, vitals_age_s: float | None) -> str:
+    """Second line of a creature's label: ``<health %> - HP <health points> - ST <stamina %>``. Only values that were
+    read are printed, the rest is "?" (never a guess). The health points are the percentage of the maximum health the
+    creature's creation record carries. A reading older than ``confidence.VITALS_FRESH_S`` gets a coarse age tag."""
+    pct = "?" if e.health_pct is None else f"{e.health_pct:.0f}%"
+    pts = "?" if e.health_pct is None or not e.max_health else f"{e.health_pct / 100.0 * e.max_health:.0f}"
+    st = "?" if e.stamina_pct is None else f"{e.stamina_pct:.0f}%"
+    text = f"{pct} - HP {pts} - ST {st}"
+    if tier == VITALS_STALE and (e.health_pct is not None or e.stamina_pct is not None):
+        text += f" [{age_tag(vitals_age_s)}]"
+    return text
+
+
 def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
                        vitals: str | None = None, group: int = 1) -> tuple[str, str]:
-    """(head, tail) of the minimap label, worded by how sure each field is (``confidence``): a confirmed species is
-    plain, one remembered from an earlier session carries "~", an unknown one is "?". A player name is only printed
-    when the creature referenced its PlayerState. The tail holds health and stamina ("HP 86% ST 33%", "HP ?" when no
-    reading was ever seen, a coarse age such as "20s+" when the reading is old), then distance, compass bearing and height
-    difference. Growth, hunger and thirst of other creatures are not replicated to us: never printed, not even as "?".
-    ``vitals``: the vitals tier to print (the map view passes the one it settled); None works it out from the age.
-    ``group`` > 1: this label stands for that many creatures of one species standing together ("Carnotaurus ×5"); it then
-    says where the nearest one is and prints no vitals (they belong to one animal)."""
-    e, dz = n.entity, height_delta_m(n, my_z)
-    mark = "~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else ""
+    """(head, tail) of the minimap label, worded by how sure each field is (``confidence``).
+
+    head:  a player          ``Name - Species - 724 m``
+           a dinosaur        ``Species - 724 m``       (``Dino ? - 724 m`` while the species is not known)
+           a server animal   ``AI - Catfish - 120 m``  (``AI - ? - 120 m`` without a class)
+    tail:  ``vitals_line`` for players and dinosaurs; "" for a server animal and for a pack.
+
+    A player name is only printed when the creature referenced its PlayerState. Compass direction and height are not
+    on the minimap label (they are in the Nearby table and ``entity_summary``). Growth, hunger and thirst of other
+    creatures are not replicated to us: never printed. ``vitals``: the vitals tier to print (the map view passes the
+    one it settled); None works it out from the age. ``group`` > 1: this label stands for that many creatures of one
+    species standing together ("Carnotaurus ×5 - 724 m", the nearest one's distance); it then has no vitals line.
+    ``my_z`` is accepted for the callers that pass it; the label does not use it."""
+    e = n.entity
+    dist = format_distance(n.distance_m)
+    if e.kind == "ai":
+        return f"AI - {species_text(e)} - {dist}", ""
     name = e.name or e.id
     if not is_placeholder_name(name):
-        head = truncate(name, name_max) + (f" ({truncate(e.species, 14)}{mark})" if e.species else " (?)")
-    elif e.species:  # no player name known: the species is the best name there is
-        head = truncate(e.species, name_max) + mark
-    else:
-        word = "Animal" if e.kind == "ai" else "Dino" if e.kind in ("dino", "player") else "Creature"
-        head = f"{word} ? #{e.id}"
+        head = f"{truncate(name, name_max)} - {species_text(e)} - {dist}"
+    else:  # no player name known: the species is the best name there is
+        who = species_text(e) if e.species else ("Dino ?" if e.kind in ("dino", "player") else "Creature ?")
+        head = f"{who}{f' ×{group}' if group > 1 else ''} - {dist}"
     if group > 1:
-        return head + f" ×{group}", where_text(n.distance_m, n.bearing, dz)
-    tier = vitals or vitals_tier(e.health_pct, e.stamina_pct, n.vitals_age_s)
-    parts = []
-    if e.health_pct is not None:
-        parts.append(f"HP {e.health_pct:.0f}%")
-    elif e.kind in PLAYER_KINDS:
-        parts.append("HP ?")
-    if e.stamina_pct is not None:
-        parts.append(f"ST {e.stamina_pct:.0f}%")
-    if tier == VITALS_STALE and (e.health_pct is not None or e.stamina_pct is not None):
-        parts.append(f"[{age_tag(n.vitals_age_s)}]")
-    if e.growth_pct is not None:
-        parts.append(f"G {e.growth_pct:.0f}%")
-    parts.append(where_text(n.distance_m, n.bearing, dz))
-    return head, " ".join(parts)
+        return head, ""
+    return head, vitals_line(e, vitals or vitals_tier(e.health_pct, e.stamina_pct, n.vitals_age_s), n.vitals_age_s)
 
 
-LABEL_RANK = {"player": 0, "dino": 1, "unknown": 2, "ai": 3}  # who gets a label first when the minimap is crowded
-LABELS_MINIMAP, LABELS_FULL = 8, 24
-AI_LABELS_MINIMAP, AI_LABELS_FULL = 3, 8  # fish and other server animals must never use up the labels of players
-CROWDED_ON_SCREEN = 20  # above this many peers of a group that group gets only a few labels
-CROWDED_LABELS = 4
+# ------------------------------------------------------------ who gets glyph budget and label space first
+PRIORITY_RADII_M = (250.0, 500.0, 1000.0)  # distance tiers: inside 250 m first, then 500 m, then 1000 m, then the rest
+KIND_RANK = {"player": 0, "dino": 1, "unknown": 2, "ai": 3}
+LABEL_CAPS_MINIMAP = (12, 6, 4, 0)  # labels per distance tier (inside 250 m / 500 m / 1000 m / beyond) on the minimap ...
+LABEL_CAPS_FULL = (24, 16, 12, 8)  # ... and on the full map
+AI_LABELS_MINIMAP, AI_LABELS_FULL = 3, 8  # server animals (fish) never use up the labels of players and dinosaurs
+CROWDED_ON_SCREEN = 20  # above this many creatures on screen, the 500 m and 1000 m tiers get fewer labels (never the 250 m tier)
+CROWDED_TIER_CAPS = (3, 2)
+STICKY_DISTANCE_FACTOR = 0.85  # a peer that had a label last frame ranks as if it were this much nearer: no label swapping
 
 
-def label_rank(n: Nearby) -> int:
-    return LABEL_RANK.get(n.entity.kind, len(LABEL_RANK))
+def priority_tier(distance_m_: float) -> int:
+    """0 = within 250 m, 1 = within 500 m, 2 = within 1000 m, 3 = further away."""
+    return bisect_left(PRIORITY_RADII_M, distance_m_)
 
 
-def label_sort_key(n: Nearby) -> tuple[int, float, str]:
-    """Order in which peers compete for a label: players, then dinosaurs, unidentified, server animals; nearest first."""
-    return label_rank(n), n.distance_m, n.entity.id
+def priority_key(n: Nearby, sticky: bool = False) -> float:
+    """The one order in which peers compete for dot budget, label space and collisions (smaller = more important):
+    creatures before server animals; then the distance tier (250 / 500 / 1000 m); then players before dinosaurs before
+    unidentified creatures; then the nearest. One float, so sorting hundreds of peers every frame stays cheap; equal
+    keys keep the order they came in (the callers pass peers nearest first). ``sticky``: it had a label last frame, so
+    it ranks as slightly nearer (labels do not swap between two peers at almost the same distance)."""
+    d = n.distance_m * (STICKY_DISTANCE_FACTOR if sticky else 1.0)
+    kind = n.entity.kind
+    group = (4 if kind == "ai" else 0) + bisect_left(PRIORITY_RADII_M, d)
+    return group * 8 + KIND_RANK.get(kind, len(KIND_RANK)) + min(d, 99_999.0) * 1e-6
 
 
-def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) -> tuple[int, int]:
-    """(max labels in total, max labels for server animals) for the peers currently drawn on screen."""
-    total = LABELS_FULL if full_map else LABELS_MINIMAP
+def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) -> tuple[tuple[int, ...], int]:
+    """(labels per distance tier, labels for server animals) for the peers currently drawn on screen. The 250 m tier is
+    never reduced; a crowd only takes labels from the further tiers, and a shoal takes all the fish labels."""
+    caps = list(LABEL_CAPS_FULL if full_map else LABEL_CAPS_MINIMAP)
     ai = AI_LABELS_FULL if full_map else AI_LABELS_MINIMAP
     if creatures_on_screen > CROWDED_ON_SCREEN:
-        total = min(total, CROWDED_LABELS)
+        caps[1], caps[2] = min(caps[1], CROWDED_TIER_CAPS[0]), min(caps[2], CROWDED_TIER_CAPS[1])
     if ai_on_screen > CROWDED_ON_SCREEN:
         ai = 0
-    return total, ai
+    return tuple(caps), ai
 
 
-def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False, vitals: str | None = None,
-                     group: int = 1) -> list[str]:
-    """Minimap label: ``entity_label_lines`` plus, with ``detail``, the vitals the label does not already print
-    (growth, hunger, water; HP and ST are in the tail, so they are never repeated as "Health" / "Stamina")."""
-    lines = list(entity_label_lines(n, my_z=my_z, vitals=vitals, group=group))
-    if detail and group <= 1:
-        extra = [f"{label} {v:.0f}%" for label, attr in VITAL_FIELDS
-                 if attr not in ("health_pct", "stamina_pct") and (v := getattr(n.entity, attr)) is not None]
-        if extra:
-            lines.append(truncate("  ".join(extra), 44))
-    return lines
+def peer_label_lines(n: Nearby, my_z: float | None = None, vitals: str | None = None, group: int = 1) -> list[str]:
+    """Minimap label: the lines of ``entity_label_lines`` (the second one only when there is one)."""
+    return [line for line in entity_label_lines(n, my_z=my_z, vitals=vitals, group=group) if line]
 
 
 def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
@@ -773,25 +790,37 @@ SLOT_SLACK_PX = 3.0  # the slot a label already has may be this much worse than 
 
 def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect,
                 accept: Callable[[Rect], bool] | None = None, prefer: int | None = None,
-                slot: list[int] | None = None, prefer_accept: Callable[[Rect], bool] | None = None) -> Rect | None:
+                slot: list[int] | None = None, prefer_accept: Callable[[Rect], bool] | None = None,
+                only_preferred: bool = False) -> Rect | None:
     """Pick a label rect for anchor (ax, ay): the first candidate of ``label_slots`` that lies inside ``bounds``,
     overlaps no already placed label and satisfies ``accept`` (e.g. lie inside the round minimap). ``prefer`` is the
     index chosen for this marker last time: it is tried first, and with ``SLOT_SLACK_PX`` of tolerance on the bounds,
     on overlaps and (through ``prefer_accept``) on ``accept``, so a label keeps its side while it still more or less
     fits. Without that a dot moving along the edge of the round view made its label jump between two sides every few
-    frames. ``slot`` (a list) receives the chosen index. Returns None if none fits."""
+    frames. ``slot`` (a list) receives the chosen index. ``only_preferred``: try nothing but ``prefer``. Returns None if none fits."""
     bx, by, bw, bh = bounds
     if w > bw:
         return None
     slots = label_slots(ax, ay, w, h, bounds)
-    order = range(len(slots)) if prefer is None or not 0 <= prefer < len(slots) else \
-        [prefer, *[i for i in range(len(slots)) if i != prefer]]
+    if only_preferred:  # keep the side it has, or say that it no longer fits (the caller then looks for another)
+        order = [prefer] if prefer is not None and 0 <= prefer < len(slots) else []
+    else:
+        order = range(len(slots)) if prefer is None or not 0 <= prefer < len(slots) else \
+            [prefer, *[i for i in range(len(slots)) if i != prefer]]
     for i in order:
         r = slots[i]
         tol = SLOT_SLACK_PX if i == prefer else 0.0
-        inside = (r[0] >= bx - tol and r[1] >= by - tol and r[0] + r[2] <= bx + bw + tol and r[1] + r[3] <= by + bh + tol)
+        x0, y0 = r[0], r[1]
+        x1, y1 = x0 + r[2], y0 + r[3]
+        if not (x0 >= bx - tol and y0 >= by - tol and x1 <= bx + bw + tol and y1 <= by + bh + tol):
+            continue
         test = (prefer_accept or accept) if tol else accept
-        if inside and (test is None or test(r)) and not any(_overlaps(r, o, tol) for o in placed):
+        if test is not None and not test(r):
+            continue
+        for o in placed:  # the same test as _overlaps, inlined: this loop runs for every slot of every label of every frame
+            if x0 < o[0] + o[2] - tol and o[0] < x1 - tol and y0 < o[1] + o[3] - tol and o[1] < y1 - tol:
+                break
+        else:
             placed.append(r)
             if slot is not None:
                 slot[:] = [i]

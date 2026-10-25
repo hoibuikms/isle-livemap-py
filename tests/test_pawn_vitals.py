@@ -184,7 +184,9 @@ def test_bootstrap_leaves_an_anchored_creature_alone():
 def test_label_tail_carries_health_and_stamina():
     e = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=86.0, stamina_pct=33.4)
     head, tail = entity_label_lines(Nearby(e, 0.0, 0.0, 100.0, 90.0))
-    assert head == "Allosaurus" and tail.startswith("HP 86% ST 33% ")
+    assert head == "Allosaurus - 100 m" and tail == "86% - HP ? - ST 33%"  # no maximum health known: the points are "?"
+    sized = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=86.0, stamina_pct=33.4, max_health=1650.0)
+    assert entity_label_lines(Nearby(sized, 0.0, 0.0, 100.0, 90.0))[1] == "86% - HP 1419 - ST 33%"  # 86 % of 1650
     bare = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0)
     tail = entity_label_lines(Nearby(bare, 0.0, 0.0, 100.0, 90.0))[1]
-    assert tail.startswith("HP ? ") and "ST" not in tail  # never read: said so, not guessed
+    assert tail == "? - HP ? - ST ?"  # never read: said so, not guessed

@@ -6,8 +6,8 @@ import time
 import pytest
 
 from isle_livemap.geo import (
-    AI_LABELS_MINIMAP, CROWDED_LABELS, LABELS_FULL, LABELS_MINIMAP, Entity, Nearby, Settings, entity_label_lines,
-    label_limits, label_sort_key,
+    AI_LABELS_MINIMAP, LABEL_CAPS_FULL, LABEL_CAPS_MINIMAP, Entity, Nearby, Settings, entity_label_lines, label_limits,
+    priority_key,
 )
 from isle_livemap.peers import GamePeerSource, PeerEntity
 
@@ -19,40 +19,55 @@ def near(kind, name, species="", dist=100.0, **kw):
 # ---------------------------------------------------------------- label text
 def test_creature_without_a_player_name_is_labelled_by_species_not_by_handle():
     head, tail = entity_label_lines(near("dino", "Actor #171102", "Deinosuchus"))
-    assert head == "Deinosuchus" and "#" not in head
-    assert entity_label_lines(near("ai", "Actor #5", "Longear"))[0] == "Longear"
-    assert entity_label_lines(near("dino", "Actor #171102", "Deinosuchus", inferred=True))[0] == "Deinosuchus~"
+    assert head == "Deinosuchus - 100 m" and "#" not in head
+    assert entity_label_lines(near("dino", "Actor #171102", "Deinosuchus", inferred=True))[0] == "Deinosuchus~ - 100 m"
 
 
-def test_named_player_keeps_name_and_species():
-    assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus"))[0] == "Rex Fan (Deinosuchus)"
-    assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus", inferred=True))[0] == "Rex Fan (Deinosuchus~)"
+def test_server_animals_are_labelled_ai_and_their_name():
+    assert entity_label_lines(near("ai", "Actor #5", "Catfish", dist=120.0)) == ("AI - Catfish - 120 m", "")
+    assert entity_label_lines(near("ai", "Actor #5", "Forktail"))[0] == "AI - Forktail - 100 m"
+    assert entity_label_lines(near("ai", "Actor #5", ""))[0] == "AI - ? - 100 m"  # no class known
 
 
-def test_unidentified_creature_says_unknown_and_still_shows_its_handle():
+def test_named_player_label_is_name_species_distance():
+    assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus", dist=724.0))[0] == "Rex Fan - Deinosuchus - 724 m"
+    assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus", inferred=True))[0] == "Rex Fan - Deinosuchus~ - 100 m"
+    assert entity_label_lines(near("player", "Some Name", ""))[0] == "Some Name - ? - 100 m"  # a name, but no species yet
+
+
+def test_unidentified_creature_says_unknown():
     def nearby(kind, eid, name):
         return Nearby(Entity(eid, kind, name, "", 0.0, 0.0), 0.0, 0.0, 100.0, 0.0)
 
-    assert entity_label_lines(nearby("unknown", "9", "Unknown #9"))[0] == "Creature ? #9"
-    assert entity_label_lines(nearby("dino", "9", "Actor #9"))[0] == "Dino ? #9"
-    assert entity_label_lines(nearby("ai", "9", "Actor #9"))[0] == "Animal ? #9"
-    assert entity_label_lines(nearby("player", "9", "Some Name"))[0] == "Some Name (?)"  # a name, but no species yet
+    assert entity_label_lines(nearby("unknown", "9", "Unknown #9"))[0] == "Creature ? - 100 m"
+    assert entity_label_lines(nearby("dino", "9", "Actor #9"))[0] == "Dino ? - 100 m"
 
 
 # ---------------------------------------------------------------- who gets a label
-def test_players_are_labelled_before_dinosaurs_unknowns_and_fish_whatever_the_distance():
+def test_creatures_come_before_fish_then_the_distance_tier_then_players_before_dinosaurs():
     es = [near("ai", "f1", dist=10), near("unknown", "u", dist=20), near("dino", "d", dist=900), near("player", "p", dist=800),
-          near("player", "p2", dist=700)]
-    assert [n.entity.id for n in sorted(es, key=label_sort_key)] == ["p2", "p", "d", "u", "f1"]
+          near("player", "p2", dist=700), near("dino", "d_near", dist=200), near("dino", "d_mid", dist=400)]
+    # 250 m tier first (whatever the kind), then 500 m, then 1000 m; inside a tier players, dinosaurs, unknowns; fish last
+    assert [n.entity.id for n in sorted(es, key=priority_key)] == ["d_near", "u", "d_mid", "p2", "p", "d", "f1"]
+
+
+def test_a_peer_that_had_a_label_ranks_as_slightly_nearer():
+    a, b = near("dino", "a", dist=300.0), near("dino", "b", dist=290.0)
+    assert sorted([a, b], key=priority_key)[0].entity.id == "b"
+    assert sorted([a, b], key=lambda n: priority_key(n, n.entity.id == "a"))[0].entity.id == "a"
 
 
 def test_fish_never_use_up_the_label_budget_of_players():
-    assert label_limits(2, 10, full_map=False) == (LABELS_MINIMAP, AI_LABELS_MINIMAP)
-    assert AI_LABELS_MINIMAP < LABELS_MINIMAP
+    assert label_limits(2, 10, full_map=False) == (LABEL_CAPS_MINIMAP, AI_LABELS_MINIMAP)
     assert label_limits(2, 30, full_map=False)[1] == 0  # a shoal: no fish labels at all, players keep theirs
-    assert label_limits(2, 30, full_map=False)[0] == LABELS_MINIMAP
-    assert label_limits(25, 0, full_map=False)[0] == CROWDED_LABELS
-    assert label_limits(2, 0, full_map=True)[0] == LABELS_FULL
+    assert label_limits(2, 30, full_map=False)[0] == LABEL_CAPS_MINIMAP
+    assert label_limits(2, 0, full_map=True)[0] == LABEL_CAPS_FULL
+
+
+def test_a_crowd_takes_labels_from_the_far_tiers_never_from_the_250_m_tier():
+    caps, _ = label_limits(25, 0, full_map=False)
+    assert caps[0] == LABEL_CAPS_MINIMAP[0]
+    assert caps[1] < LABEL_CAPS_MINIMAP[1] and caps[2] < LABEL_CAPS_MINIMAP[2]
 
 
 def test_minimap_labels_the_player_first_even_when_many_fish_are_nearer(tmp_path, monkeypatch):

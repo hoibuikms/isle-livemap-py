@@ -39,7 +39,7 @@ def test_table_lists_every_creature_with_species_source_and_confidence(pcap):
     assert {r["source"] for r in rows.values() if r["species"]} <= {"table", "asset"}  # no cache was given
     assert rows[86612]["kind"] == "player" and rows[86612]["name"] and rows[86612]["source"] == "table"
     assert rows[74400]["hp"] == pytest.approx(78.4, abs=0.1)  # a pawn whose full health block was seen
-    assert rows[73832]["placed"] is False  # replicated (a creation record) but never given a position
+    assert rows[73832]["placed"] is True  # its creation record carried a spawn position and a maxHealth: drawn from the start
     text = "\n".join(tool.render_table(result, EPOCH0, 0.0, include_ai=True, hide_names=False))
     assert "species" in text and "source" in text and "Pteranodon" in text and "never placed" in text
     assert rows[86612]["name"] in text

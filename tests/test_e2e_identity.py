@@ -91,4 +91,4 @@ def test_creatures_with_species_and_names_are_drawn_and_world_objects_are_not(tm
         from isle_livemap.geo import peer_label_lines
 
         head, tail = peer_label_lines(named[0])
-        assert head.endswith(f"({named[0].entity.species})") and "m" in tail
+        assert head.startswith(named[0].entity.name[:10]) and f" - {named[0].entity.species} - " in head and "HP" in tail

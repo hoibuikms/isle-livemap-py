@@ -31,14 +31,13 @@ Bare `--replay` shows synthetic demo peers (one entry deliberately carries a sel
 
 ## Settings (`settings.json`)
 
-Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on labels". There is no peers dialog.
+Tray menu items: "Show other players", "Nearby radius...", "Health / stamina bars". There is no peers dialog.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `peer_radius_m` | `1000` | radar radius in metres (clamped 50..20000); tray "Nearby radius...". Old files with `feed_radius_m` are migrated to this on load; other legacy `feed_*` keys and the obsolete `peer_source` key are ignored. |
 | `peer_self_ids` | `[]` | settings-file only: extra ids that are "me" and never drawn (for example a second client); read at start |
 | `show_players` | `true` | draw other players; tray toggle |
-| `show_vitals_detail` | `false` | extra label line with the vitals that are known; tray toggle |
 | `show_vitals_bars` | `true` | a thin health (and stamina) bar under the dot of a creature whose health is known; tray toggle "Health / stamina bars" |
 | `show_ai` | `true` | settings-file only: draw server-controlled animals (fish, kind `ai`, muted grey-blue diamond) from the game source |
 | `record_sessions` | `true` | settings-file only: automatic session pcap + log for live capture; `false` = same as `--no-record` |
@@ -51,7 +50,14 @@ Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on lab
 - Self is excluded by identity, never by position. Lab: id 0 is the lab's "me". Game: the entity whose Iris handle equals the own handle (learned from the survival heartbeat) is dropped, and a provisional peer with that handle is purged when the lock arrives. `peer_self_ids` adds more.
 - Silence timeouts are a property of the source. Lab and synthetic peers are dimmed after 3 s without an update and removed after 5 s. Game peers are dimmed after 8 s (`GAME_PEER_STALE_S`) and, without a destruction record, removed after 180 s for creatures (`GamePeerSource.TTL_S`: captured resting pawns went silent for 100-300 s and came back) or 30 s for server animals (`TTL_AI_S`), because Iris replicates changes only: an actor that stands still sends nothing, so silence is not absence. The game source also removes a tracked handle when the packet carries a destruction record for it (the dot is gone 1.5 s later: `GamePeerSource.GONE_GRACE_S`, applied by `EntitySmoother.prune` every frame; it used to stay dimmed for 30 s) (431 records in the recorded capture, 431 of 431 handles seen in that capture, 430 with a creation record). The 8 s / 30 s values are a judgement call, not a measured number.
 - The game server is the destination of the first outbound datagram. A different destination only replaces it after 5 outbound datagrams in a row while the old server has been silent for 1 s (a real server change). A single datagram from the game's second socket to another host (a 1300-byte latency probe was seen once per session) is ignored: it used to count as a server change and wiped the identity tables, the peers and the own-vitals lock, twice within 30 ms (once for the probe, once when the real server was "learned" again).
-- A label never states a guess as a fact; see "Label confidence" below. Unknown is written as `?`, a species remembered from an earlier session carries `~` and is drawn softer, and growth, hunger and thirst of other creatures are never printed (not even as `?`): they are not replicated to us. The label is the player name with the species in brackets (`<name> (Pteranodon)`); a creature without a player name is labelled by its species alone (`Deinosuchus`, `Longear`) and only a creature with no class at all shows `Dino ? #<handle>` (`Creature ? #<handle>` when even the kind is unknown, `Animal ? #<handle>` for a server animal). Second line: health and stamina, distance, compass bearing and height difference, e.g. `Rainbow Fish` / `666 m N` or `<name> (Pteranodon)` / `HP 86% ST 33% 787 m NNE +60m`. Labels go to players first, then dinosaurs, then server animals (fish: at most 3 labels, none in a crowd of 20+); they avoid the status lines, the dots of players and the edge of the round minimap. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet is a dot, one that has moved is an arrow.
+- A label never states a guess as a fact; see "Label confidence" below. Unknown is written as `?`, a species remembered from an earlier session carries `~` and is drawn softer, and growth, hunger and thirst of other creatures are never printed (not even as `?`): they are not replicated to us. The format is the same for everybody (`geo.entity_label_lines`, `geo.vitals_line`):
+  * a player: `<name> - <species> - <distance>` / `<health %> - HP <health points> - ST <stamina %>`, e.g. `P1 - Deinosuchus - 724 m` / `86% - HP 1419 - ST 33%`
+  * a dinosaur without a player name: `<species> - <distance>` / the same second line (`Dino ? - <distance>` while the species is not known, `Creature ? - ...` when even the kind is unknown)
+  * a server animal: `AI - <name> - <distance>`, one line (`AI - Catfish - 120 m`, `AI - Forktail - 1.5 km`, `AI - ? - 120 m` without a class)
+  * a pack of one species standing together beyond 250 m: `Carnotaurus ×5 - <distance of the nearest>`, one line.
+  The second line holds only what was read: the percentage, the health points (percentage of the maximum health of the creature's creation record, `?` without it) and the stamina percentage; unread values are `?`, an old reading gets a coarse age tag (`[2m+]`). Compass direction and height are not on the minimap label; they are in the Nearby table and the tooltip text (`geo.entity_summary`). The label keeps the side of the dot it had (even when a dot has moved under it) while it still fits. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet is a dot, one that has moved is an arrow.
+- **Priority** (`geo.priority_key`, one number used for the dot budget, the label slots and collisions): creatures before server animals; then the distance tier **within 250 m, within 500 m, within 1000 m, further**; inside a tier players before dinosaurs before unidentified creatures; then the nearest. A peer that had a label last frame ranks as 15 % nearer, so two creatures at almost the same distance do not swap labels. Labels per tier on the minimap: 12 / 6 / 4 (a crowd of more than 20 creatures cuts the 500 m and 1000 m tiers to 3 and 2, **never the 250 m tier**); fish get at most 3 labels and none in a shoal of 20+. Every creature inside 250 m keeps its full two-line label: when no free spot is left it takes the best one over other labels instead of being dropped or shortened. Beyond the 1000 m view radius players and dinosaurs up to 2.5 km are pointers on the circle edge.
+- **Your own stats** (growth, hunger, thirst, health) are not drawn anywhere on the minimap: there is no panel and no text for the red arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
 
 ## Label confidence (what the minimap claims, and how sure it is)
@@ -129,13 +135,13 @@ rest are small plain squares (500 anti-aliased glyphs do not fit a 16 ms frame; 
 
 ## Distance, direction, height and why a dot can be missing
 
-Every place that describes where a creature is uses one wording (`geo.where_text`): `724 m NE ▲40 m` (minimap label), the
-same in the tooltip text and, in separate columns, in the Nearby table (Distance, Direction, Height Δ). The direction is a
+Every place that describes where a creature is uses one wording (`geo.where_text`): `724 m NE ▲40 m` (tooltip text and
+log lines) and, in separate columns, in the Nearby table (Distance, Direction, Height Δ); the minimap label itself carries the
+distance only. The direction is a
 compass bearing from map-north (north = -Y), not relative to where you look; the minimap does not rotate. `▲` is above you,
 `▼` below you, `level` within half a metre, and the height is left out when it is not known. Health and stamina are printed
-once, as `HP` / `ST` (table headers use the same two words); the optional "Vitals detail on labels" line only adds growth,
-hunger and water, so `HP` is never repeated as "Health", and the thin bars are drawn only for creatures that have no label
-(the label already says the number).
+once, as `HP` / `ST` (table headers use the same two words), and the thin bars are drawn only for creatures that have no
+label (the label already says the number).
 
 A creature leaves the minimap only when the server destroys it. Everything else that used to hide one:
 
@@ -143,7 +149,8 @@ A creature leaves the minimap only when the server destroys it. Everything else 
 |---|---|
 | Beyond the view radius (default 1000 m): the player and most dinosaurs of that session were 1.0-1.2 km away and were never drawn | players and dinosaurs up to 2.5 km are a pointer on the circle edge; the nearest six also read `Name 1.1 km` |
 | The server destroys an actor that leaves its relevancy range and sends a new creation record 6-8 s later (same handle, same spot) | players, dinosaurs and unknown creatures stay as dimmed ghosts for 12 s (`GamePeerSource.GHOST_GRACE_S`); fish still leave after 1.5 s |
-| A pack of one species standing together had no room for labels | one label `Carnotaurus ×5` (nearest one's position) instead of none |
+| A creature whose class could not be named (join tables missed, id not in the cache) and that stands still gave no position at all, so it stayed off the map for as long as it did not move: in the vv capture 3-6 such creatures were "replicated but not placeable" all the time | its creation record carries a spawn position and a maxHealth (plants, fruit and items have none): it is drawn at the spawn position at once, as an unknown creature, and is upgraded when its class is known (hidden creatures 3-6 -> 0-2; time to the first dot, 95th percentile, 334 s -> 13 s). Creatures that existed before the app started and never move still cannot be placed |
+| A pack of one species standing together beyond 250 m had no room for labels | one label `Carnotaurus ×5` (nearest one's position) instead of none; inside 250 m every creature keeps its own label |
 | No room for a two-line label | a one-line label (who / what it is) for at least 4 s instead of none |
 | A creature drawn as `unknown` whose creation record arrived later (or that linked to its PlayerState) stayed `unknown` until it moved | kind and name are upgraded on any state update; never downgraded |
 | Resting creatures were dimmed after 8 s although Iris sends nothing for a creature at rest | dimmed after 45 s |

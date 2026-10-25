@@ -15,12 +15,11 @@ from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, is_p
 from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
-    ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
-    PEER_STALE_S, PEER_TTL_S, LABEL_RANK, SLOT_SLACK_PX, label_limits, place_label, vital_lines, visible_entities,
+    ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
+    PEER_STALE_S, PEER_TTL_S, SLOT_SLACK_PX, label_limits, place_label, priority_key, priority_tier, visible_entities,
     marker_extent, marker_radius, peer_style, truncate, _overlaps,
 )
 from .peers import status_is_warning
-from .tracking import Vitals
 
 BASE_SIZE = 360  # minimap edge in px at 100 %
 BASE_VIEW_FRACTION = 0.2  # minimap shows 20 % of map width at zoom 1
@@ -234,7 +233,7 @@ class MapView(QWidget):
                           self._draw_player):
                 self._paint_layer(layer, p)
             p.setClipping(False)
-            for layer in (self._draw_border, self._draw_hud, self._draw_peer_status, self._draw_record_status):
+            for layer in (self._draw_border, self._draw_peer_status, self._draw_record_status):
                 self._paint_layer(layer, p)
         finally:
             p.end()  # an unbalanced painter would blank every later frame
@@ -333,8 +332,7 @@ class MapView(QWidget):
         half = self.width() / 2
         lim = (half + 4) ** 2 if not self.full_map else None
         off = []
-        groups = {kind: [] for kind in LABEL_RANK}  # on-screen peers by kind, nearest first inside each group
-        other: list = []
+        on_screen: list = []
         w, h_px = self.width(), self.height()
         for n in near:
             pt = QPointF(ox + n.x * sx, oy + n.y * sy)
@@ -342,25 +340,31 @@ class MapView(QWidget):
                 inside = -10 <= pt.x() <= w + 10 and -10 <= pt.y() <= h_px + 10
             else:
                 inside = (pt.x() - half) ** 2 + (pt.y() - h_px / 2) ** 2 <= lim
-            (groups.get(n.entity.kind, other) if inside else off).append((n, pt))
+            (on_screen if inside else off).append((n, pt))
         far_pts = [(n, QPointF(ox + n.x * sx, oy + n.y * sy)) for n in far]
         if off or far_pts:
             self._draw_edge_indicators(p, off, far_pts)
-        labelled_before = self._labelled
-        if labelled_before:  # a peer that had a label keeps it over a newcomer at almost the same distance
-            for items in groups.values():
-                items.sort(key=lambda it: it[0].distance_m * (0.8 if it[0].entity.id in labelled_before else 1.0))
-        by_priority = [it for kind in sorted(groups, key=LABEL_RANK.get) for it in groups[kind]] + other
-        ai_on_screen = len(groups["ai"])
-        max_labels, max_ai_labels = label_limits(len(by_priority) - ai_on_screen, ai_on_screen, self.full_map)
+        # one order for everything (geo.priority_key): creatures before server animals, then the 250 / 500 / 1000 m tier,
+        # then players before dinosaurs, then the nearest; a peer that had a label keeps it over a newcomer at almost the
+        # same distance
+        before = self._labelled
+        by_priority = sorted(on_screen, key=lambda it: priority_key(it[0], it[0].entity.id in before))
+        ai_on_screen = sum(1 for it in by_priority if it[0].entity.kind == "ai")
+        tier_caps, max_ai_labels = label_limits(len(by_priority) - ai_on_screen, ai_on_screen, self.full_map)
+        max_labels = sum(tier_caps[:3])
         font = QFont("Segoe UI", 8)
         fm = QFontMetricsF(font)
         p.setFont(font)
         centre, radius = QPointF(self.width() / 2, self.height() / 2), self.width() / 2 - 3
 
+        ccx, ccy = centre.x(), centre.y()
+
         def in_circle(r, extra: float = 0.0) -> bool:  # the minimap clips to its circle: a label must not run past the edge
-            return self.full_map or all(math.hypot(x - centre.x(), y - centre.y()) <= radius + extra
-                                        for x in (r[0], r[0] + r[2]) for y in (r[1], r[1] + r[3]))
+            if self.full_map:
+                return True
+            dx = max(abs(r[0] - ccx), abs(r[0] + r[2] - ccx))  # the corner of the rectangle that is furthest from the centre
+            dy = max(abs(r[1] - ccy), abs(r[1] + r[3] - ccy))
+            return dx * dx + dy * dy <= (radius + extra) ** 2
 
         def in_circle_loose(r) -> bool:  # for the slot a label already has (see geo.SLOT_SLACK_PX)
             return in_circle(r, SLOT_SLACK_PX)
@@ -373,7 +377,8 @@ class MapView(QWidget):
                 placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
         self._draw_edge_captions(p, far_pts, placed)
         p.setFont(font)
-        labelled = attempts = ai_labelled = 0
+        attempts = ai_labelled = 0
+        tier_used = [0] * len(tier_caps)
         slots_now: dict[str, int] = {}
         widths = self._text_widths  # text measuring is the slow part of the layer: measure each string once
         if len(widths) > 2000:
@@ -389,10 +394,10 @@ class MapView(QWidget):
         # dots of players and dinosaurs that can compete with a label: kept clear when possible (a preference, so two
         # creatures standing next to each other still both get a label)
         dots = []
-        for n, pt in by_priority[:max_labels * 2]:
-            if n.entity.kind != "ai":
-                c = max(DOT_CLEARANCE_PX, marker_extent(n.entity) + 3.0)  # a big dino's dot is wider than the default
-                dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c))
+        first_ai = len(by_priority) - ai_on_screen
+        for n, pt in (*by_priority[:max_labels], *by_priority[first_ai:first_ai + 2 * max_ai_labels]):  # creatures, then the fish that can get a label
+            c = max(DOT_CLEARANCE_PX, marker_extent(n.entity) + 3.0)  # a big dino's dot is wider than the default
+            dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c))
         pos = self.pipeline.latest.position
         my_z = pos.z if pos is not None else None
         now = time.monotonic()
@@ -401,10 +406,16 @@ class MapView(QWidget):
         skip: set[str] = set()
         group_of: dict[str, int] = {}
         leaders: list[tuple[Nearby, QPointF]] = []
-        for n, pt in by_priority[:max_labels * 6]:
+        scanned, scan_limit = 0, (tier_caps[1] + tier_caps[2]) * 6
+        for n, pt in by_priority:
             e = n.entity
-            if e.kind not in ("dino", "unknown") or not e.species:
-                continue
+            if e.kind not in ("dino", "unknown") or not e.species or priority_tier(n.distance_m) == 0:
+                if e.kind == "ai":
+                    break  # sorted: only server animals from here on
+                continue  # the creatures inside 250 m each keep their own full label
+            scanned += 1
+            if scanned > scan_limit:
+                break
             for ln, lpt in leaders:
                 if ln.entity.species == e.species and (lpt.x() - pt.x()) ** 2 + (lpt.y() - pt.y()) ** 2 < CLUSTER_PX ** 2:
                     group_of[ln.entity.id] += 1
@@ -413,14 +424,18 @@ class MapView(QWidget):
             else:
                 leaders.append((n, pt))
                 group_of[e.id] = 1
-        # players and dinosaurs claim label space before server animals (fish) do, each group nearest first
+        # players and dinosaurs claim label space before server animals (fish) do, the nearest tier first
         for n, pt in by_priority:
-            if labelled >= max_labels or attempts >= max_labels * LABEL_ATTEMPTS_PER_LABEL:
+            if attempts >= (max_labels + max_ai_labels) * LABEL_ATTEMPTS_PER_LABEL:
                 break
             if n.entity.id in skip:
                 continue
             is_ai = n.entity.kind == "ai"
-            if is_ai and ai_labelled >= max_ai_labels:
+            tier = priority_tier(n.distance_m)
+            if is_ai:
+                if ai_labelled >= max_ai_labels:
+                    continue
+            elif tier_used[min(tier, len(tier_caps) - 1)] >= tier_caps[min(tier, len(tier_caps) - 1)]:
                 continue
             attempts += 1
             e = n.entity
@@ -428,16 +443,22 @@ class MapView(QWidget):
                                                             n.vitals_age_s, now)
             if (sp, inferred, hp, st) != (e.species, e.inferred, e.health_pct, e.stamina_pct):
                 n = replace(n, entity=replace(e, species=sp, inferred=inferred, health_pct=hp, stamina_pct=st))
-            lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail, vtier, group_of.get(n.entity.id, 1))
+            lines = peer_label_lines(n, my_z, vtier, group_of.get(n.entity.id, 1))
             if len(lines) > 1 and now < self._compact_until.get(n.entity.id, 0.0):
                 lines = lines[:1]  # it did not fit in full a moment ago: stay short for a few seconds instead of flipping size
             w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
             h = fm.height() * len(lines)
             eid = n.entity.id
             prefer, slot = self._label_slot.get(eid), [0]
-            r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose)
+            r = None
+            if prefer is not None:  # the side it had: kept while it still fits, even if a dot has moved under it (no hopping)
+                r = place_label(pt.x(), pt.y(), w, h, list(placed), bounds, in_circle, prefer, slot, in_circle_loose, True)
+            if r is None:
+                r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose)
             if r is None and not is_ai:
                 r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose)
+            if r is None and not is_ai and tier == 0:  # the creatures inside 250 m always keep their full label, even over others
+                r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose)
             if r is None and not is_ai and len(lines) > 1:  # no room for two lines: at least say who / what it is
                 lines = lines[:1]
                 self._compact_until[eid] = now + COMPACT_HOLD_S
@@ -445,12 +466,16 @@ class MapView(QWidget):
                 r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose)
                 if r is None:
                     r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose)
+                if r is None and tier == 0:
+                    r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose)
             if r is None:
                 continue
             placed.append(r)
             slots_now[eid] = slot[0]
-            labelled += 1
-            ai_labelled += is_ai
+            if is_ai:
+                ai_labelled += 1
+            else:
+                tier_used[min(tier, len(tier_caps) - 1)] += 1
             alpha = STALE_ALPHA if n.stale else 255
             tier = species_tier(sp, inferred)  # a species that is only remembered / unknown is drawn softer than a confirmed one
             head_alpha = int(alpha * (SOFT_INFERRED if tier == SPECIES_INFERRED else SOFT_UNKNOWN if tier == SPECIES_UNKNOWN else 1.0))
@@ -461,8 +486,6 @@ class MapView(QWidget):
             for i, text in enumerate(lines):
                 base = QPointF(r[0], r[1] + fm.ascent() + i * fm.height())
                 a = head_alpha if i == 0 else alpha
-                p.setPen(QColor(0, 0, 0, min(220, a)))
-                p.drawText(base + QPointF(1, 1), text)
                 p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
         self._label_slot = slots_now
@@ -651,25 +674,6 @@ class MapView(QWidget):
             p.drawRect(self.rect().adjusted(1, 1, -1, -1))
         else:
             p.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
-
-    def _draw_hud(self, p: QPainter) -> None:
-        v: Vitals | None = self.pipeline.latest.vitals
-        lines: list[str] = []
-        name = self.settings.species.strip()
-        if name:
-            lines.append(name.upper())
-        lines += vital_lines(local_entity(self.pipeline.latest.position, v))
-        if not lines:
-            return
-        p.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-        h = 16 * len(lines) + 8
-        box = QRectF(6, self.height() - h - 6, 120, h)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 0, 0, 150))
-        p.drawRoundedRect(box, 5, 5)
-        p.setPen(QColor(255, 255, 255))
-        for i, text in enumerate(lines):
-            p.drawText(QPointF(box.x() + 8, box.y() + 18 + i * 16), text)
 
     # ---- mouse (edit mode only; otherwise the window is click-through) -------
     def mousePressEvent(self, e) -> None:  # noqa: N802

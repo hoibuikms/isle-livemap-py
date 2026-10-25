@@ -33,8 +33,8 @@ def test_radius_filter_sort_and_kind_toggles():
 def test_labels_and_truncation():
     n = nearby_entities([(E("a", "player", 25_000, name="X" * 40, species="Tyrannosaurus", health_pct=92.4), 25_000, 0)], 0, 0)[0]
     head, tail = entity_label_lines(n)
-    assert len(head.split(" (")[0]) <= 16 and head.endswith("(Tyrannosaurus)") and "…" in head
-    assert tail == "HP 92% 250 m E"  # growth unknown: omitted, no placeholder
+    assert len(head.split(" - ")[0]) <= 16 and head == "XXXXXXXXXXXXXXX… - Tyrannosaurus - 250 m"
+    assert tail == "92% - HP ? - ST ?"  # growth unknown: omitted, no placeholder; health points and stamina were never read
     assert "250 m E" in entity_summary(n)
     assert truncate("abcdef", 4) == "abc…" and truncate("ab", 4) == "ab"
 
@@ -122,12 +122,14 @@ def test_row_and_3d_distance():
 def test_label_shows_height_delta():
     e = E("p", "player", 25_000, name="Alpha", z=13_000)
     n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
-    assert entity_label_lines(n, my_z=10_000)[1].endswith("250 m E ▲30 m")
-    assert not entity_label_lines(n)[1].endswith("▲30 m")
+    # the minimap label has distance only; compass direction and height are in the summary (tooltips, logs) and the table
+    assert "▲" not in " ".join(entity_label_lines(n, my_z=10_000)) and " E " not in entity_label_lines(n, my_z=10_000)[0]
+    assert entity_summary(n, my_z=10_000).endswith("250 m E (90°) ▲30 m")
+    assert "▲" not in entity_summary(n)
     below = nearby_entities([(E("q", "player", 25_000, name="Beta", z=7_000), 25_000, 0)], 0, 0)[0]
-    assert entity_label_lines(below, my_z=10_000)[1].endswith("250 m E ▼30 m")
+    assert entity_summary(below, my_z=10_000).endswith("250 m E (90°) ▼30 m")
     level = nearby_entities([(E("r", "player", 25_000, name="Gamma", z=10_020), 25_000, 0)], 0, 0)[0]
-    assert entity_label_lines(level, my_z=10_000)[1].endswith("250 m E level")
+    assert entity_summary(level, my_z=10_000).endswith("250 m E (90°) level")
 
 
 def test_local_player_shares_entity_path():

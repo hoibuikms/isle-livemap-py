@@ -181,7 +181,7 @@ def test_no_source_and_source_error_status(tmp_path):
 
 
 def test_detail_line_and_empty_snapshot_render(tmp_path):
-    view = make_view(tmp_path, settings=Settings(show_vitals_detail=True))
+    view = make_view(tmp_path, settings=Settings())
     view.peers = FakePeers()
     tick_twice(view)
     assert not view.grab().toImage().isNull()

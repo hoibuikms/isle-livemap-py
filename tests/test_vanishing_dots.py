@@ -36,12 +36,12 @@ def test_height_is_an_arrow_and_a_number_and_level_inside_half_a_metre():
 
 def test_label_summary_and_table_say_the_same_thing():
     n = nearby_entities([(E("1", x=0.0, y=-72_400.0, z=14_000.0, name="P1"), 0.0, -72_400.0)], 0, 0)[0]  # north = -Y
-    assert entity_label_lines(n, my_z=10_000.0)[1].endswith("724 m N ▲40 m")
+    assert entity_label_lines(n, my_z=10_000.0)[0] == "P1 - Allosaurus - 724 m"  # the minimap label: distance only
     assert "724 m N (0°) ▲40 m" in entity_summary(n, my_z=10_000.0)
     row = entity_row(n, my_z=10_000.0)
     assert row[7] == "724 m" and row[8] == "N (0°)" and row[-1] == "▲40 m higher"
     below = nearby_entities([(E("2", x=-72_400.0, y=0.0, z=6_000.0), -72_400.0, 0.0)], 0, 0)[0]  # west
-    assert entity_label_lines(below, my_z=10_000.0)[1].endswith("724 m W ▼40 m")
+    assert "724 m W (270°) ▼40 m" in entity_summary(below, my_z=10_000.0)
     assert entity_row(below, my_z=10_000.0)[-1] == "▼40 m lower"
 
 
@@ -62,17 +62,17 @@ def test_dinosaurs_of_one_species_standing_together_share_one_label(tmp_path, mo
     seen = []
     real = overlay.peer_label_lines
 
-    def spy(n, my_z=None, detail=False, vitals=None, group=1):
+    def spy(n, my_z=None, vitals=None, group=1):
         seen.append((n.entity.id, group))
-        return real(n, my_z, detail, vitals, group)
+        return real(n, my_z, vitals, group)
 
     monkeypatch.setattr(overlay, "peer_label_lines", spy)
-    pack = lambda v: [E(str(i), x=v.interp.x + 20_000.0 + i * 120.0, y=v.interp.y, species="Carnotaurus") for i in range(4)]  # noqa: E731
+    pack = lambda v: [E(str(i), x=v.interp.x + 60_000.0 + i * 120.0, y=v.interp.y, species="Carnotaurus") for i in range(4)]  # noqa: E731 (600 m: beyond the 250 m tier, where every creature keeps its own label)
     render(tmp_path, pack)
     assert [g for _, g in seen if g > 1] and max(g for _, g in seen) == 4
     assert len({eid for eid, _ in seen}) == 1  # one label for the four of them
     head, tail = entity_label_lines(nearby_entities([(E("0", species="Carnotaurus", health_pct=50.0), 20_000.0, 0.0)], 0, 0)[0], group=4)
-    assert head == "Carnotaurus ×4" and "HP" not in tail  # the vitals of one animal are not those of the pack
+    assert head == "Carnotaurus ×4 - 200 m" and tail == ""  # the vitals of one animal are not those of the pack
 
 
 # ---------------------------------------------------------------- the server destroys, the actor returns: a ghost in between

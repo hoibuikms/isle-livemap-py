@@ -228,7 +228,7 @@ class App(QObject):
         for text, attr in (
             ("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings"),
             ("Show other players", "show_players"),  # players and dinosaurs; animals (fish) have show_ai, settings file only
-            ("Vitals detail on labels", "show_vitals_detail"), ("Health / stamina bars", "show_vitals_bars"),
+            ("Health / stamina bars", "show_vitals_bars"),
         ):
             a = QAction(text, menu, checkable=True)
             a.setChecked(getattr(self.settings, attr))

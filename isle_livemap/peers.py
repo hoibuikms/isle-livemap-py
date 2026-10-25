@@ -636,6 +636,7 @@ class GamePeerSource:
         self.store.update(Entity(
             eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
             health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
+            max_health=vit.max_health if vit else None,
             heading=self._heading(handle, x, y, old.heading if old else None), inferred=inferred,
             vitals_t=self._vitals_t.get(handle)))
 
@@ -751,6 +752,7 @@ class GamePeerSource:
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
                 self._emit(handle, *creation.location, kind, species, name)  # the spawn position is a position
         bits = Bits(d.payload)
+        spawn_at = {c.net_ref_handle: c.location for c in created if c.location is not None}
         for batch in packet.batches:
             handle = batch.net_ref_handle
             if handle == self.own_handle:
@@ -762,7 +764,14 @@ class GamePeerSource:
             bkind = batch_kind(bits, batch)
             if bkind == KIND_CREATION:
                 if kind != sp.KIND_AI:
-                    self.pawn_vitals.note_creation(handle, creation_max_health(bits, batch))
+                    max_health = creation_max_health(bits, batch)
+                    self.pawn_vitals.note_creation(handle, max_health)
+                    # A creature whose class could not be named (the join tables were missed, the id is not in the cache)
+                    # is still a creature when its creation record carries a maxHealth: plants, fruit and items have none.
+                    # Its spawn position is drawn at once; waiting for a position update leaves a resting creature unseen.
+                    if kind == sp.KIND_UNKNOWN and max_health is not None and handle in spawn_at \
+                            and self.store.get(str(handle)) is None:
+                        self._emit(handle, *spawn_at[handle], kind, species, name)
                 continue
             if bkind != KIND_STATE:
                 continue
@@ -796,7 +805,8 @@ class GamePeerSource:
                     self._note_identity(handle, old, species, inferred)  # tables arrived later: the label gets the better species
                     upd = replace(upd, species=species, inferred=inferred)
                 if vit is not None:
-                    upd = replace(upd, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct, vitals_t=self._vitals_t.get(handle))
+                    upd = replace(upd, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct, max_health=vit.max_health,
+                                  vitals_t=self._vitals_t.get(handle))
                 self.store.update(upd)
 
     def _upgrade_identity(self, ent: Entity, handle: int, kind: str, name: str) -> Entity:

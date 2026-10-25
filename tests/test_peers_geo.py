@@ -104,16 +104,14 @@ def test_entity_heading_normalised():
 def test_labels_omit_unknown_fields_and_fall_back_to_the_id():
     n = visible_entities(items(E("12", 25_000, name="", health_pct=40.0)), 0, 0)[0]
     head, tail = entity_label_lines(n)
-    assert head == "12 (?)" and tail == "HP 40% 250 m E"  # geo falls back to the id; the species is not known: "?"
+    assert head == "12 - ? - 250 m" and tail == "40% - HP ? - ST ?"  # geo falls back to the id; the species is not known: "?"
     assert peer_label_lines(n) == [head, tail]
-    assert peer_label_lines(n, detail=True) == [head, tail]  # HP is in the tail: the detail line never repeats it as "Health"
     grown = visible_entities(items(E("12", 25_000, name="", health_pct=40.0, stamina_pct=30.0, growth_pct=75.0)), 0, 0)[0]
-    detail = peer_label_lines(grown, detail=True)
-    assert detail[2] == "Growth 75%" and len(detail) == 3  # only what the tail does not already say
+    assert peer_label_lines(grown) == ["12 - ? - 250 m", "40% - HP ? - ST 30%"]  # growth of others is never printed
     bare = visible_entities(items(E("1", 10)), 0, 0)[0]
-    assert peer_label_lines(bare, detail=True) == list(entity_label_lines(bare))  # no vitals: no detail line
+    assert peer_label_lines(bare) == list(entity_label_lines(bare))
     long = visible_entities(items(E("1", 10, name="X" * 40)), 0, 0)[0]
-    assert entity_label_lines(long)[0] == "X" * 15 + "… (?)"  # the name is cut to 16 characters; the species marker follows
+    assert entity_label_lines(long)[0] == "X" * 15 + "… - ? - 0 m"  # the name is cut to 16 characters; the species follows
 
 
 # ---- T10
@@ -134,10 +132,10 @@ def test_style_table_keeps_self_distinct_and_bigger():
 # ---- T11
 def test_settings_roundtrip_and_migration(tmp_path):
     p = tmp_path / "s.json"
-    s = Settings(peer_radius_m=2500, peer_self_ids=[" 5 ", "4294967295", "5"], show_vitals_detail=True)
+    s = Settings(peer_radius_m=2500, peer_self_ids=[" 5 ", "4294967295", "5"], show_vitals_bars=False)
     s.save(p)
     back = Settings.load(p)
-    assert (back.peer_radius_m, back.show_vitals_detail) == (2500.0, True)
+    assert (back.peer_radius_m, back.show_vitals_bars) == (2500.0, False)
     assert back.peer_self_ids == ["-1", "5"]
     assert Settings(peer_radius_m="x").normalise().peer_radius_m == 1000.0
     assert Settings(peer_radius_m=1e9).normalise().peer_radius_m == 20_000
@@ -221,9 +219,9 @@ def test_nearby_stale_threshold_follows_the_source():
 
 def test_peer_label_includes_known_vitals_only_in_order():
     n = visible_entities(items(E("1", 25_000, health_pct=92.4, growth_pct=40.0, z=13_000.0)), 0, 0)[0]
-    assert peer_label_lines(n, my_z=10_000.0) == ["P1 (?)", "HP 92% G 40% 250 m E ▲30 m"]
+    assert peer_label_lines(n, my_z=10_000.0) == ["P1 - ? - 250 m", "92% - HP ? - ST ?"]  # growth is never printed
     n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
-    assert peer_label_lines(n) == ["P1 (?)", "HP ? G 40% 250 m E"]  # a player whose health was never read says so
+    assert peer_label_lines(n) == ["P1 - ? - 250 m", "? - HP ? - ST ?"]  # a player whose health was never read says so
 
 
 def test_lead_cancels_the_filter_lag_behind_a_walking_actor():

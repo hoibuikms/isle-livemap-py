@@ -408,7 +408,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
             recent = (recent + [(t, slot)])[-3:]
             if len(recent) == 3 and recent[0][1] == recent[2][1] != recent[1][1] and recent[2][0] - recent[0][0] < 2.0:
                 flipflops += 1  # A -> B -> A within two seconds: the label flickered between two sides
-            nums = tuple(int(x) for x in __import__("re").findall(r"(?:HP|ST) (\d+)%", text))
+            nums = tuple(int(x) for x in __import__("re").findall(r"(\d+)%", text))  # the percentages of the vitals line
             vals.append(nums)
         for a, b, c in zip(vals, vals[1:], vals[2:]):
             if a == c and a != b:

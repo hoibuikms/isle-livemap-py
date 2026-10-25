@@ -459,7 +459,7 @@ def test_peer_entity_carries_vitals_species_and_name(join_packets):
     assert e.name == g.identity.player_names[66576]
     near = visible_entities([(e, e.x + 50_000, e.y)], e.x, e.y, 1_000.0)  # 500 m east of the viewer
     head, tail = peer_label_lines(near[0])
-    assert head.endswith("(Pteranodon)") and "HP 78%" in tail
+    assert head.endswith(" - Pteranodon - 500 m") and tail.startswith("78% - HP ")
 
 
 # ---------------------------------------------------------------- GamePeerSource: only creatures reach the map
