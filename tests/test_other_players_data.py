@@ -282,13 +282,19 @@ def _screen(view, dx_cm):
     return pt.x(), pt.y()
 
 
-def test_the_health_bar_hangs_under_the_dot_and_can_be_switched_off(tmp_path):
-    view, img = render(tmp_path, one_dino(100.0))
-    sx, sy = _screen(view, 15_000.0)
+def test_the_health_bar_is_for_a_creature_without_a_label_and_can_be_switched_off(tmp_path, monkeypatch):
+    import isle_livemap.overlay as overlay
+
+    sx = sy = None
     bar = (20, 240, 85)  # full health: green
-    assert colour_near(img, sx, sy + 9, bar, r=5, tol=45)
-    view2, img2 = render(tmp_path, one_dino(100.0), show_vitals_bars=False)
-    assert not colour_near(img2, sx, sy + 9, bar, r=5, tol=45)
+    view, img = render(tmp_path, one_dino(100.0))  # labelled: the label already says "HP 100%", no second copy as a bar
+    sx, sy = _screen(view, 15_000.0)
+    assert not colour_near(img, sx, sy + 9, bar, r=5, tol=45)
+    monkeypatch.setattr(overlay, "label_limits", lambda *a, **k: (0, 0))  # no room for labels: the bar carries the value
+    view2, img2 = render(tmp_path, one_dino(100.0))
+    assert colour_near(img2, sx, sy + 9, bar, r=5, tol=45)
+    view3, img3 = render(tmp_path, one_dino(100.0), show_vitals_bars=False)
+    assert not colour_near(img3, sx, sy + 9, bar, r=5, tol=45)
 
 
 # ---------------------------------------------------------------- the tools

@@ -105,7 +105,7 @@ class MarkersPanel(QDialog):
 class NearbyPanel(QDialog):
     """Other players from the peer source, nearest first (same selection as the minimap)."""
 
-    COLUMNS = ("Name", "Species", "Health", "Growth", "Stamina", "Hunger", "Water", "Distance", "3D", "Height Δ")
+    COLUMNS = ("Name", "Species", "HP", "Growth", "ST", "Hunger", "Water", "Distance", "Direction", "3D", "Height Δ")
 
     def __init__(self, view: MapView) -> None:
         super().__init__()

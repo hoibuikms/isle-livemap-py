@@ -104,9 +104,9 @@ def test_summary_shows_vitals_and_height_delta():
     e = E("p", "player", 25_000, stamina_pct=70, hunger_pct=60, thirst_pct=80, z=13_000)
     n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
     s = entity_summary(n, my_z=10_000)
-    assert "ST 70% HU 60% TH 80%" in s and "dZ +30m" in s
+    assert "ST 70% HU 60% TH 80%" in s and "▲30 m" in s
     bare = entity_summary(nearby_entities([(E("q", x=25_000), 25_000, 0)], 0, 0)[0], my_z=10_000)
-    assert "ST" not in bare and "dZ" not in bare
+    assert "ST" not in bare and "▲" not in bare and "▼" not in bare
 
 
 def test_row_and_3d_distance():
@@ -115,15 +115,19 @@ def test_row_and_3d_distance():
     n = nearby_entities([(e, 30_000, 0)], 0, 0)[0]  # 300 m east, 40 m up
     assert math.isclose(distance_3d_m(n, 10_000), 50 * 0 + math.hypot(300, 40))
     row = entity_row(n, my_z=10_000)
-    assert row[0] == "Alpha" and row[2] == "100%" and row[3] == "80%" and row[-1] == "+40 m higher"
+    assert row[0] == "Alpha" and row[2] == "100%" and row[3] == "80%" and row[-1] == "▲40 m higher"
     assert entity_row(n)[-1] == "?" and distance_3d_m(n, None) == n.distance_m
 
 
 def test_label_shows_height_delta():
     e = E("p", "player", 25_000, name="Alpha", z=13_000)
     n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
-    assert entity_label_lines(n, my_z=10_000)[1].endswith("+30m")
-    assert not entity_label_lines(n)[1].endswith("+30m")
+    assert entity_label_lines(n, my_z=10_000)[1].endswith("250 m E ▲30 m")
+    assert not entity_label_lines(n)[1].endswith("▲30 m")
+    below = nearby_entities([(E("q", "player", 25_000, name="Beta", z=7_000), 25_000, 0)], 0, 0)[0]
+    assert entity_label_lines(below, my_z=10_000)[1].endswith("250 m E ▼30 m")
+    level = nearby_entities([(E("r", "player", 25_000, name="Gamma", z=10_020), 25_000, 0)], 0, 0)[0]
+    assert entity_label_lines(level, my_z=10_000)[1].endswith("250 m E level")
 
 
 def test_local_player_shares_entity_path():

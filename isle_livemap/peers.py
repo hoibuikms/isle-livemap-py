@@ -363,7 +363,7 @@ class GamePeerSource:
         provisional peer with that handle is purged retroactively (``PeerStore.set_owned_self_ids``).
       * A destruction record removes the peer at once and forgets its identity (the server reuses handles). Iris
         replicates changes only, so a creature that stands still goes quiet: the fallback is generous (dim after
-        ``STALE_S`` = 8 s, remove after ``TTL_S`` = 30 s without any report), not the 3 s / 5 s of the lab feed.
+        ``STALE_S`` = 45 s, remove after ``TTL_S`` = 30 s without any report), not the 3 s / 5 s of the lab feed.
         Any state update of a tracked creature counts as a report, also one without a position: live captures show
         pawns that keep sending state for minutes after their position stopped changing.
       * Every decoded position is written to the store at once (no buffering); the overlay smooths and
@@ -385,6 +385,12 @@ class GamePeerSource:
     # is a stuck dot). Read by the overlay's smoother.
     GONE_GRACE_S = 1.5
     gone_grace_s = GONE_GRACE_S
+    # The server destroys an actor that leaves its relevancy range and sends a new creation record when it comes back
+    # (captured: the same handle returns 6-8 s later at about the same spot). Players and dinosaurs are therefore kept
+    # as dimmed ghosts at their last position for this long, instead of vanishing and reappearing.
+    GHOST_GRACE_S = 12.0
+    ghost_grace_s = GHOST_GRACE_S
+    ghost_kinds = frozenset(("player", "dino", "unknown"))
 
     # Actors whose creation record was never captured have no class. Their state batches still have a class-typical
     # size: every server-controlled animal of the recorded captures (33 resolved, 73 never created) repeats a 155 or
@@ -444,6 +450,10 @@ class GamePeerSource:
         self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
         self._past_own: set[int] = set()  # earlier own pawns (respawn): the old body is not "another creature"
         self._last_t = 0.0  # datagram time of the newest inbound packet
+        # handle -> (kind, species, name, inferred, x, y, t) of a player / dinosaur the server destroyed. The same handle
+        # often keeps sending state afterwards without a new creation record (relevancy flapping): if it shows up near
+        # where it was, it is that creature, not an unknown one.
+        self._zombies: dict[int, tuple] = {}
         self._hidden_cache: tuple[float, int] = (-1e9, 0)
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
         self.packets = 0  # inbound datagrams seen
@@ -619,6 +629,9 @@ class GamePeerSource:
         old = self.store.get(eid)
         vit = self._vitals.get(handle)
         inferred = bool(species) and self.identity.is_inferred(handle)
+        back = self._zombies.get(handle) if kind == "unknown" else None
+        if back is not None and math.hypot(x - back[4], y - back[5]) / 100.0 <= self.ZOMBIE_NEAR_M + self.ZOMBIE_SPEED_MS * max(self._last_t - back[6], 0.0):
+            kind, species, name, inferred = back[0], back[1], back[2] or name, back[3]  # the destroyed creature is back, still no creation record
         self._note_identity(handle, old, species, inferred)
         self.store.update(Entity(
             eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
@@ -657,7 +670,17 @@ class GamePeerSource:
             self._conflicts_seen = dropped
         return out
 
+    ZOMBIE_NEAR_M = 60.0  # a returning handle counts as the same creature within this + ZOMBIE_SPEED_MS * silence
+    ZOMBIE_SPEED_MS = 25.0
+    ZOMBIE_MAX = 2000
+
     def _drop(self, handle: int) -> None:
+        gone = self.store.get(str(handle))
+        if gone is not None and gone.kind in ("dino", "player") and handle != self.own_handle:
+            if len(self._zombies) >= self.ZOMBIE_MAX:
+                self._zombies.clear()
+            self._zombies[handle] = (gone.kind, gone.species, "" if is_placeholder_name(gone.name) else gone.name, gone.inferred,
+                                     gone.x, gone.y, self._last_t)
         if handle in self._past_own:  # the server removed the old body; the handle may be reused
             self._past_own.discard(handle)
             self._sync_owned()
@@ -715,6 +738,7 @@ class GamePeerSource:
                 self._past_own.discard(handle)
                 self._sync_owned()
             self.store.remove(str(handle))  # a reused handle is a new actor
+            self._zombies.pop(handle, None)
             self.pawn_vitals.forget(handle)
             self._vitals.pop(handle, None)
             self._vitals_t.pop(handle, None)
@@ -766,6 +790,7 @@ class GamePeerSource:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
                 # on the map at its last position instead of letting the TTL remove it.
                 upd = old
+                upd = self._upgrade_identity(upd, handle, kind, name)
                 inferred = bool(species) and self.identity.is_inferred(handle)
                 if species and (not old.species or (old.inferred and not inferred)) and (species, inferred) != (old.species, old.inferred):
                     self._note_identity(handle, old, species, inferred)  # tables arrived later: the label gets the better species
@@ -773,6 +798,17 @@ class GamePeerSource:
                 if vit is not None:
                     upd = replace(upd, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct, vitals_t=self._vitals_t.get(handle))
                 self.store.update(upd)
+
+    def _upgrade_identity(self, ent: Entity, handle: int, kind: str, name: str) -> Entity:
+        """A creature that was drawn as ``unknown`` (its creation record came later, or it just linked to a PlayerState)
+        becomes a dinosaur / player with its name even when this batch has no position; kinds never go back."""
+        rank = {"unknown": 0, "dino": 1, "player": 2}
+        up_kind = kind if rank.get(kind, -1) > rank.get(ent.kind, 99) else ent.kind
+        label = name or (ent.name if ent.name and not ent.name.startswith(("Unknown #", "Actor #")) else "")
+        new_name = label or (f"Unknown #{handle}" if up_kind == "unknown" else f"Actor #{handle}")
+        if up_kind != ent.kind or new_name != ent.name:
+            return replace(ent, kind=up_kind, name=new_name)
+        return ent
 
     # -- PeerSource --------------------------------------------------------
     def status(self) -> str:

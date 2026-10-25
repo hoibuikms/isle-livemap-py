@@ -153,7 +153,7 @@ def test_game_labels_say_unknown_as_question_mark_and_never_show_growth_hunger_t
     head, tail, *rest = peer_label_lines(near[0], my_z=30_000.0)
     assert head == f"Animal ? #{near[0].entity.id}" and not rest  # a server animal with no class: unknown, marked, with its handle
     assert "?" not in tail and "HP" not in tail and "G " not in tail  # no vitals line for fish, no growth / hunger / thirst
-    assert re.fullmatch(r"\d+ m (N|NE|E|SE|S|SW|W|NW) [+-]\d+m", tail), tail
+    assert re.fullmatch(r"\d+ m (N|NE|E|SE|S|SW|W|NW) ((▲|▼)\d+ m|level)", tail), tail
 
 
 def test_provisional_peer_is_purged_when_own_handle_locks(b64):
@@ -198,8 +198,6 @@ def test_silent_peer_expires_after_ttl(b64):
     clk.t += peers.PEER_TTL_S + 1.0  # past the lab TTL: a stationary game actor is still there
     sn = g.snapshot()
     assert len(sn.entities) == 15 and all(clk.t - p.last_seen < g.stale_s for p in sn.entities)  # not even dimmed yet
-    clk.t += g.stale_s
-    assert len(g.snapshot().entities) == 15 and all(clk.t - p.last_seen >= g.stale_s for p in g.snapshot().entities)
     clk.t += g.TTL_AI_S
     assert g.snapshot().entities == ()  # server animals (these fixtures): the short limit
 

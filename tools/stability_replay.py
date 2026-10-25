@@ -361,12 +361,14 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
         "drift_longest_run_s": round(drift_run_max, 2),
     }
     out["errors"] = {"decode": peers_errors[0], "pipeline": len(pipe_errors), "view": view_errors[0]}
-    after = []
+    after, ghosts = [], []  # server animals leave at once; players and dinosaurs stay as dimmed ghosts (peers.GHOST_GRACE_S)
     for eid, t_drop in drops.items():
         g = gone_at.get(eid)
         if eid in first_dot and g is not None and g >= t_drop:
-            after.append(g - t_drop)
+            kinds = timeline.get(eid, {}).get("kind") or []
+            (ghosts if kinds and kinds[-1][1] in ("player", "dino", "unknown") else after).append(g - t_drop)
     out["dot_after_destroy_s"] = {"n": len(after), "p50": pct(after, .5), "p95": pct(after, .95), "max": max(after, default=None)}
+    out["ghost_after_destroy_s"] = {"n": len(ghosts), "p50": pct(ghosts, .5), "p95": pct(ghosts, .95), "max": max(ghosts, default=None)}
     out["vanished_without_destroy"] = len(vanished_without_destroy)
     out["vanished_then_back"] = len(reappeared)
 
@@ -455,7 +457,7 @@ def _get(r: dict, path: str):
 BUDGETS = (
     ("tick_exceptions", 0), ("errors.decode", 0), ("errors.pipeline", 0), ("errors.view", 0),
     ("stuck.frozen_dot_s", 1.0), ("stuck.drift_longest_run_s", 3.0), ("stuck.own_marker_frozen_s", 0.5),
-    ("dot_after_destroy_s.max", 2.0), ("vanished_then_back", 0),
+    ("dot_after_destroy_s.max", 2.0), ("ghost_after_destroy_s.max", 13.0), ("vanished_then_back", 0),
     ("jumps_per_min", 10.0), ("own_jumps_per_min", 5.0),
     ("label.slot_hops_per_min", 3.0), ("label.slot_flipflops_per_min", 0.0), ("label.text_reversals_per_min", 1.0), ("label.on_off_toggles_per_min", 1.0),
     ("lag_ms.p50", 150.0), ("time_to_first_dot_s.p50", 0.5), ("time_to_first_dot_s.p95", 5.0),

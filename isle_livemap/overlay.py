@@ -11,13 +11,13 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QPixmap,
 from PySide6.QtWidgets import QWidget
 
 from .capture import TelemetryPipeline
-from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, species_tier
+from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, is_placeholder_name, species_tier
 from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
     PEER_STALE_S, PEER_TTL_S, LABEL_RANK, SLOT_SLACK_PX, label_limits, place_label, vital_lines, visible_entities,
-    marker_extent, marker_radius, peer_style,
+    marker_extent, marker_radius, peer_style, truncate, _overlaps,
 )
 from .peers import status_is_warning
 from .tracking import Vitals
@@ -34,7 +34,10 @@ HALO_PLAYER = QColor(255, 255, 255, 105)
 LABEL_BG, LABEL_BG_STALE = QColor(8, 12, 16, 125), QColor(8, 12, 16, 60)
 BAR_TRACK, BAR_ST_FILL = QColor(0, 0, 0, 170), QColor(90, 170, 255)
 BAR_HP_H, BAR_ST_H = 3.0, 2.0  # px
-BAR_ROOM_PX = 9.0  # extra height under a dot that labels keep clear
+EDGE_RANGE_M = 2500.0  # players and dinosaurs up to this far are shown on the circle edge when beyond the view radius
+EDGE_CAPTIONS = 6  # the nearest this many edge pointers also say who / what they are and how far
+COMPACT_HOLD_S = 4.0  # a label that had to be shortened stays short this long (no flipping between one and two lines)
+CLUSTER_PX = 12.0  # creatures of one species whose dots are closer than this share one label ("Carnotaurus ×5")
 HALO_MAX = 40  # halos and bars for the most important this many peers (labels are limited in the same way)
 CROWD_GLYPHS = 150  # full glyphs for the most important this many peers; the rest of a crowd are small squares
 LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
@@ -62,6 +65,8 @@ class MapView(QWidget):
         self._pen_key = None  # (colour, stale, player) of the pen / brush currently set on the painter
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
         self._label_slot: dict[str, int] = {}  # peer id -> label slot used last frame: tried first, so labels do not hop
+        self._grouped: set[str] = set()
+        self._compact_until: dict[str, float] = {}  # peer id -> until when its label stays one line
         self._labelled: set[str] = set()  # peers that had a label last frame: they keep it over equally near newcomers
         self._conf = LabelConfidence()  # what each label may claim; less sure only after a few seconds (no flapping text)
         self.errors = 0  # frames in which tick() or paintEvent() raised (the frame is still scheduled)
@@ -171,6 +176,9 @@ class MapView(QWidget):
                 self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
                 # a source that removes creatures itself (the game: destruction records) needs no second, longer timer here
                 self.ents.missing_grace_s = getattr(self.peers, "gone_grace_s", None)
+                self.ents.ghost_grace_s = getattr(self.peers, "ghost_grace_s", None)
+                self.ents.ghost_kinds = getattr(self.peers, "ghost_kinds", frozenset())
+                self.ents.ghost_age_s = self._stale_s  # a ghost is drawn dimmed from its first frame
                 self.ents.heading_only_when_moving = bool(getattr(self.peers, "heading_from_movement", False))
                 # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
                 if snap is not self._peers_snap or snap.version != self._peers_version:
@@ -305,8 +313,15 @@ class MapView(QWidget):
 
     def _draw_entities(self, p: QPainter) -> None:
         # Minimap: only within the configured radius. Full map: every known peer.
-        near = self.nearby(None if self.full_map else self.settings.peer_radius_m)
-        if not near:
+        radius = self.settings.peer_radius_m
+        far: list[Nearby] = []
+        if self.full_map:
+            near = self.nearby(None)
+        else:  # beyond the radius, players and dinosaurs are not dropped: they become pointers on the circle edge
+            reach = self.nearby(max(radius, EDGE_RANGE_M))
+            near = [n for n in reach if n.distance_m <= radius]
+            far = [n for n in reach if n.distance_m > radius and n.entity.kind != "ai"]
+        if not near and not far:
             self._label_slot, self._labelled = {}, set()
             return
         bounds = (0.0, 0.0, float(self.width()), float(self.height()))
@@ -328,8 +343,9 @@ class MapView(QWidget):
             else:
                 inside = (pt.x() - half) ** 2 + (pt.y() - h_px / 2) ** 2 <= lim
             (groups.get(n.entity.kind, other) if inside else off).append((n, pt))
-        if off:
-            self._draw_edge_indicators(p, off)
+        far_pts = [(n, QPointF(ox + n.x * sx, oy + n.y * sy)) for n in far]
+        if off or far_pts:
+            self._draw_edge_indicators(p, off, far_pts)
         labelled_before = self._labelled
         if labelled_before:  # a peer that had a label keeps it over a newcomer at almost the same distance
             for items in groups.values():
@@ -355,6 +371,8 @@ class MapView(QWidget):
         for shown, row in ((self.peer_status, 0), (self.record_status, 1)):
             if shown:
                 placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
+        self._draw_edge_captions(p, far_pts, placed)
+        p.setFont(font)
         labelled = attempts = ai_labelled = 0
         slots_now: dict[str, int] = {}
         widths = self._text_widths  # text measuring is the slow part of the layer: measure each string once
@@ -374,15 +392,33 @@ class MapView(QWidget):
         for n, pt in by_priority[:max_labels * 2]:
             if n.entity.kind != "ai":
                 c = max(DOT_CLEARANCE_PX, marker_extent(n.entity) + 3.0)  # a big dino's dot is wider than the default
-                bar = BAR_ROOM_PX if self._has_bars(n) else 0.0  # the health bar hangs under the dot
-                dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c + bar))
+                dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c))
         pos = self.pipeline.latest.position
         my_z = pos.z if pos is not None else None
         now = time.monotonic()
+        # creatures of one species standing together (a pack) share the label of the nearest one: "Carnotaurus ×5". Only
+        # the creatures that can compete for a label are looked at, so a crowd of 500 costs nothing here.
+        skip: set[str] = set()
+        group_of: dict[str, int] = {}
+        leaders: list[tuple[Nearby, QPointF]] = []
+        for n, pt in by_priority[:max_labels * 6]:
+            e = n.entity
+            if e.kind not in ("dino", "unknown") or not e.species:
+                continue
+            for ln, lpt in leaders:
+                if ln.entity.species == e.species and (lpt.x() - pt.x()) ** 2 + (lpt.y() - pt.y()) ** 2 < CLUSTER_PX ** 2:
+                    group_of[ln.entity.id] += 1
+                    skip.add(e.id)
+                    break
+            else:
+                leaders.append((n, pt))
+                group_of[e.id] = 1
         # players and dinosaurs claim label space before server animals (fish) do, each group nearest first
         for n, pt in by_priority:
             if labelled >= max_labels or attempts >= max_labels * LABEL_ATTEMPTS_PER_LABEL:
                 break
+            if n.entity.id in skip:
+                continue
             is_ai = n.entity.kind == "ai"
             if is_ai and ai_labelled >= max_ai_labels:
                 continue
@@ -392,18 +428,26 @@ class MapView(QWidget):
                                                             n.vitals_age_s, now)
             if (sp, inferred, hp, st) != (e.species, e.inferred, e.health_pct, e.stamina_pct):
                 n = replace(n, entity=replace(e, species=sp, inferred=inferred, health_pct=hp, stamina_pct=st))
-            lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail, vtier)
+            lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail, vtier, group_of.get(n.entity.id, 1))
+            if len(lines) > 1 and now < self._compact_until.get(n.entity.id, 0.0):
+                lines = lines[:1]  # it did not fit in full a moment ago: stay short for a few seconds instead of flipping size
             w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
             h = fm.height() * len(lines)
             eid = n.entity.id
             prefer, slot = self._label_slot.get(eid), [0]
             r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose)
-            if r is not None:
-                placed.append(r)
-            elif not is_ai:
+            if r is None and not is_ai:
                 r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose)
+            if r is None and not is_ai and len(lines) > 1:  # no room for two lines: at least say who / what it is
+                lines = lines[:1]
+                self._compact_until[eid] = now + COMPACT_HOLD_S
+                w, h = widths[lines[0]] + 2 if lines[0] in widths else fm.horizontalAdvance(lines[0]) + 2, fm.height()
+                r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose)
+                if r is None:
+                    r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose)
             if r is None:
                 continue
+            placed.append(r)
             slots_now[eid] = slot[0]
             labelled += 1
             ai_labelled += is_ai
@@ -423,6 +467,17 @@ class MapView(QWidget):
                 p.drawText(base, text)
         self._label_slot = slots_now
         self._labelled = set(slots_now)
+        if len(self._compact_until) > 400:
+            self._compact_until = {k: v for k, v in self._compact_until.items() if v > now}
+        self._grouped = skip  # creatures whose dot is covered by the "×N" label of a neighbour of the same species
+        if self.settings.show_vitals_bars:  # the label prints HP / ST; a bar is the same value for a creature without a label
+            for n, pt in by_priority[:HALO_MAX]:
+                if n.entity.id not in slots_now and n.entity.id not in skip and self._has_bars(n):
+                    rad = marker_radius(n.entity)
+                    bw = max(14.0, 2.0 * rad + 6.0)
+                    box = (pt.x() - bw / 2, pt.y() + rad + 3.0, bw, BAR_HP_H + (BAR_ST_H + 1.5 if n.entity.stamina_pct is not None else 0.0))
+                    if not any(_overlaps(box, q) for q in placed):  # never on top of somebody's label
+                        self._draw_bars(p, n, pt, rad)
         self._conf.keep_only({n.entity.id for n in near})
 
     def _has_bars(self, n: Nearby) -> bool:
@@ -498,17 +553,16 @@ class MapView(QWidget):
             p.drawPolygon(QPolygonF([pt + QPointF(0, -r), pt + QPointF(r, 0), pt + QPointF(0, r), pt + QPointF(-r, 0)]))
         else:
             p.drawEllipse(pt, rad, rad)
-        if decorate and self._has_bars(n):
-            self._draw_bars(p, n, pt, rad)
-            self._pen_key = None
 
-    def _draw_edge_indicators(self, p: QPainter, offscreen: list[tuple[Nearby, QPointF]]) -> None:
-        """In-radius players outside the minimap circle: a small pointer on the circle edge."""
-        if not offscreen:
+    def _draw_edge_indicators(self, p: QPainter, offscreen: list[tuple[Nearby, QPointF]],
+                              far: list[tuple[Nearby, QPointF]] = ()) -> None:
+        """Pointers on the circle edge: peers inside the radius but outside the circle, and (``far``) players and
+        dinosaurs beyond the radius, the nearest few with who they are and how far ("Name 1.1 km")."""
+        if not offscreen and not far:
             return
         cx, cy = self.width() / 2, self.height() / 2
         r = self.width() / 2 - EDGE_INSET_PX
-        for n, pt in reversed(offscreen):
+        for n, pt in list(reversed(offscreen)) + list(reversed(far)):
             a = edge_anchor(cx, cy, pt.x(), pt.y(), r)
             if a is None:
                 continue
@@ -521,6 +575,39 @@ class MapView(QWidget):
             p.setBrush(_qcolor(st.color, alpha))
             p.drawPolygon(QPolygonF([QPointF(0, -5), QPointF(4, 3), QPointF(-4, 3)]))
             p.restore()
+
+    def _draw_edge_captions(self, p: QPainter, far: list[tuple[Nearby, QPointF]], placed: list) -> None:
+        """"Name 1.1 km" next to the pointers of the nearest creatures beyond the radius. Each caption takes a free spot
+        just inside its pointer (rectangles in ``placed`` are avoided and the caption is added to them, so labels keep
+        clear of it too); no free spot: no caption, the pointer alone is still there."""
+        if not far:
+            return
+        cx, cy = self.width() / 2, self.height() / 2
+        r = self.width() / 2 - EDGE_INSET_PX
+        p.setFont(QFont("Segoe UI", 7))
+        fm = QFontMetricsF(p.font())
+        for n, pt in far[:EDGE_CAPTIONS]:
+            a = edge_anchor(cx, cy, pt.x(), pt.y(), r)
+            if a is None:
+                continue
+            e = n.entity
+            who = e.name if e.name and not is_placeholder_name(e.name) else (e.species or "?")
+            text = f"{truncate(who, 12)} {format_distance(n.distance_m)}"
+            w, h = fm.horizontalAdvance(text) + 6, fm.height()
+            ux, uy = (a[0] - cx) / r, (a[1] - cy) / r  # unit vector outward
+            for inward in (12.0, 26.0, 40.0):
+                qx, qy = a[0] - ux * inward, a[1] - uy * inward
+                box = (min(max(qx - w / 2, 1.0), self.width() - w - 1.0), qy - h / 2, w, h)
+                if not any(_overlaps(box, q) for q in placed):
+                    break
+            else:
+                continue
+            placed.append(box)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(LABEL_BG)
+            p.drawRoundedRect(QRectF(box[0] - 2, box[1], w + 2, h), 3.0, 3.0)
+            p.setPen(_qcolor(peer_style(e).color, STALE_ALPHA if n.stale else 235))
+            p.drawText(QPointF(box[0], box[1] + fm.ascent()), text)
 
     def _draw_peer_status(self, p: QPainter) -> None:
         if not self.peer_status:

@@ -127,6 +127,35 @@ creature whose health is known, with no text to read (`show_vitals_bars`, tray "
 Tray "Marker colours..." shows the legend (`geo.LEGEND_ENTRIES`). Beyond the 150 most important peers of a huge crowd the
 rest are small plain squares (500 anti-aliased glyphs do not fit a 16 ms frame; the 500-peer paint test takes ~3 ms).
 
+## Distance, direction, height and why a dot can be missing
+
+Every place that describes where a creature is uses one wording (`geo.where_text`): `724 m NE ▲40 m` (minimap label), the
+same in the tooltip text and, in separate columns, in the Nearby table (Distance, Direction, Height Δ). The direction is a
+compass bearing from map-north (north = -Y), not relative to where you look; the minimap does not rotate. `▲` is above you,
+`▼` below you, `level` within half a metre, and the height is left out when it is not known. Health and stamina are printed
+once, as `HP` / `ST` (table headers use the same two words); the optional "Vitals detail on labels" line only adds growth,
+hunger and water, so `HP` is never repeated as "Health", and the thin bars are drawn only for creatures that have no label
+(the label already says the number).
+
+A creature leaves the minimap only when the server destroys it. Everything else that used to hide one:
+
+| Cause (found in a recorded session) | What the map does now |
+|---|---|
+| Beyond the view radius (default 1000 m): the player and most dinosaurs of that session were 1.0-1.2 km away and were never drawn | players and dinosaurs up to 2.5 km are a pointer on the circle edge; the nearest six also read `Name 1.1 km` |
+| The server destroys an actor that leaves its relevancy range and sends a new creation record 6-8 s later (same handle, same spot) | players, dinosaurs and unknown creatures stay as dimmed ghosts for 12 s (`GamePeerSource.GHOST_GRACE_S`); fish still leave after 1.5 s |
+| A pack of one species standing together had no room for labels | one label `Carnotaurus ×5` (nearest one's position) instead of none |
+| No room for a two-line label | a one-line label (who / what it is) for at least 4 s instead of none |
+| A creature drawn as `unknown` whose creation record arrived later (or that linked to its PlayerState) stayed `unknown` until it moved | kind and name are upgraded on any state update; never downgraded |
+| Resting creatures were dimmed after 8 s although Iris sends nothing for a creature at rest | dimmed after 45 s |
+
+What stays the server's: a destroyed creature leaves after its 12 s ghost, and a creature that rests without ever having
+had a position (its creation record predates the app) is not on the map until it moves.
+
+**Player names.** A name exists only in the creation record of the PlayerState, which the server sends when that player
+joins. A pawn references its PlayerState by handle; if that handle is below the first one the app saw, the PlayerState was
+created before the app started and its name was never sent to us: the pawn is a dinosaur without a name until you rejoin
+with the app running. In a recorded session 2 of 24 dinosaurs/players had a seen PlayerState; both were named.
+
 ## Lab record (development only)
 
 Little-endian `<IfffH` + UTF-8 name: id (uint32, shown as signed), x, y, z (float32, Y-up metres), status (uint16, read as health 0..100), name. The layout is an assumption used by `labsim`, not the game's protocol. Y-up metres are converted once to geo centimetres (lab z becomes geo y, lab y becomes height).

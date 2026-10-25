@@ -329,10 +329,10 @@ def labels_at(pcap: Path, at_s: float, cache=None, local_port: int | None = None
         view._last = clock.t
         real_marker = view._draw_entity_marker
 
-        def marker(p, n, pt):
+        def marker(p, n, pt, *more):
             if recording["on"]:
                 drawn.add(n.entity.id)
-            return real_marker(p, n, pt)
+            return real_marker(p, n, pt, *more)
 
         view._draw_entity_marker = marker
         next_paint = 0.0

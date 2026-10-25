@@ -78,6 +78,20 @@ def format_distance(meters: float) -> str:
     return f"{text} km"
 
 
+def format_height(dz_m: float) -> str:
+    """Height difference to the player: "▲31 m" (above you), "▼31 m" (below you), "level" within half a metre."""
+    if abs(dz_m) < 0.5:
+        return "level"
+    return f"{'▲' if dz_m > 0 else '▼'}{abs(dz_m):.0f} m"
+
+
+def where_text(distance_m_: float, bearing: float, dz_m: float | None) -> str:
+    """Where a creature is, the same way everywhere (minimap label, tooltip, table): "724 m NE ▲40 m". The bearing is
+    a compass direction from map-north (not relative to where you look); the height is omitted when it is not known."""
+    text = f"{format_distance(distance_m_)} {compass_label(bearing)}"
+    return text if dz_m is None else f"{text} {format_height(dz_m)}"
+
+
 # ----------------------------------------------------------------- range rings
 DEFAULT_RING_RADII_M = (250.0, 500.0, 1000.0)
 
@@ -366,7 +380,7 @@ PEER_STALE_S = 3.0  # dimmed after this long without an update
 PEER_TTL_S = 5.0  # removed after this long (the only despawn rule; matches labsim NODE_TTL)
 # Real-game peers: Iris replicates DELTAS, so an actor that stands still sends nothing; silence is not absence.
 # Destruction records remove an actor at once; these are only the fallback (judgement call, see docs/PEERS.md).
-GAME_PEER_STALE_S = 8.0
+GAME_PEER_STALE_S = 45.0  # a creature at rest sends nothing (Iris replicates changes only): dim after this long, not after 8 s
 GAME_PEER_TTL_S = 30.0
 LOCAL_ID = "local"  # id of geo.local_entity(); packet ids never equal it
 
@@ -636,13 +650,15 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
 
 
 def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
-                       vitals: str | None = None) -> tuple[str, str]:
+                       vitals: str | None = None, group: int = 1) -> tuple[str, str]:
     """(head, tail) of the minimap label, worded by how sure each field is (``confidence``): a confirmed species is
     plain, one remembered from an earlier session carries "~", an unknown one is "?". A player name is only printed
     when the creature referenced its PlayerState. The tail holds health and stamina ("HP 86% ST 33%", "HP ?" when no
     reading was ever seen, a coarse age such as "20s+" when the reading is old), then distance, compass bearing and height
     difference. Growth, hunger and thirst of other creatures are not replicated to us: never printed, not even as "?".
-    ``vitals``: the vitals tier to print (the map view passes the one it settled); None works it out from the age."""
+    ``vitals``: the vitals tier to print (the map view passes the one it settled); None works it out from the age.
+    ``group`` > 1: this label stands for that many creatures of one species standing together ("Carnotaurus ×5"); it then
+    says where the nearest one is and prints no vitals (they belong to one animal)."""
     e, dz = n.entity, height_delta_m(n, my_z)
     mark = "~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else ""
     name = e.name or e.id
@@ -653,6 +669,8 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
     else:
         word = "Animal" if e.kind == "ai" else "Dino" if e.kind in ("dino", "player") else "Creature"
         head = f"{word} ? #{e.id}"
+    if group > 1:
+        return head + f" ×{group}", where_text(n.distance_m, n.bearing, dz)
     tier = vitals or vitals_tier(e.health_pct, e.stamina_pct, n.vitals_age_s)
     parts = []
     if e.health_pct is not None:
@@ -665,9 +683,7 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
         parts.append(f"[{age_tag(n.vitals_age_s)}]")
     if e.growth_pct is not None:
         parts.append(f"G {e.growth_pct:.0f}%")
-    parts += [format_distance(n.distance_m), compass_label(n.bearing)]
-    if dz is not None:
-        parts.append(f"{dz:+.0f}m")
+    parts.append(where_text(n.distance_m, n.bearing, dz))
     return head, " ".join(parts)
 
 
@@ -698,35 +714,40 @@ def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) ->
     return total, ai
 
 
-def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False, vitals: str | None = None) -> list[str]:
-    """Minimap label: ``entity_label_lines`` plus, with ``detail``, the known vitals (``vital_lines``)."""
-    lines = list(entity_label_lines(n, my_z=my_z, vitals=vitals))
-    if detail and (v := vital_lines(n.entity)):
-        lines.append(truncate("  ".join(v), 44))
+def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False, vitals: str | None = None,
+                     group: int = 1) -> list[str]:
+    """Minimap label: ``entity_label_lines`` plus, with ``detail``, the vitals the label does not already print
+    (growth, hunger, water; HP and ST are in the tail, so they are never repeated as "Health" / "Stamina")."""
+    lines = list(entity_label_lines(n, my_z=my_z, vitals=vitals, group=group))
+    if detail and group <= 1:
+        extra = [f"{label} {v:.0f}%" for label, attr in VITAL_FIELDS
+                 if attr not in ("health_pct", "stamina_pct") and (v := getattr(n.entity, attr)) is not None]
+        if extra:
+            lines.append(truncate("  ".join(extra), 44))
     return lines
 
 
 def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
-    """Table cells: name, species, health, growth, stamina, hunger, water, distance, 3D distance, height delta."""
+    """Table cells: name, species, HP, growth, ST, hunger, water, distance, compass direction, 3D distance, height."""
     e, dz = n.entity, height_delta_m(n, my_z)
     return (truncate(e.name or e.id, 24), (e.species + "~" if e.inferred and e.species else e.species) or "-", _pct(e.health_pct), _pct(e.growth_pct),
             _pct(e.stamina_pct), _pct(e.hunger_pct), _pct(e.thirst_pct),
-            format_distance(n.distance_m), f"{distance_3d_m(n, my_z):.0f} m",
-            "?" if dz is None else f"{dz:+.0f} m {'higher' if dz > 0 else 'lower' if dz < 0 else 'level'}")
+            format_distance(n.distance_m), f"{compass_label(n.bearing)} ({n.bearing:.0f}°)", f"{distance_3d_m(n, my_z):.0f} m",
+            "?" if dz is None else f"{format_height(dz)} {'higher' if dz >= 0.5 else 'lower' if dz <= -0.5 else ''}".strip())
 
 
 def entity_summary(n: Nearby, my_z: float | None = None) -> str:
+    """One-line text of a peer (tooltips, logs). Same wording as the minimap label: HP / ST, then where it is."""
     e = n.entity
     sp = f" {e.species}" if e.species else ""
-    extra = ""
-    for tag, v in (("ST", e.stamina_pct), ("HU", e.hunger_pct), ("TH", e.thirst_pct)):
+    vit = ""
+    for tag, v in (("HP", e.health_pct), ("ST", e.stamina_pct), ("G", e.growth_pct), ("HU", e.hunger_pct), ("TH", e.thirst_pct)):
         if v is not None:
-            extra += f" {tag} {v:.0f}%"
-    if e.z is not None and my_z is not None:
-        extra += f" dZ {(e.z - my_z) / 100.0:+.0f}m"
-    known = "".join(f"  {tag} {v:.0f}%" for tag, v in (("HP", e.health_pct), ("G", e.growth_pct)) if v is not None)
-    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}{known}{extra}  "
-            f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°)")
+            vit += f" {tag} {v:.0f}%"
+    dz = height_delta_m(n, my_z)
+    height = "" if dz is None else f" {format_height(dz)}"
+    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}{vit}  "
+            f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°){height}")
 
 
 Rect = tuple[float, float, float, float]  # x, y, w, h
@@ -808,6 +829,13 @@ class EntitySmoother:
         # packet). A number: the source is authoritative (the game feed removes a creature when the server destroys it),
         # so a missing id leaves after this many seconds.
         self.missing_grace_s: float | None = None
+        # Players and dinosaurs the server stops listing (it destroys an actor that leaves its relevancy range and sends a
+        # fresh creation record when it comes back, a few seconds later) are kept as dimmed ghosts at their last position
+        # for ``ghost_grace_s`` instead of vanishing for those seconds. ``ghost_age_s``: the age they are shown at, so
+        # that they are drawn as stale from the first frame.
+        self.ghost_grace_s: float | None = None
+        self.ghost_kinds: frozenset[str] = frozenset()
+        self.ghost_age_s = 0.0
         self.heading_only_when_moving = False  # the source's heading is the direction of travel: no arrow for a creature at rest
         self._missing: dict[str, float] = {}  # id -> time it was first absent from an update
         self._born: dict[str, int] = {}  # id -> serial of the source's entry: a new one is a different creature (reused id)
@@ -877,11 +905,28 @@ class EntitySmoother:
         self._forget(gone)
         self.entities = {**{i: e for i, e in self.entities.items() if i in self.pos}, **new}
 
+    def _grace_for(self, eid: str) -> float | None:
+        e = self.entities.get(eid)
+        if self.ghost_grace_s and e is not None and e.kind in self.ghost_kinds:
+            return self.ghost_grace_s
+        return self.missing_grace_s
+
     def _expired(self, now: float) -> set[str]:
-        grace = self.missing_grace_s
-        if grace is None:
+        if self.missing_grace_s is None and not self.ghost_grace_s:
             return {i for i in self._missing if now - self.last_seen.get(i, now) >= self.ttl}
-        return {i for i, since in self._missing.items() if now - since >= grace}
+        out = set()
+        for i, since in self._missing.items():
+            grace = self._grace_for(i)
+            if grace is None:
+                if now - self.last_seen.get(i, now) >= self.ttl:
+                    out.add(i)
+            elif now - since >= grace:
+                out.add(i)
+        return out
+
+    def is_ghost(self, eid: str) -> bool:
+        """The source no longer lists ``eid`` but it is held at its last position (see ``ghost_grace_s``)."""
+        return eid in self._missing and self._grace_for(eid) == self.ghost_grace_s and bool(self.ghost_grace_s)
 
     def _forget(self, gone) -> None:
         for eid in gone:
@@ -959,6 +1004,8 @@ class EntitySmoother:
         out = []
         for eid, e in self.entities.items():
             age = max(now - self.last_seen.get(eid, now), 0.0)
+            if eid in self._missing and self.ghost_grace_s and e.kind in self.ghost_kinds:
+                age = max(age, self.ghost_age_s)
             if age < self.ttl:
                 vitals_age = None if e.vitals_t is None else max(now - e.vitals_t, 0.0)
                 out.append((self._shown(eid, e, now), *self.pos[eid], age, vitals_age))
