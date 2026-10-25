@@ -125,6 +125,18 @@ The status line under the minimap (and the tray tooltip) shows it working: `reco
 
 **Privacy:** the pcaps contain your IP address, the server's address and the raw game traffic, and `logs/` is in `.gitignore` so they are never committed by accident. Share them deliberately.
 
+## Starting the app after joining
+
+The server sends the class and player-name tables, and the creation record (with the first position) of every creature in range, once, when you join. An app that starts later cannot recover them from the stream:
+
+- **Nothing is hidden by the animal rule.** Every actor classed `ai` without a creation record repeats a 155/158 bit state in at least 99 % of its batches (checked on five captures: no dinosaur, player or world object matched).
+- **Still creatures never get a position.** The game only sends changed fields, so a creature that has not moved since you joined sends no position batch. Three such Deinosuchus were replicated for over 200 s in the `as` captures with no position (no `0xc0000348` / `0xc0100348` batch at all); no bit scan can find a value that is not in the stream. The app counts them (`GamePeerSource.hidden_creatures`: 30+ state batches, at least 80 % of them 60-400 bits, under 10 % animal sized, recent, not an earlier own pawn) and says so.
+- **The overlay line is elided to about 30 characters**, so `GamePeerSource.status()` now starts with a short headline and appends the detail: `Rejoin server: N hidden` (tables missed), `Started late: rejoin to see all` (tables missed, nothing hidden), `N creatures: no position yet` (tables seen), `No other players nearby` (tables seen, no dinosaur or player on the map). "Rejoin" means leaving the server and joining again with the app already running.
+- **Own handle changes** (`own handle changed: A -> B`) are a death and respawn: the heartbeat lock lets go of the silent pawn and takes the new one. The old pawn keeps streaming as a body for a while; it is remembered (`_past_own`) and never counted as another creature.
+- **Species without tables** come from `class_cache.json` (learned on this machine) and the shipped `isle_livemap/assets/class_seed.json` (51 protocol ids from captures that saw the tables; `python tools/build_class_seed.py PCAP...` rebuilds it; asset paths only). A table that disagrees with a seeded or learned id blocks it for the process. Species from either show with a `~`.
+
+Tests: use the project environment, `.venv/bin/python -m pytest` (Qt and Pillow are installed there; the system `python3` skips the 10 tests that need them).
+
 ## Recording steps for the owner
 
 Just play. Start the app before joining a server (it records from launch), join, stay put for the first 30 s, and quit from the tray when done (this flushes the file; it is also flushed about once a second). Optionally note, for one neighbour, the character name, species and roughly when they appeared and left.

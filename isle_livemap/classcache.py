@@ -28,13 +28,29 @@ SCHEMA = 1
 MAX_AGE_S = 90 * 24 * 3600.0
 MAX_ENTRIES = 5000
 SAVE_INTERVAL_S = 30.0
+SEED_PATH = Path(__file__).with_name("assets") / "class_seed.json"
+
+
+def load_seed(path: Path | None = SEED_PATH) -> dict[int, str]:
+    """Protocol id -> class path shipped with the app (``tools/build_class_seed.py``): the classes of captures that
+    did see the join tables, so a first run that starts after joining can still name them. Never raises."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+            return {}
+        return {int(k, 16): v for k, v in (data.get("entries") or {}).items()
+                if isinstance(v, str) and v.startswith("/") and 0 <= int(k, 16) < 1 << 32}
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 class ClassCache:
-    def __init__(self, path: Path | None = None, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, path: Path | None = None, clock: Callable[[], float] = time.time,
+                 seed: dict[int, str] | None = None) -> None:
         self.path = path
         self._clock = clock
         self._lock = threading.Lock()
+        self._seed: dict[int, str] = dict(seed or {})  # shipped with the app: read-only, never written to ``path``
         self._entries: dict[int, dict] = {}  # protocol id -> {"path": str, "n": confirmations, "seen": unix time}
         self._blocked: set[int] = set()  # ids whose tables disagreed with the stored path in this process
         self._dirty = False
@@ -44,8 +60,10 @@ class ClassCache:
 
     # -- queries -------------------------------------------------------------
     def lookup(self, protocol_id: int) -> str | None:
+        if protocol_id in self._blocked:
+            return None
         entry = self._entries.get(protocol_id)
-        return entry["path"] if entry is not None and protocol_id not in self._blocked else None
+        return entry["path"] if entry is not None else self._seed.get(protocol_id)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -58,7 +76,12 @@ class ClassCache:
         now = self._clock()
         with self._lock:
             entry = self._entries.get(protocol_id)
-            if entry is None:
+            seeded = self._seed.get(protocol_id)
+            if entry is None and seeded is not None and seeded != path:  # a game update reused the id: trust no one
+                self._blocked.add(protocol_id)
+                self.conflicts += 1
+                log.warning("class cache: protocol %#x now names %s, the shipped seed has %s; dropped", protocol_id, path, seeded)
+            elif entry is None:
                 if len(self._entries) >= MAX_ENTRIES:
                     return
                 self._entries[protocol_id] = {"path": path, "n": 1, "seen": now}
@@ -77,8 +100,10 @@ class ClassCache:
 
     # -- persistence ---------------------------------------------------------
     @classmethod
-    def load(cls, path: Path | None, clock: Callable[[], float] = time.time) -> "ClassCache":
-        cache = cls(path, clock)
+    def load(cls, path: Path | None, clock: Callable[[], float] = time.time,
+             seed: dict[int, str] | None = None) -> "ClassCache":
+        """The cache file at ``path`` plus ``seed`` (None: the one shipped in ``assets/class_seed.json``)."""
+        cache = cls(path, clock, load_seed() if seed is None else seed)
         if path is None:
             return cache
         try:

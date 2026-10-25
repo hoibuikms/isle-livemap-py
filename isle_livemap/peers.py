@@ -383,6 +383,17 @@ class GamePeerSource:
 
     LATE_JOIN_PACKETS = 100  # a fresh join sends the export tables within the first packets; this many without = missed
 
+    # A creature whose creation record was missed and that never moved sends state batches but no position: the map
+    # cannot place it. Its batches still look like a pawn's (mostly 60-400 bits, never the 155/158 bit animal state):
+    # that profile counts it as "hidden" so the overlay can say so instead of showing nothing.
+    CREATURE_BAND = (60, 400)  # recorded pawns: >= 89 % of their state batches; game state 59 %, sky actor 24 %
+    CREATURE_MIN_BATCHES = 30  # an actor with a known dinosaur class needs only HIDDEN_KNOWN_BATCHES
+    HIDDEN_KNOWN_BATCHES = 10
+    CREATURE_BAND_SHARE = 0.8
+    CREATURE_FISH_SHARE = 0.1
+    HIDDEN_RECENT_S = 30.0  # a hidden creature must have sent state this recently (datagram time)
+    PROFILE_MAX = 20_000
+
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
 
     def __init__(self, self_ids: Iterable[str] = (), pipeline=None, clock: Callable[[], float] = time.monotonic,
@@ -399,6 +410,10 @@ class GamePeerSource:
         self._vitals: dict[int, object] = {}  # handle -> decode.ActorVitals
         self._layouts: dict[int, list[int]] = {}  # unclassified handle -> [state batches of the animal size, all state batches]
         self._anchors: dict[int, tuple[float, float]] = {}  # handle -> position the travel direction is measured from
+        self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
+        self._past_own: set[int] = set()  # earlier own pawns (respawn): the old body is not "another creature"
+        self._last_t = 0.0  # datagram time of the newest inbound packet
+        self._hidden_cache: tuple[float, int] = (-1e9, 0)
         self.packets = 0  # inbound datagrams seen
         self.locations = 0  # actor locations decoded (all sources)
         self.destroyed = 0  # destruction records that removed a tracked peer
@@ -444,6 +459,9 @@ class GamePeerSource:
         self._vitals.clear()
         self._layouts.clear()
         self._anchors.clear()
+        self._profile.clear()
+        self._past_own.clear()
+        self._hidden_cache = (-1e9, 0)
 
     def _heading(self, handle: int, x: float, y: float, previous: float | None) -> float | None:
         """Direction of travel (degrees clockwise from north) once the creature has moved ``HEADING_MIN_MOVE_CM``
@@ -478,6 +496,57 @@ class GamePeerSource:
         seen[1] += 1
         return seen[1] >= self.AI_LAYOUT_MIN_BATCHES and seen[0] >= seen[1] * self.AI_LAYOUT_SHARE
 
+    def _note_unplaced(self, handle: int, nbits: int, t: float) -> None:
+        """Profile of a creature-like actor that sent a state batch but has no position on the map."""
+        row = self._profile.get(handle)
+        if row is None:
+            if len(self._profile) >= self.PROFILE_MAX:
+                self._profile.clear()
+            row = self._profile[handle] = [0, 0, 0, t]
+        row[0] += 1
+        row[1] += self.CREATURE_BAND[0] <= nbits <= self.CREATURE_BAND[1]
+        row[2] += nbits in self.AI_LAYOUT_BITS
+        row[3] = t
+
+    def hidden_creatures(self) -> int:
+        """Creatures that are replicated to us (recent state batches) but that the map cannot place: their creation
+        record, and with it their position, was never seen and they have not moved since. Recomputed once a second."""
+        if self._last_t - self._hidden_cache[0] < 1.0:
+            return self._hidden_cache[1]
+        from . import species as sp
+
+        count = 0
+        for handle, (n, band, fish, last) in self._profile.items():
+            if (n < self.HIDDEN_KNOWN_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
+                    or handle in self._past_own or self.store.get(str(handle)) is not None):
+                continue
+            kind = self._identity(handle)[0]
+            if kind in (sp.KIND_DINO, sp.KIND_PLAYER):
+                count += 1
+            elif kind == sp.KIND_UNKNOWN and n >= self.CREATURE_MIN_BATCHES and band >= n * self.CREATURE_BAND_SHARE \
+                    and fish < n * self.CREATURE_FISH_SHARE:
+                count += 1
+        self._hidden_cache = (self._last_t, count)
+        return count
+
+    def headline(self) -> str:
+        """The few words the overlay can show (its status line is elided to about 30 characters): what the user
+        should do or know. Empty when there is nothing to add."""
+        if self.pipeline is None or self.error or self.packets < self.LATE_JOIN_PACKETS:
+            return ""
+        peers = self.store.entities()
+        unknown = sum(1 for p in peers if p.entity.kind == "unknown")
+        hidden = self.hidden_creatures()
+        if self.identity.tables_missed() and (hidden or unknown):
+            return f"Rejoin server: {hidden} hidden" if hidden else "Rejoin server to identify"
+        if self.identity.tables_missed():
+            return "Started late: rejoin to see all"  # sleeping creatures cannot be placed, so "nobody" is not known
+        if hidden:
+            return f"{hidden} creature{'s' if hidden > 1 else ''}: no position yet"
+        if not unknown and not any(p.entity.kind in ("dino", "player") for p in peers):
+            return "No other players nearby"
+        return ""
+
     def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str) -> None:
         eid = str(handle)
         old = self.store.get(eid)
@@ -494,15 +563,20 @@ class GamePeerSource:
         self._vitals.pop(handle, None)
         self._layouts.pop(handle, None)
         self._anchors.pop(handle, None)
+        self._profile.pop(handle, None)
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
         from . import species as sp
         from .decode import Bits, batch_kind, count_batches, decode_vitals_block, parse_iris_packet, KIND_STATE
 
         self.packets += 1
+        self._last_t = d.observed_at
         if own_handle is not None and own_handle != self.own_handle:
+            if self.own_handle is not None:
+                self._past_own.add(self.own_handle)  # died and respawned: the old pawn lingers as a body
             self.own_handle = own_handle  # replaces (not adds to) the previous own handle
             self.store.set_owned_self_ids((str(own_handle),))
+            self._profile.pop(own_handle, None)
         packet = parse_iris_packet(d.payload)
         if packet is None:
             return
@@ -522,6 +596,7 @@ class GamePeerSource:
             self._vitals.pop(handle, None)
             self._layouts.pop(handle, None)
             self._anchors.pop(handle, None)
+            self._profile.pop(handle, None)
             self.locator.note_creation(handle, creation.location, t)
             kind, species, name = self._identity(handle)
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
@@ -546,14 +621,24 @@ class GamePeerSource:
             loc = self.locator.update(bits, batch, t, learn=kind in (sp.KIND_DINO, sp.KIND_PLAYER, sp.KIND_AI))
             if loc is not None:
                 self.locations += 1
+                self._profile.pop(handle, None)
                 self._emit(handle, loc.x, loc.y, loc.z if loc.z_reliable else None, kind, species, name)
-            elif (old := self.store.get(str(handle))) is not None:
+            elif (old := self.store.get(str(handle))) is None:
+                if kind != sp.KIND_AI:
+                    self._note_unplaced(handle, batch.data_bit_count, t)
+            else:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
                 # on the map at its last position instead of letting the TTL remove it.
                 self.store.update(replace(old, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct) if vit is not None else old)
 
     # -- PeerSource --------------------------------------------------------
     def status(self) -> str:
+        """Short headline first (the overlay shows only its start), then the details for the log and the tool window."""
+        detail = self._detail_status()
+        head = self.headline()
+        return f"{head} | {detail}" if head else detail
+
+    def _detail_status(self) -> str:
         if self.pipeline is None:
             return self.STATUS_NO_PIPELINE
         if self.error:
@@ -570,10 +655,10 @@ class GamePeerSource:
             cached = sum(1 for p in peers if p.entity.inferred)
             if unknown == len(peers):
                 return (f"game: {len(peers)} actors, none identified: the app started after you joined, so the server's "
-                        f"class and player tables were missed. Rejoin the server to get species and names ({own})")
+                        f"class and player tables were missed. Leave the server and join again (rejoin) to get species and names ({own})")
             via = f"; {cached} named from the saved class cache (marked ~)" if cached else ""
             return (f"game: {len(peers)} actors, {unknown} unidentified: the app started after you joined and missed the "
-                    f"server's class tables{via}. Rejoin the server to identify the rest ({own})")
+                    f"server's class tables{via}. Leave the server and join again (rejoin) to identify the rest ({own})")
         seen = (f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}")
         return (f"game: {len(peers)} actors ({known} with species; {seen}; "
                 f"heading from movement; growth, hunger and thirst not available; {own})")
@@ -596,6 +681,9 @@ class GamePeerSource:
         shown = " ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"
         if self.late_join():
             shown += " (LATE JOIN: class/name tables missed, rejoin the server)"
+        hidden = self.hidden_creatures()
+        if hidden:
+            shown += f" ({hidden} creature(s) replicated but never placed: no position received; rejoin to see them)"
         inferred = sum(1 for p in self.store.entities() if p.entity.inferred)
         if inferred:
             shown += f" ({inferred} species from the saved class cache)"
