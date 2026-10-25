@@ -8,13 +8,13 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QColor
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QInputDialog,
-    QAbstractItemView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSystemTrayIcon,
+    QAbstractItemView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .capture import TelemetryPipeline
 from .geo import (
-    MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance,
+    LEGEND_ENTRIES, MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance,
     parse_radii,
 )
 from .overlay import MapView
@@ -220,7 +220,7 @@ class App(QObject):
         for text, fn in (
             ("Zoom to peer radius", lambda: self.view.zoom_to_radius(self.settings.peer_radius_m)),
             ("Size…", self.ask_size), ("Range rings…", self.ask_rings), ("Species label…", self.ask_species),
-            ("Nearby radius…", self.ask_peer_radius),
+            ("Nearby radius…", self.ask_peer_radius), ("Marker colours…", self.show_legend),
         ):
             a = QAction(text, menu)
             a.triggered.connect(fn)
@@ -228,7 +228,7 @@ class App(QObject):
         for text, attr in (
             ("Zones", "show_zones"), ("Food sources", "show_food"), ("Range rings", "show_rings"),
             ("Show other players", "show_players"),  # players and dinosaurs; animals (fish) have show_ai, settings file only
-            ("Vitals detail on labels", "show_vitals_detail"),
+            ("Vitals detail on labels", "show_vitals_detail"), ("Health / stamina bars", "show_vitals_bars"),
         ):
             a = QAction(text, menu, checkable=True)
             a.setChecked(getattr(self.settings, attr))
@@ -285,6 +285,14 @@ class App(QObject):
         radii = parse_radii(text) if ok else []
         if radii:
             self.settings.ring_radii_m = radii
+
+    def show_legend(self) -> None:
+        rows = "".join(f'<tr><td><span style="color:{color}">&#9679;</span>&nbsp;</td><td><b>{name}</b></td><td>&nbsp;{how}</td></tr>'
+                       for name, color, how in LEGEND_ENTRIES)
+        box = QMessageBox(QMessageBox.Icon.NoIcon, "Marker colours",
+                          f"<table>{rows}</table><p>Dot size follows the species. An arrow means the creature is moving. "
+                          "A bar under a dot is its health (green to red) and stamina (blue) when the game has sent them.</p>")
+        box.exec()
 
     def ask_species(self) -> None:
         text, ok = QInputDialog.getText(None, "Species label", "Shown on the HUD (not detectable from traffic):",

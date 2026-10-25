@@ -29,9 +29,14 @@ def test_named_player_keeps_name_and_species():
     assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus", inferred=True))[0] == "Rex Fan (Deinosuchus~)"
 
 
-def test_unidentified_creature_still_shows_its_id():
-    assert entity_label_lines(near("unknown", "Unknown #9"))[0] == "Unknown #9"
-    assert entity_label_lines(near("dino", "Actor #9"))[0] == "Actor #9"
+def test_unidentified_creature_says_unknown_and_still_shows_its_handle():
+    def nearby(kind, eid, name):
+        return Nearby(Entity(eid, kind, name, "", 0.0, 0.0), 0.0, 0.0, 100.0, 0.0)
+
+    assert entity_label_lines(nearby("unknown", "9", "Unknown #9"))[0] == "Creature ? #9"
+    assert entity_label_lines(nearby("dino", "9", "Actor #9"))[0] == "Dino ? #9"
+    assert entity_label_lines(nearby("ai", "9", "Actor #9"))[0] == "Animal ? #9"
+    assert entity_label_lines(nearby("player", "9", "Some Name"))[0] == "Some Name (?)"  # a name, but no species yet
 
 
 # ---------------------------------------------------------------- who gets a label

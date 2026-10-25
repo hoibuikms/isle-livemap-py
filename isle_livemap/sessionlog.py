@@ -40,6 +40,8 @@ DEFAULT_KEEP_SESSIONS = 10
 DEFAULT_TOTAL_CAP_MB = 1024.0
 DEFAULT_FILE_CAP_MB = 200.0
 SNAPSHOT_INTERVAL_S = 10.0
+LABELS_INTERVAL_S = 30.0  # a "labels:" line at least this often while creatures are on the map ...
+LABELS_MIN_GAP_S = 5.0  # ... and when what the labels claim changes, but never more often than this
 LOG_MAX_BYTES = 5 * 1024 * 1024
 MAX_TRACEBACKS_PER_SITE = 5
 
@@ -159,6 +161,8 @@ class SessionLog:
         self._server: str | None = None
         self._peer_stem: str | None = None
         self._next_snapshot = 0.0
+        self._labels_sig: frozenset | None = None
+        self._labels_at = -1e9
         self._first_creation = False
         self._errors: dict[str, int] = {}
         self.creation = self.exports = self.destroyed = self.packets = 0
@@ -291,8 +295,33 @@ class SessionLog:
             if force_snapshot or now >= self._next_snapshot:
                 self._next_snapshot = now + self.interval
                 self.snapshot()
+            self._labels(now)
         except Exception:  # noqa: BLE001
             self.on_error("session log tick")
+
+    def _labels(self, now: float) -> None:
+        """Label corrections, and the compact "labels:" line (what the minimap says about each creature and how sure it
+        is) every ``LABELS_INTERVAL_S`` or when that changes: enough to check a label against the game without a replay."""
+        peers = self.peers
+        if peers is None:
+            return
+        drain = getattr(peers, "drain_events", None)
+        for line in drain() if callable(drain) else ():
+            self.event("%s", line)
+        signature, line = getattr(peers, "labels_signature", None), getattr(peers, "labels_line", None)
+        if not callable(signature) or not callable(line):
+            return
+        due = now - self._labels_at
+        if due < LABELS_MIN_GAP_S:
+            return
+        sig = signature()
+        if sig == self._labels_sig and due < LABELS_INTERVAL_S:
+            return
+        if not sig and not self._labels_sig:  # nothing but fish, before and now: nothing to say
+            self._labels_sig = sig
+            return
+        self._labels_sig, self._labels_at = sig, now
+        self.event("%s", line())
 
     def snapshot(self, label: str = "counters") -> None:
         try:

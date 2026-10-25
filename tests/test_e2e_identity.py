@@ -14,12 +14,21 @@ import pytest
 pytest.importorskip("PySide6")
 pytest.importorskip("scapy")
 
+from isle_livemap.geo import peer_style  # noqa: E402
 from isle_livemap.replay import encode_move_payload  # noqa: E402
 from test_e2e_peers import near_color, run_main, screen_of, settings_dir  # noqa: E402
 
 OWN = (141_000.0, -312_000.0, 38_000.0)  # among the creatures of the capture (the Gallimimus sits ~360 m away)
 CYAN = (77, 208, 255)
-ORANGE = (255, 138, 61)  # geo.ENTITY_STYLE["ai"].color
+ORANGE = (143, 166, 179)  # geo.ENTITY_STYLE["ai"].color
+
+
+def style_rgb(entity) -> tuple[int, int, int]:
+    """The colour the minimap paints this creature with (geo.peer_style: players cyan, dinosaurs by diet, animals muted)."""
+    from PySide6.QtGui import QColor
+
+    c = QColor(peer_style(entity).color)
+    return c.red(), c.green(), c.blue()
 
 
 def build_join_pcap(path: Path, packets: list[dict]) -> Path:
@@ -74,8 +83,7 @@ def test_creatures_with_species_and_names_are_drawn_and_world_objects_are_not(tm
     for n in near.values():
         sx, sy = screen_of(app.view, n.x, n.y)
         if math.hypot(sx - cx, sy - cy) < app.view.width() / 2 - 8:
-            color = ORANGE if n.entity.kind == "ai" else CYAN
-            drawn += near_color(img, sx, sy, color, r=5)
+            drawn += near_color(img, sx, sy, style_rgb(n.entity), r=5)
     assert drawn >= 2, "creatures inside the circle must be drawn at their projected positions"
     # the label of a named creature: name, then species in brackets, then distance and bearing
     named = [n for n in near.values() if n.entity.species and not n.entity.name.startswith("Actor #")]

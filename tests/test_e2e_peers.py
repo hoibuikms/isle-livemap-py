@@ -32,7 +32,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 OWN_FIX = (442_020.33, -162_148.37)
 NEAR_IDS = {"104114", "84466", "105096", "89308", "94432"}  # actors 752..838 m from OWN_FIX in the recorded packets
 CYAN = (77, 208, 255)  # geo.ENTITY_STYLE["player"].color
-ORANGE = (255, 138, 61)  # geo.ENTITY_STYLE["ai"].color: the recorded actors only ever send the 155/158 bit animal state
+ORANGE = (143, 166, 179)  # geo.ENTITY_STYLE["ai"].color (muted grey-blue): the recorded actors only ever send the 155/158 bit animal state
 
 
 def build_pcap(path: Path, inbound=("FirstHeartbeat", "SecondHeartbeat", "PeriodicAttributes")) -> Path:

@@ -39,7 +39,8 @@ Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on lab
 | `peer_self_ids` | `[]` | settings-file only: extra ids that are "me" and never drawn (for example a second client); read at start |
 | `show_players` | `true` | draw other players; tray toggle |
 | `show_vitals_detail` | `false` | extra label line with the vitals that are known; tray toggle |
-| `show_ai` | `true` | settings-file only: draw server-controlled animals (fish, kind `ai`, orange diamond) from the game source |
+| `show_vitals_bars` | `true` | a thin health (and stamina) bar under the dot of a creature whose health is known; tray toggle "Health / stamina bars" |
+| `show_ai` | `true` | settings-file only: draw server-controlled animals (fish, kind `ai`, muted grey-blue diamond) from the game source |
 | `record_sessions` | `true` | settings-file only: automatic session pcap + log for live capture; `false` = same as `--no-record` |
 | `record_dir` | `""` | settings-file only: sessions directory; empty = `<data dir>/logs/sessions` |
 | `record_keep_sessions` | `10` | settings-file only: newest sessions kept (1..1000) |
@@ -50,8 +51,81 @@ Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on lab
 - Self is excluded by identity, never by position. Lab: id 0 is the lab's "me". Game: the entity whose Iris handle equals the own handle (learned from the survival heartbeat) is dropped, and a provisional peer with that handle is purged when the lock arrives. `peer_self_ids` adds more.
 - Silence timeouts are a property of the source. Lab and synthetic peers are dimmed after 3 s without an update and removed after 5 s. Game peers are dimmed after 8 s (`GAME_PEER_STALE_S`) and, without a destruction record, removed after 180 s for creatures (`GamePeerSource.TTL_S`: captured resting pawns went silent for 100-300 s and came back) or 30 s for server animals (`TTL_AI_S`), because Iris replicates changes only: an actor that stands still sends nothing, so silence is not absence. The game source also removes a tracked handle when the packet carries a destruction record for it (the dot is gone 1.5 s later: `GamePeerSource.GONE_GRACE_S`, applied by `EntitySmoother.prune` every frame; it used to stay dimmed for 30 s) (431 records in the recorded capture, 431 of 431 handles seen in that capture, 430 with a creation record). The 8 s / 30 s values are a judgement call, not a measured number.
 - The game server is the destination of the first outbound datagram. A different destination only replaces it after 5 outbound datagrams in a row while the old server has been silent for 1 s (a real server change). A single datagram from the game's second socket to another host (a 1300-byte latency probe was seen once per session) is ignored: it used to count as a server change and wiped the identity tables, the peers and the own-vitals lock, twice within 30 ms (once for the probe, once when the real server was "learned" again).
-- Missing fields are `None` and are simply not printed: the minimap label never shows `?`, `HP ?` or `G ?`. The label is the player name with the species in brackets; a creature without a player name is labelled by its species alone (`Deinosuchus`, `Longear`; a `~` marks a species taken from the saved class cache) and only a creature with no class at all shows `Unknown #<handle>`. Second line: the known vitals, distance, compass bearing and height difference, e.g. `Rainbow Fish` / `666 m N` or `<name> (Pteranodon)` / `HP 86% 787 m NNE +60m`. Labels go to players first, then dinosaurs, then server animals (fish: at most 3 labels, none in a crowd of 20+); they avoid the status lines, the dots of players and the edge of the round minimap. The Nearby table keeps `-` / `?` only because its columns need a cell. Nothing is guessed. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet is a dot, one that has moved is an arrow.
+- A label never states a guess as a fact; see "Label confidence" below. Unknown is written as `?`, a species remembered from an earlier session carries `~` and is drawn softer, and growth, hunger and thirst of other creatures are never printed (not even as `?`): they are not replicated to us. The label is the player name with the species in brackets (`<name> (Pteranodon)`); a creature without a player name is labelled by its species alone (`Deinosuchus`, `Longear`) and only a creature with no class at all shows `Dino ? #<handle>` (`Creature ? #<handle>` when even the kind is unknown, `Animal ? #<handle>` for a server animal). Second line: health and stamina, distance, compass bearing and height difference, e.g. `Rainbow Fish` / `666 m N` or `<name> (Pteranodon)` / `HP 86% ST 33% 787 m NNE +60m`. Labels go to players first, then dinosaurs, then server animals (fish: at most 3 labels, none in a crowd of 20+); they avoid the status lines, the dots of players and the edge of the round minimap. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet is a dot, one that has moved is an arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
+
+## Label confidence (what the minimap claims, and how sure it is)
+
+`isle_livemap/confidence.py` holds the rules; the minimap, the Nearby table, the session log and `tools/label_report.py` use the same ones.
+
+| Field | Tier | Shown as | Meaning |
+|---|---|---|---|
+| species | confirmed | `Allosaurus` | this connection named it: the server's export tables (source `table`), or the dinosaur assets its own creation records reference (source `asset`) |
+| species | inferred | `Allosaurus~`, head drawn at 75 % opacity | remembered from an earlier session: the saved class cache (source `cache`) or the seed shipped with the app (source `seed`), matched by protocol id |
+| species | unknown | `Dino ? #186850`, `<name> (?)`, drawn at 60 % opacity | nothing is known |
+| player name | confirmed | `<name> (...)` | the creature references its PlayerState; there is no other source, so a creature without one has no name (never `Actor #id`) |
+| health, stamina | known | `HP 86% ST 33%` | a full attribute block was seen (so the maxima are real) and the reading is at most `VITALS_FRESH_S` = 120 s old (the server sends only what changed, so an unchanged value is still true) |
+| health, stamina | stale | `HP 86% ST 33% [1m+]` | the same reading, older; the age is coarse (`2m+`, `5m+`, `10m+`) so the text changes at most three times in a creature's life |
+| health | none | `HP ?` | never read for this creature (dinosaurs and players only; server animals have no health line) |
+| growth, hunger, thirst | not replicated | nothing | never printed, not even `?`; the status line says "growth, hunger and thirst not available" |
+
+Hysteresis (`confidence.TierTracker`, `LabelConfidence`, one per map view): a label that becomes MORE sure (unknown to remembered to confirmed, a first or a fresh health reading) changes at once; one that would say LESS (a species that vanishes, a reading that goes stale) changes only after the weaker evidence has lasted `DWELL_S` = 3 s. A species or a reading that comes and goes inside that time never reaches the label. State is dropped when the creature leaves the map.
+
+Corrections: when a species remembered from the cache is later contradicted by the server's tables (or the cache entry is dropped because the tables disagreed), the label flips to the confirmed species at once and one line is written to the session log, once per creature: `label corrected: handle 123: Allosaurus~ (remembered class) -> Carnotaurus (server tables)`; dropped cache entries are reported as `class cache: N remembered class(es) dropped ...`.
+
+### Checking the labels against the game
+
+The session log has a compact `labels:` line, written every 30 s while creatures are on the map and whenever what the labels claim changes (a species is confirmed, a name is linked, a first health reading arrives; at most one per 5 s):
+
+    labels: creatures=3 fish=12 | 186850 player Deinosuchus[table] "P1" HP86 ST33 724mN | 171102 dino Deinosuchus~[cache] HP? 408mE | 255202 dino ? HP? 1531mW
+
+`<handle> <kind> <species>[source] "<player name>" HP<n or ?> ST<n> (<age>s old, when stale) <distance>m<bearing>`; creatures are nearest first, at most 12 are spelled out, fish are only counted. Names are the game's player names (the minimap shows them too); the log stays on your machine.
+
+`tools/label_report.py` replays a recorded session through the same code:
+
+    .venv/bin/python -I tools/label_report.py session_X.pcap [--all] [--csv out.csv] [--hide-names]
+    .venv/bin/python -I tools/label_report.py session_X.pcap --at 14:10:30 [--png at.png]
+
+* The table has one row per creature seen: handle, kind, species with its source, name, first and last time on the map (seconds into the capture and the recording machine's clock, read from the `session_X.log` beside the pcap), whether it was ever placed on the map (`no` = replicated to us, position never received), the last health and stamina and how old that reading was, and the distance and bearing at first sight. Compare it with what you saw in the game: species, name, the HP you remember, how far away it was.
+* `--at HH:MM:SS` (or `+SECONDS`) draws the real `MapView` offscreen at that moment and prints, for every creature on the map, what the label said, or why it had none: outside the minimap circle (an edge arrow only), or no room / over the label limit. It also prints the status line. `--png` saves the picture. Without PySide6 the labels are built by the same functions but not placed.
+* `--cache class_cache.json` uses your saved class cache (copy it from the data folder); by default only the shipped seed is used. `--no-seed` uses neither. `--hide-names` replaces player names before you share a report.
+
+## Dot size by species
+
+A peer's dot (and its heading arrow) is scaled by the species' size class, so a Tyrannosaurus reads bigger than a
+Troodon. Growth of other creatures is not decoded, so only the species decides; a growth fraction, when an entity has
+one (`growth_pct`), scales the radius from 60 % (juvenile) up to 100 %. Inferred species (`Name~`) scale too. Fish stay a
+small fixed diamond.
+
+| Class | Dot radius | Species (rough estimates of real adult size, not game data) |
+|---|---|---|
+| tiny | 3.0 px | Hypsilophodon, Troodon, Beipiaosaurus, Dryosaurus, Pteranodon, Compsognathus, Microraptor |
+| small | 3.8 px | Dilophosaurus, Herrerasaurus, Omniraptor, Utahraptor, Gallimimus, Pachycephalosaurus, Austroraptor, Dromaeosaurus |
+| medium (default) | 4.6 px | Carnotaurus, Ceratosaurus, Allosaurus, Maiasaura, Tenontosaurus, Diabloceratops, Kentrosaurus, Parasaurolophus, Camptosaurus, Oxalaia |
+| large | 5.6 px | Stegosaurus, Deinosuchus, Acrocanthosaurus, Therizinosaurus, Sarcosuchus |
+| huge | 6.8 px | Tyrannosaurus, Triceratops, Giganotosaurus, Spinosaurus, Brachiosaurus |
+
+A species that is not in the table (or no species at all) uses the medium radius. Radii are clamped to 2.5-8 px. Tables:
+`species.SIZE_CLASSES`, `geo.SIZE_RADIUS_PX`; the label placement keeps clear of the larger dot (`geo.marker_extent`).
+
+## Marker look (2D, readable on any map colour)
+
+| Peer | Look |
+|---|---|
+| you | red arrow (unchanged) |
+| player (the creature references a PlayerState) | cyan dot with a white ring: a person reads at a glance |
+| carnivore / herbivore / omnivore dinosaur | pink / green / yellow dot (`species.DIET_SPECIES`, rough, from the in-game diet) |
+| dinosaur with no species yet | neutral grey-blue dot |
+| server animal (fish) | small muted grey-blue diamond: background, not a target |
+
+Every dot of the 40 most important peers has a soft light halo, so it keeps its contrast over forest, rock and water. A dot
+becomes an **arrow only while the creature moves** (`EntitySmoother.is_moving`: measured speed of at least 0.3 m/s and the
+dot still being carried along that movement); a creature at rest is a plain dot, because the heading comes from movement
+and says nothing once it has stopped. Labels sit on a soft dark pill, so the white second line reads on any background.
+A thin **health bar** (green to red) and, when the stamina is known, a **stamina bar** (blue) hang under the dot of a
+creature whose health is known, with no text to read (`show_vitals_bars`, tray "Health / stamina bars"; not for fish).
+Tray "Marker colours..." shows the legend (`geo.LEGEND_ENTRIES`). Beyond the 150 most important peers of a huge crowd the
+rest are small plain squares (500 anti-aliased glyphs do not fit a 16 ms frame; the 500-peer paint test takes ~3 ms).
 
 ## Lab record (development only)
 
@@ -69,10 +143,12 @@ Evidence and method: "Identity, species and positions" (section 13) of `docs/trd
 | Species | `Pteranodon`, `Gallimimus`, `Longear`, `Rainbow Fish` in the capture. Any other class is shown under its cleaned asset name (`BP_Foo_C` -> `Foo`), never invented. The mapping is `species.py` (`CLASS_RULES`, `DISPLAY_NAMES`) |
 | Player name | decoded for pawns whose creation record references their PlayerState (name from the PlayerState creation record: 382 of 388 PlayerStates in the capture). A creature whose PlayerState was created before the capture, or an AI animal, has no name |
 | Position x, y, z | decoded: creation position (16 x the raw/100 value, see TRD 13.4), two fixed state layouts (BP_Longear, BP_Fish_RainbowFish: x and y only), and layouts learned from creation anchor + continuity (pteranodon pawns). Most pawn state batches carry no position at all |
-| Health, stamina | decoded for other creatures from the full attribute block (9 slots: health, maxHealth, stamina, maxStamina, then maxHealth repeated three times and half of it twice; or 8 slots without maxStamina when that did not change), then **followed** between blocks: a pawn that regenerates sends the pair health + stamina (66 bits apart) in small state batches every second or so (`decode.PawnVitalsTracker`). A slot is the health when it is close to the last health (or sits at an offset confirmed twice for that batch header, which then also takes a bite). A percentage needs the maxima of the block, so nothing is shown for a pawn that has not sent one yet (in the hhh capture 26 % of the dino-seconds had HP, 17 % had stamina: the block comes rarely and the 8-slot form has no maxStamina). Label: `HP 86% ST 33% 408 m E -31m` |
-| Growth, hunger, thirst | NOT decoded, and probably not replicated to other clients: the own pawn's survival heartbeat (hunger, thirst, hunger repeated) was found 283 times in the own batches of one capture and not once in the batches of other pawns (their repeats were maxHealth blocks); no slot next to the health slot of another pawn holds a growth fraction. maxHealth of a juvenile grows (72.75 -> 73.76 in 20 s) but without the adult maximum of the species that is not a percentage |
+| Health, stamina | decoded for other creatures from the full attribute block (9 slots: health, maxHealth, stamina, maxStamina, then maxHealth repeated three times and half of it twice; or 8 slots without maxStamina when that did not change), then **followed** between blocks: a pawn that regenerates sends the pair health + stamina (66 bits apart) in small state batches every second or so (`decode.PawnVitalsTracker`). A slot is the health when it is close to the last health (or sits at an offset confirmed twice for that batch header, which then also takes a bite). A percentage needs the maxima. maxHealth is also in the **creation record** (see below), so a creature created while the app runs gets its health percentage from the first confirmed health + stamina pair, without waiting for a block (`PawnVitalsTracker.note_creation`, `_bootstrap`: the pair must be seen twice at the same place of the same batch layout, health inside 2-105 % of the maximum). maxStamina is in no creation record: such a pawn has HP but no stamina percentage. A creature created before the app started still waits for its first block (in the hhh capture 26 % of the dino-seconds had HP, 17 % had stamina: the block comes rarely and the 8-slot form has no maxStamina). Label: `HP 86% ST 33% 408 m E -31m` |
+| Growth, hunger, thirst | NOT replicated to other clients as far as the data shows (see "Why other players' data is less complete than yours"): at every growth tick of the own pawn the growth slot travels with the new maxHealth (57 of 60 full blocks of growing own pawns), at the same event of a growing other pawn it never does (0 of 16 blocks, 5 of them growth ticks); the own pawn's hunger / thirst heartbeat reaches it about once a second, other pawns' batches never hold it. Not printed, not even `?` |
 | Despawn | destruction records (layout fixed, see TRD 13.3); TTL is the fallback |
 | Heading | derived from movement: the bearing from an anchor to the first position at least 1 m away (jumps over 200 m ignored), kept while the creature stands still; the dot becomes an arrow |
+
+**Positions of other creatures** (`tools/position_audit.py`, no ground truth exists for another player, so the audit checks what must hold for any real creature): over the recorded sessions no dinosaur / player step is faster than 16 m/s (136 steps, budget 40 m/s); six silences of 4 to 146 s ended 0.0-3.8 m from where the creature had been, i.e. **the server sends a position only when it changed, and no position means "has not moved"** (the same delta rule as for health: a missing update is an unchanged value, not stale data); every fix is within 6.4 km of the own player. A search for a position around an anchor older than `ANCHOR_LIFETIME` (a creature that rested for minutes) was tried and dropped: it found vectors 2.5-4.9 km from the old anchor with 60-97 m/s between consecutive fixes, which are false locks (the same search on 10,795 batches of non-creature streams with the normal 1 km bootstrap radius found none). What a creature without a creation record in the capture and without a position since the app started cannot be given: a position.
 
 A creature whose creation record was missed has no anchor. `ActorLocationTracker.bootstrap` places it from two consecutive state batches: a canonical 22+ bit vector within 1 km of the local player in both, the second continuing one of the first batch's candidates at creature speed. A vector within 15 m (+20 m/s) of the last position is accepted at its first sighting (the layout still needs two sightings to be trusted). In the hhh captures this placed 4 more creatures and raised the fixes of walking dinosaurs from 33 to 42 of 89 batches (a resting creature sends only health and stamina, so it has no position to decode).
 
@@ -90,6 +166,36 @@ The own marker follows the client's own outbound move packets (no network hop). 
 - A reused handle (`PeerEntity.born` changes) is a different creature: the dot starts at its position instead of gliding there from the old one.
 
 What stays inherent: the first sample after a silence, network latency and the server's send interval.
+
+## Why other players' data is less complete than yours
+
+Your own pawn is the ground truth the app reads: the server sends the **owner** the whole attribute set (growth, hunger,
+thirst, health and maxima) in a full frame about every 16 s and the hunger / thirst heartbeat about once a second. To
+everybody else it sends what changed, and only members that are not owner-only. `tools/attribute_census.py` counts the
+signatures per capture, own pawn against all others (5 captures):
+
+| Field | Own pawn | Other pawns |
+|---|---|---|
+| health, maxHealth | in every full block | yes: full blocks (16 seen) and the health + stamina pair in small batches |
+| stamina | yes | yes (the pair); maxStamina only in some blocks |
+| growth | slot in 57 of the 60 full blocks of growing own pawns; none for an adult (1.0 is probably the default and is not sent) | **never**, in 16 full blocks, 5 of them growth ticks of growing pawns (maxHealth +0.5..1.4 %), the event that always carries the growth slot to the owner |
+| hunger, thirst | heartbeat in 95-100 % of the attribute batches (~1 per second) | **never**: 5 look-alikes in ~250,000 batches, all maxHealth blocks |
+| maxHealth in the creation record | n/a (created before the app) | yes: 10 of the 15 creation records of 1500+ bits (the rest are classes with another layout) |
+
+So growth, hunger and thirst of others are not an unfinished decoder: the server does not send them to us. A plain float32
+copy of the own growth is in no batch of the own pawn either, so an unknown encoding for others cannot be excluded, but
+nothing in the data points to one. maxHealth grows with growth (own pawn: 1.57 at growth 0.038, 6.64 at 0.150), but the
+curve differs per species (a pawn of 1650 maxHealth had growth 0.24, one of 2.1 growth 0.049), so no percentage of growth can be
+derived from it without a per-species calibration; none is shown.
+
+**A missing update is an unchanged value.** Iris sends the members that changed, so a health that has stopped changing (full
+health), a creature that stands still, and a creature that stopped moving are all silent. The last health and the last
+position stay true until the server sends the next one or destroys the creature, which is why `VITALS_FRESH_S` is 120 s and a
+dot is not dimmed for being quiet.
+
+The creation record holds maxHealth, not health: floats 34 bits apart (value + two flag bits), maxHealth twice and maxHealth / 2
+four times (402662: 2606.108, 2606.108, 1303.054 x4 at bits 3304..3474; its first block 50 s later said 2620.49, it had grown;
+`decode.creation_max_health`; 0.9 ms per record; creation vs first block: +0.6 %, +0.9 %, +1.4 % for three pawns).
 
 ## Why the own-player vitals do not transfer to other actors
 

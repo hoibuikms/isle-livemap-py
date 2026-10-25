@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from .capture import TelemetryPipeline
+from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, species_tier
 from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
     PEER_STALE_S, PEER_TTL_S, LABEL_RANK, SLOT_SLACK_PX, label_limits, place_label, vital_lines, visible_entities,
+    marker_extent, marker_radius, peer_style,
 )
 from .peers import status_is_warning
 from .tracking import Vitals
@@ -25,6 +28,15 @@ KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "di
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
 EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
 DOT_CLEARANCE_PX = 7.0  # no label may cover the dot of a player or dinosaur
+SOFT_INFERRED, SOFT_UNKNOWN = 0.75, 0.6  # label head opacity of a remembered / unknown species (confirmed: 1.0)
+HALO = QColor(255, 255, 255, 70)  # soft light disc under a dinosaur dot: contrast on dark and light map areas
+HALO_PLAYER = QColor(255, 255, 255, 105)
+LABEL_BG, LABEL_BG_STALE = QColor(8, 12, 16, 125), QColor(8, 12, 16, 60)
+BAR_TRACK, BAR_ST_FILL = QColor(0, 0, 0, 170), QColor(90, 170, 255)
+BAR_HP_H, BAR_ST_H = 3.0, 2.0  # px
+BAR_ROOM_PX = 9.0  # extra height under a dot that labels keep clear
+HALO_MAX = 40  # halos and bars for the most important this many peers (labels are limited in the same way)
+CROWD_GLYPHS = 150  # full glyphs for the most important this many peers; the rest of a crowd are small squares
 LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
 
 
@@ -46,9 +58,12 @@ class MapView(QWidget):
         self.peer_status = ""
         self.record_status = ""  # set by App once a second while --record is active
         self._marker_tools: dict[tuple[str, bool], tuple[QPen, QColor]] = {}
+        self._bar_colors: dict[int, QColor] = {}  # health bar fill by 5 % step (no QColor built per frame)
+        self._pen_key = None  # (colour, stale, player) of the pen / brush currently set on the painter
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
         self._label_slot: dict[str, int] = {}  # peer id -> label slot used last frame: tried first, so labels do not hop
         self._labelled: set[str] = set()  # peers that had a label last frame: they keep it over equally near newcomers
+        self._conf = LabelConfidence()  # what each label may claim; less sure only after a few seconds (no flapping text)
         self.errors = 0  # frames in which tick() or paintEvent() raised (the frame is still scheduled)
         self.last_error = ""
         self._snap_ok = True
@@ -156,6 +171,7 @@ class MapView(QWidget):
                 self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
                 # a source that removes creatures itself (the game: destruction records) needs no second, longer timer here
                 self.ents.missing_grace_s = getattr(self.peers, "gone_grace_s", None)
+                self.ents.heading_only_when_moving = bool(getattr(self.peers, "heading_from_movement", False))
                 # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
                 if snap is not self._peers_snap or snap.version != self._peers_version:
                     self._peers_snap, self._peers_version = snap, snap.version
@@ -344,14 +360,25 @@ class MapView(QWidget):
         widths = self._text_widths  # text measuring is the slow part of the layer: measure each string once
         if len(widths) > 2000:
             widths.clear()
-        for n, pt in reversed(by_priority):  # players on top, far before near
-            self._draw_entity_marker(p, n, pt)
+        total = len(by_priority)
+        self._pen_key = None
+        for i, (n, pt) in enumerate(reversed(by_priority)):  # players on top, far before near
+            rank = total - i  # 1 = the most important peer
+            if rank > CROWD_GLYPHS:
+                self._draw_crowd_dot(p, n, pt)
+            else:
+                self._draw_entity_marker(p, n, pt, rank <= HALO_MAX)
         # dots of players and dinosaurs that can compete with a label: kept clear when possible (a preference, so two
         # creatures standing next to each other still both get a label)
-        dots = [(pt.x() - DOT_CLEARANCE_PX, pt.y() - DOT_CLEARANCE_PX, 2 * DOT_CLEARANCE_PX, 2 * DOT_CLEARANCE_PX)
-                for n, pt in by_priority[:max_labels * 2] if n.entity.kind != "ai"]
+        dots = []
+        for n, pt in by_priority[:max_labels * 2]:
+            if n.entity.kind != "ai":
+                c = max(DOT_CLEARANCE_PX, marker_extent(n.entity) + 3.0)  # a big dino's dot is wider than the default
+                bar = BAR_ROOM_PX if self._has_bars(n) else 0.0  # the health bar hangs under the dot
+                dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c + bar))
         pos = self.pipeline.latest.position
         my_z = pos.z if pos is not None else None
+        now = time.monotonic()
         # players and dinosaurs claim label space before server animals (fish) do, each group nearest first
         for n, pt in by_priority:
             if labelled >= max_labels or attempts >= max_labels * LABEL_ATTEMPTS_PER_LABEL:
@@ -360,7 +387,12 @@ class MapView(QWidget):
             if is_ai and ai_labelled >= max_ai_labels:
                 continue
             attempts += 1
-            lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail)
+            e = n.entity
+            sp, inferred, hp, st, vtier = self._conf.settle(n.entity.id, e.species, e.inferred, e.health_pct, e.stamina_pct,
+                                                            n.vitals_age_s, now)
+            if (sp, inferred, hp, st) != (e.species, e.inferred, e.health_pct, e.stamina_pct):
+                n = replace(n, entity=replace(e, species=sp, inferred=inferred, health_pct=hp, stamina_pct=st))
+            lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail, vtier)
             w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
             h = fm.height() * len(lines)
             eid = n.entity.id
@@ -376,39 +408,99 @@ class MapView(QWidget):
             labelled += 1
             ai_labelled += is_ai
             alpha = STALE_ALPHA if n.stale else 255
-            color = _qcolor(ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"]).color, alpha)
+            tier = species_tier(sp, inferred)  # a species that is only remembered / unknown is drawn softer than a confirmed one
+            head_alpha = int(alpha * (SOFT_INFERRED if tier == SPECIES_INFERRED else SOFT_UNKNOWN if tier == SPECIES_UNKNOWN else 1.0))
+            color = _qcolor(peer_style(n.entity).color, head_alpha)
+            p.setPen(Qt.PenStyle.NoPen)  # a soft dark pill behind the text: readable on forest, rock and water alike
+            p.setBrush(LABEL_BG if alpha == 255 else LABEL_BG_STALE)
+            p.drawRoundedRect(QRectF(r[0] - 2.0, r[1] - 0.5, r[2] + 2.0, r[3] + 1.0), 3.0, 3.0)
             for i, text in enumerate(lines):
                 base = QPointF(r[0], r[1] + fm.ascent() + i * fm.height())
-                p.setPen(QColor(0, 0, 0, min(220, alpha)))
+                a = head_alpha if i == 0 else alpha
+                p.setPen(QColor(0, 0, 0, min(220, a)))
                 p.drawText(base + QPointF(1, 1), text)
                 p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
         self._label_slot = slots_now
         self._labelled = set(slots_now)
+        self._conf.keep_only({n.entity.id for n in near})
 
-    def _draw_entity_marker(self, p: QPainter, n: Nearby, pt: QPointF) -> None:
-        """Peer glyph: arrow when a heading is known, else a dot (diamond for ai); dim when stale.
-        Smaller and cyan, so it never looks like the red local arrow."""
-        st = ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"])
-        key = (n.entity.kind, n.stale)
+    def _has_bars(self, n: Nearby) -> bool:
+        e = n.entity
+        return bool(self.settings.show_vitals_bars and e.kind != "ai" and e.health_pct is not None and not n.stale)
+
+    def _bar_fill(self, pct: float) -> QColor:
+        step = int(max(0.0, min(100.0, pct)) // 5)
+        c = self._bar_colors.get(step)
+        if c is None:  # red -> amber -> green with the health left
+            f = step / 20.0
+            c = self._bar_colors[step] = QColor(int(235 * min(1.0, 2.0 * (1.0 - f)) + 20), int(215 * min(1.0, 2.0 * f) + 25), 60)
+        return c
+
+    def _draw_bars(self, p: QPainter, n: Nearby, pt: QPointF, rad: float) -> None:
+        """Health (and stamina when known) as thin bars under the dot: readable at a glance, no text to read."""
+        e = n.entity
+        w = max(14.0, 2.0 * rad + 6.0)
+        x, y = pt.x() - w / 2, pt.y() + rad + 3.0
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(BAR_TRACK)
+        p.drawRect(QRectF(x - 0.5, y - 0.5, w + 1.0, BAR_HP_H + 1.0))
+        p.setBrush(self._bar_fill(e.health_pct))
+        p.drawRect(QRectF(x, y, w * max(0.0, min(100.0, e.health_pct)) / 100.0, BAR_HP_H))
+        if e.stamina_pct is not None:
+            y2 = y + BAR_HP_H + 1.5
+            p.setBrush(BAR_TRACK)
+            p.drawRect(QRectF(x - 0.5, y2 - 0.5, w + 1.0, BAR_ST_H + 1.0))
+            p.setBrush(BAR_ST_FILL)
+            p.drawRect(QRectF(x, y2, w * max(0.0, min(100.0, e.stamina_pct)) / 100.0, BAR_ST_H))
+
+    def _draw_crowd_dot(self, p: QPainter, n: Nearby, pt: QPointF) -> None:
+        """A peer beyond the first CROWD_GLYPHS: a plain square in its colour (500 anti-aliased glyphs do not fit a frame)."""
+        key = ("crowd", peer_style(n.entity).color, n.stale)
+        if self._pen_key != key:
+            c = _qcolor(peer_style(n.entity).color, STALE_ALPHA if n.stale else 255)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            self._pen_key = key
+        p.drawRect(QRectF(pt.x() - 1.8, pt.y() - 1.8, 3.6, 3.6))
+
+    def _draw_entity_marker(self, p: QPainter, n: Nearby, pt: QPointF, decorate: bool = True) -> None:
+        """Peer glyph: a dot with a soft halo (so it reads on any map colour); an arrow only while the creature moves;
+        a diamond for server animals. Players have a white ring, dinosaurs are coloured by diet. Dim when stale."""
+        e = n.entity
+        st = peer_style(e)
+        player = e.kind == "player"
+        key = (st.color, n.stale, player)
         pb = self._marker_tools.get(key)
-        if pb is None:  # one pen/brush per (kind, stale): creating them per marker dominated the layer
+        if pb is None:  # one pen/brush per (colour, stale, player): creating them per marker dominated the layer
             alpha = STALE_ALPHA if n.stale else 255
-            pb = self._marker_tools[key] = (QPen(_qcolor(st.outline, min(230, alpha)), 1.5), _qcolor(st.color, alpha))
-        p.setPen(pb[0])
-        p.setBrush(pb[1])
-        if n.entity.heading is not None:
+            ring = QPen(QColor(255, 255, 255, min(235, alpha)), 1.6) if player else QPen(_qcolor(st.outline, min(230, alpha)), 1.5)
+            pb = self._marker_tools[key] = (ring, _qcolor(st.color, alpha))
+        rad = marker_radius(e)  # species size class (fish: fixed small), see geo.marker_radius
+        if decorate and e.kind != "ai":  # the halo is for the creatures that matter; a crowd of 500 does not get 500 discs
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(HALO_PLAYER if player else HALO)
+            p.drawEllipse(pt, rad + 2.6, rad + 2.6)
+            self._pen_key = None
+        if self._pen_key != key:  # a run of equal markers (a crowd) sets pen and brush once
+            p.setPen(pb[0])
+            p.setBrush(pb[1])
+            self._pen_key = key
+        if e.heading is not None:  # the source only gives a heading while the creature is moving (EntitySmoother.is_moving)
             p.save()
             p.translate(pt)
-            p.rotate(n.entity.heading)
-            k = PEER_ARROW_SCALE
+            p.rotate(e.heading)
+            k = PEER_ARROW_SCALE * rad / 4.0
             p.drawPolygon(QPolygonF([QPointF(0, -10 * k), QPointF(7 * k, 8 * k), QPointF(0, 4 * k), QPointF(-7 * k, 8 * k)]))
             p.restore()
         elif st.glyph == "diamond":
-            r = st.radius + 1
+            r = rad + 1
             p.drawPolygon(QPolygonF([pt + QPointF(0, -r), pt + QPointF(r, 0), pt + QPointF(0, r), pt + QPointF(-r, 0)]))
         else:
-            p.drawEllipse(pt, st.radius, st.radius)
+            p.drawEllipse(pt, rad, rad)
+        if decorate and self._has_bars(n):
+            self._draw_bars(p, n, pt, rad)
+            self._pen_key = None
 
     def _draw_edge_indicators(self, p: QPainter, offscreen: list[tuple[Nearby, QPointF]]) -> None:
         """In-radius players outside the minimap circle: a small pointer on the circle edge."""
@@ -420,7 +512,7 @@ class MapView(QWidget):
             a = edge_anchor(cx, cy, pt.x(), pt.y(), r)
             if a is None:
                 continue
-            st = ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"])
+            st = peer_style(n.entity)
             alpha = STALE_ALPHA if n.stale else 255
             p.save()
             p.translate(QPointF(*a))

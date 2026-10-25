@@ -65,6 +65,14 @@ class ClassCache:
         entry = self._entries.get(protocol_id)
         return entry["path"] if entry is not None else self._seed.get(protocol_id)
 
+    def source(self, protocol_id: int) -> str | None:
+        """"cache" (learned on this machine), "seed" (shipped with the app) or None: where ``lookup`` gets its answer."""
+        if protocol_id in self._blocked:
+            return None
+        if protocol_id in self._entries:
+            return "cache"
+        return "seed" if protocol_id in self._seed else None
+
     def __len__(self) -> int:
         return len(self._entries)
 

@@ -65,8 +65,8 @@ def test_smoother_ttl_stale_reappear_teleport():
     a = E("a", 0)
     s.update([PeerEntity(a, 0.0)], now=0.0)
     s.update([], now=3.0)  # a missed update does not drop it
-    ((e, x, y, age),) = s.items_aged(3.0)
-    assert e.id == "a" and age == 3.0 and age >= PEER_STALE_S
+    ((e, x, y, age, vitals_age),) = s.items_aged(3.0)
+    assert e.id == "a" and age == 3.0 and age >= PEER_STALE_S and vitals_age is None  # no reading, no age
     s.update([], now=4.9)
     assert len(s.items_aged(4.9)) == 1
     s.update([], now=5.0)
@@ -74,7 +74,7 @@ def test_smoother_ttl_stale_reappear_teleport():
     # reappearing inside the TTL resets the age without a position jump
     s.update([PeerEntity(E("b", 0), 10.0)], now=10.0)
     s.update([PeerEntity(E("b", 1000), 14.0)], now=14.0)
-    ((_, bx, _, age),) = s.items_aged(14.0)
+    ((_, bx, _, age, _),) = s.items_aged(14.0)
     assert bx == 0 and age == 0.0
     s.step(0.4)
     assert 500 < s.items()[0][1] < 700
@@ -104,14 +104,14 @@ def test_entity_heading_normalised():
 def test_labels_omit_unknown_fields_and_fall_back_to_the_id():
     n = visible_entities(items(E("12", 25_000, name="", health_pct=40.0)), 0, 0)[0]
     head, tail = entity_label_lines(n)
-    assert head == "12" and tail == "HP 40% 250 m E"  # geo falls back to the id; peers.from_record uses "Player #id"
+    assert head == "12 (?)" and tail == "HP 40% 250 m E"  # geo falls back to the id; the species is not known: "?"
     assert peer_label_lines(n) == [head, tail]
     detail = peer_label_lines(n, detail=True)
     assert detail[2] == "Health 40%" and len(detail) == 3
     bare = visible_entities(items(E("1", 10)), 0, 0)[0]
     assert peer_label_lines(bare, detail=True) == list(entity_label_lines(bare))  # no vitals: no detail line
     long = visible_entities(items(E("1", 10, name="X" * 40)), 0, 0)[0]
-    assert len(entity_label_lines(long)[0]) <= 16 and entity_label_lines(long)[0].endswith("…")
+    assert entity_label_lines(long)[0] == "X" * 15 + "… (?)"  # the name is cut to 16 characters; the species marker follows
 
 
 # ---- T10
@@ -219,9 +219,9 @@ def test_nearby_stale_threshold_follows_the_source():
 
 def test_peer_label_includes_known_vitals_only_in_order():
     n = visible_entities(items(E("1", 25_000, health_pct=92.4, growth_pct=40.0, z=13_000.0)), 0, 0)[0]
-    assert peer_label_lines(n, my_z=10_000.0) == ["P1", "HP 92% G 40% 250 m E +30m"]
+    assert peer_label_lines(n, my_z=10_000.0) == ["P1 (?)", "HP 92% G 40% 250 m E +30m"]
     n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
-    assert peer_label_lines(n) == ["P1", "G 40% 250 m E"]
+    assert peer_label_lines(n) == ["P1 (?)", "HP ? G 40% 250 m E"]  # a player whose health was never read says so
 
 
 def test_lead_cancels_the_filter_lag_behind_a_walking_actor():

@@ -13,9 +13,14 @@ import sys
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from functools import lru_cache
 from typing import Callable
 
+from .confidence import (
+    SPECIES_INFERRED, VITALS_STALE, age_tag, is_placeholder_name, species_tier, vitals_tier,
+)
 from .decode import normalize_degrees
+from .species import diet_of, size_class
 
 # ----------------------------------------------------------------- projection
 # Gateway map projection, identical to GatewayMapProjection.cs.
@@ -233,6 +238,7 @@ class Settings:
     peer_radius_m: float = 1000.0
     peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client); settings-file only
     show_vitals_detail: bool = False
+    show_vitals_bars: bool = True  # a thin health / stamina bar under the dot of a creature whose vitals are known
     show_players: bool = True
     show_ai: bool = True  # server-controlled animals (fish) from the game source; settings-file only, no tray item
     # automatic session recording (live capture only; see sessionlog.py). Settings-file only.
@@ -250,6 +256,7 @@ class Settings:
         ids = self.peer_self_ids if isinstance(self.peer_self_ids, (list, tuple, set)) else []
         self.peer_self_ids = sorted({c for c in (canonical_id(i) for i in ids) if c}, key=str)[:32]
         self.show_vitals_detail = bool(self.show_vitals_detail)
+        self.show_vitals_bars = bool(self.show_vitals_bars)
         self.show_players, self.show_ai = bool(self.show_players), bool(self.show_ai)
         self.record_sessions = bool(self.record_sessions)
         self.record_dir = self.record_dir.strip() if isinstance(self.record_dir, str) else ""
@@ -380,6 +387,7 @@ class Entity:
     thirst_pct: float | None = None
     heading: float | None = None  # map heading, degrees clockwise from north (like the local arrow); None = unknown
     inferred: bool = False  # the species comes from the saved class cache (the join tables were missed), not the server
+    vitals_t: float | None = None  # source clock time of the newest health / stamina reading (None: no timestamp)
 
     def __post_init__(self) -> None:
         h = self.heading
@@ -395,6 +403,7 @@ class Nearby:
     bearing: float
     age_s: float | None = None  # seconds since the source last reported it (None = not tracked)
     stale_s: float = PEER_STALE_S  # dimmed from this age on (the source decides, see GAME_PEER_STALE_S)
+    vitals_age_s: float | None = None  # seconds since its health / stamina were last read (None = no timestamp)
 
     @property
     def stale(self) -> bool:
@@ -413,15 +422,78 @@ class EntityStyle:
 ENTITY_STYLE = {
     "self": EntityStyle("#ff4040", "#000000", 10.0, "arrow"),  # local player: red, biggest, drawn last
     "player": EntityStyle("#4dd0ff", "#00141c", 4.0, "dot"),  # other players: cyan, smaller, outlined
-    "ai": EntityStyle("#ff8a3d", "#1c0e00", 5.0, "diamond"),
+    "ai": EntityStyle("#8fa6b3", "#0b1318", 5.0, "diamond"),  # server animals (fish): muted, they are background
 }
 # Entity kinds from the game source (species.py): "player" (a creature that references a PlayerState), "dino" (a
 # dinosaur class, controller unknown), "unknown" (no class information) are all "other players" for the toggles and
 # the style; "ai" is a server controlled animal. World objects ("other") never become entities.
 PLAYER_KINDS = ("player", "dino", "unknown")
 ENTITY_STYLE.update({k: ENTITY_STYLE["player"] for k in PLAYER_KINDS if k not in ENTITY_STYLE})
+# Dinosaurs (no PlayerState) are coloured by diet when the species is known; players stay cyan with a white ring, so
+# "a person" reads at a glance; a dinosaur whose species is not known is a neutral grey-blue.
+DIET_STYLE = {
+    "carnivore": EntityStyle("#ff7eb6", "#2a0a1a", 4.0, "dot"),
+    "herbivore": EntityStyle("#7bd88f", "#08200f", 4.0, "dot"),
+    "omnivore": EntityStyle("#ffd166", "#2a1c00", 4.0, "dot"),
+}
+NEUTRAL_DINO_STYLE = EntityStyle("#b8c4d6", "#10141a", 4.0, "dot")
+LEGEND_ENTRIES = (
+    ("You", ENTITY_STYLE["self"].color, "red arrow"),
+    ("Player", ENTITY_STYLE["player"].color, "cyan dot with a white ring"),
+    ("Carnivore", DIET_STYLE["carnivore"].color, "pink dot"),
+    ("Herbivore", DIET_STYLE["herbivore"].color, "green dot"),
+    ("Omnivore", DIET_STYLE["omnivore"].color, "yellow dot"),
+    ("Dinosaur, species not known", NEUTRAL_DINO_STYLE.color, "grey dot"),
+    ("Animal / fish", ENTITY_STYLE["ai"].color, "small grey diamond"),
+)
+
+
+@lru_cache(maxsize=256)
+def _peer_style(kind: str, species: str) -> EntityStyle:
+    if kind == "player" or kind == "ai":
+        return ENTITY_STYLE[kind]
+    return DIET_STYLE.get(diet_of(species)) or NEUTRAL_DINO_STYLE
+
+
+def peer_style(e: "Entity") -> EntityStyle:
+    """Colours of a peer: players cyan, other dinosaurs by diet (neutral without a species), server animals muted."""
+    return _peer_style(e.kind, e.species)
+
+
 STALE_ALPHA = 105  # 0-255 opacity of a stale (> PEER_STALE_S) peer
 PEER_ARROW_SCALE = 0.6  # peer arrow size relative to the local arrow
+
+# Dot radius (px) by species size class (species.size_class). Every radius is clamped to [DOT_MIN_PX, DOT_MAX_PX] so a
+# dot stays readable and never hides its neighbours. Server animals (fish) stay small whatever they are.
+SIZE_RADIUS_PX = {"tiny": 3.0, "small": 3.8, "medium": 4.6, "large": 5.6, "huge": 6.8}
+AI_RADIUS_PX = 3.5
+DOT_MIN_PX, DOT_MAX_PX = 2.5, 8.0
+JUVENILE_SCALE = 0.6  # a growth fraction (when known) scales the radius from this up to 1.0
+_BASE_ARROW_RADIUS_PX = 4.0  # the radius the PEER_ARROW_SCALE arrow was designed for
+
+
+@lru_cache(maxsize=512)
+def _radius(kind: str, species: str, growth_q: int | None) -> float:
+    if kind == "ai":
+        return AI_RADIUS_PX
+    r = SIZE_RADIUS_PX[size_class(species)]
+    if growth_q is not None:
+        r *= JUVENILE_SCALE + (1.0 - JUVENILE_SCALE) * growth_q / 20
+    return min(DOT_MAX_PX, max(DOT_MIN_PX, r))
+
+
+def marker_radius(e: Entity) -> float:
+    """Dot radius in px of a peer: from its species size class (fish: fixed small), scaled by growth when known."""
+    g = e.growth_pct
+    return _radius(e.kind, e.species, None if g is None or not math.isfinite(g) else round(min(100.0, max(0.0, g)) / 5))
+
+
+def marker_extent(e: Entity) -> float:
+    """How far from its centre a peer glyph reaches, px (an arrow is longer than its dot radius)."""
+    r = marker_radius(e)
+    if e.heading is not None:
+        return 10 * PEER_ARROW_SCALE * r / _BASE_ARROW_RADIUS_PX
+    return r + 1 if e.kind == "ai" else r
 
 
 def canonical_id(raw) -> str:
@@ -540,13 +612,14 @@ def visible_entities(items, px: float, py: float, radius_m: float | None = None,
     for item in items:
         e, x, y = item[0], item[1], item[2]
         age = item[3] if len(item) > 3 else None
+        vitals_age = item[4] if len(item) > 4 else None
         if canonical_id(e.id) in ids:
             continue
         if (e.kind in PLAYER_KINDS and not show_players) or (e.kind == "ai" and not show_ai):
             continue
         if age is not None and ttl_s is not None and age >= ttl_s:
             continue
-        n = Nearby(e, x, y, distance_m(px, py, x, y), bearing_deg(px, py, x, y), age, stale_s)
+        n = Nearby(e, x, y, distance_m(px, py, x, y), bearing_deg(px, py, x, y), age, stale_s, vitals_age)
         d = distance_3d_m(n, my_z) if use_3d else n.distance_m
         if radius_m is not None and (d >= radius_m if use_3d else d > radius_m):
             continue
@@ -562,22 +635,34 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
                             self_ids=self_ids, me_id=me.id, my_z=me.z, use_3d=True)
 
 
-def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None) -> tuple[str, str]:
-    """(head, tail) of the minimap label. Only what is known is printed: name (or id) and species on the head;
-    the tail holds the known vitals ("HP 92%", "ST 40%", "G 40%"), then distance, compass bearing and height difference.
-    Unknown fields are omitted, never shown as a placeholder."""
+def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
+                       vitals: str | None = None) -> tuple[str, str]:
+    """(head, tail) of the minimap label, worded by how sure each field is (``confidence``): a confirmed species is
+    plain, one remembered from an earlier session carries "~", an unknown one is "?". A player name is only printed
+    when the creature referenced its PlayerState. The tail holds health and stamina ("HP 86% ST 33%", "HP ?" when no
+    reading was ever seen, a coarse age such as "20s+" when the reading is old), then distance, compass bearing and height
+    difference. Growth, hunger and thirst of other creatures are not replicated to us: never printed, not even as "?".
+    ``vitals``: the vitals tier to print (the map view passes the one it settled); None works it out from the age."""
     e, dz = n.entity, height_delta_m(n, my_z)
-    mark = "~" if e.inferred else ""
+    mark = "~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else ""
     name = e.name or e.id
-    if e.species and name.startswith(PLACEHOLDER_NAME):  # no player name known: the species is the best name there is
+    if not is_placeholder_name(name):
+        head = truncate(name, name_max) + (f" ({truncate(e.species, 14)}{mark})" if e.species else " (?)")
+    elif e.species:  # no player name known: the species is the best name there is
         head = truncate(e.species, name_max) + mark
     else:
-        head = truncate(name, name_max) + (f" ({truncate(e.species, 14)}{mark})" if e.species else "")
+        word = "Animal" if e.kind == "ai" else "Dino" if e.kind in ("dino", "player") else "Creature"
+        head = f"{word} ? #{e.id}"
+    tier = vitals or vitals_tier(e.health_pct, e.stamina_pct, n.vitals_age_s)
     parts = []
     if e.health_pct is not None:
         parts.append(f"HP {e.health_pct:.0f}%")
+    elif e.kind in PLAYER_KINDS:
+        parts.append("HP ?")
     if e.stamina_pct is not None:
         parts.append(f"ST {e.stamina_pct:.0f}%")
+    if tier == VITALS_STALE and (e.health_pct is not None or e.stamina_pct is not None):
+        parts.append(f"[{age_tag(n.vitals_age_s)}]")
     if e.growth_pct is not None:
         parts.append(f"G {e.growth_pct:.0f}%")
     parts += [format_distance(n.distance_m), compass_label(n.bearing)]
@@ -586,7 +671,6 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None)
     return head, " ".join(parts)
 
 
-PLACEHOLDER_NAME = "Actor #"  # peers.GamePeerSource name of a creature whose player name is not known
 LABEL_RANK = {"player": 0, "dino": 1, "unknown": 2, "ai": 3}  # who gets a label first when the minimap is crowded
 LABELS_MINIMAP, LABELS_FULL = 8, 24
 AI_LABELS_MINIMAP, AI_LABELS_FULL = 3, 8  # fish and other server animals must never use up the labels of players
@@ -614,9 +698,9 @@ def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) ->
     return total, ai
 
 
-def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False) -> list[str]:
+def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False, vitals: str | None = None) -> list[str]:
     """Minimap label: ``entity_label_lines`` plus, with ``detail``, the known vitals (``vital_lines``)."""
-    lines = list(entity_label_lines(n, my_z=my_z))
+    lines = list(entity_label_lines(n, my_z=my_z, vitals=vitals))
     if detail and (v := vital_lines(n.entity)):
         lines.append(truncate("  ".join(v), 44))
     return lines
@@ -698,6 +782,8 @@ def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bo
 # waits for the next sample trails reality by up to one send interval. Between samples the target is advanced along
 # the velocity of the last two distinct samples, never further than the interval it was measured over (the next
 # sample is due then) and never beyond DR_MAX_EXTRAP_S, so a stop is overshot by less than one interval of motion.
+MOVING_MIN_SPEED_CM_S = 30.0  # below this a creature counts as standing (a drifting fix, not a step)
+MOVING_HOLD_S = 0.7  # the arrow outlives the dead-reckoning horizon a little, so it does not blink between 3 Hz fixes
 DR_MIN_DT_S = 0.05  # samples closer than this give a noisy velocity; the old velocity is kept
 DR_MAX_INTERVAL_S = 3.0  # samples further apart are not one continuous movement: no velocity
 DR_MAX_EXTRAP_S = 1.0
@@ -722,6 +808,7 @@ class EntitySmoother:
         # packet). A number: the source is authoritative (the game feed removes a creature when the server destroys it),
         # so a missing id leaves after this many seconds.
         self.missing_grace_s: float | None = None
+        self.heading_only_when_moving = False  # the source's heading is the direction of travel: no arrow for a creature at rest
         self._missing: dict[str, float] = {}  # id -> time it was first absent from an update
         self._born: dict[str, int] = {}  # id -> serial of the source's entry: a new one is a different creature (reused id)
         self.entities: dict[str, Entity] = {}
@@ -850,20 +937,31 @@ class EntitySmoother:
             if h is not None and e.heading is not None:
                 self.heading[eid] = (h + shortest_arc(h, e.heading) * a) % 360.0
 
-    def _shown(self, eid: str, e: Entity) -> Entity:
+    def is_moving(self, eid: str, now: float) -> bool:
+        """The creature was measured moving and the dot is still being carried along that movement. A creature that
+        stands still is not re-sent by the server, so this is about time since its last position, not about a flag."""
+        v, s = self._vel.get(eid), self._sample.get(eid)
+        if v is None or s is None or math.hypot(v[0], v[1]) < MOVING_MIN_SPEED_CM_S:
+            return False
+        return max(now - s[2], 0.0) <= v[2] + DR_FF_GRACE_S + MOVING_HOLD_S
+
+    def _shown(self, eid: str, e: Entity, now: float | None = None) -> Entity:
         h = self.heading.get(eid)
+        if e.heading is not None and self.heading_only_when_moving and now is not None and not self.is_moving(eid, now):
+            return replace(e, heading=None)  # a heading measured from movement says nothing once the creature has stopped
         return e if h is None or e.heading is None else replace(e, heading=h)
 
     def items(self):
         return [(e, *self.pos[eid]) for eid, e in self.entities.items()]
 
     def items_aged(self, now: float):
-        """[(Entity with smoothed heading, x, y, age_s)] for ids younger than the TTL."""
+        """[(Entity with smoothed heading, x, y, age_s, vitals_age_s)] for ids younger than the TTL."""
         out = []
         for eid, e in self.entities.items():
             age = max(now - self.last_seen.get(eid, now), 0.0)
             if age < self.ttl:
-                out.append((self._shown(eid, e), *self.pos[eid], age))
+                vitals_age = None if e.vitals_t is None else max(now - e.vitals_t, 0.0)
+                out.append((self._shown(eid, e, now), *self.pos[eid], age, vitals_age))
         return out
 
 

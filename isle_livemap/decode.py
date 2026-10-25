@@ -898,12 +898,28 @@ class IdentityTracker:
         began after the join (the server sends those tables once; a later class only exports its own archetype)."""
         return self.table_classes * 10 <= self.creations
 
-    def is_inferred(self, handle: int) -> bool:
-        """True when the class of ``handle`` comes from the saved class cache, not from this connection's tables."""
+    def species_source(self, handle: int) -> str | None:
+        """Where the class / species of actor ``handle`` comes from: "table" (this connection's export tables, the only
+        confirmed one), "cache" (saved class cache) or "seed" (shipped with the app) by protocol id, "asset" (the dinosaur
+        assets named in its creation records), None when nothing is known."""
         info = self.actors.get(handle)
-        if info is None or info.archetype_handle is None or self.class_cache is None:
-            return False
-        return self.object_path(info.archetype_handle) is None and self.class_cache.lookup(info.protocol_id) is not None
+        if info is None:
+            return None
+        if self.object_path(info.archetype_handle if info.archetype_handle is not None else handle) is not None:
+            return "table"
+        if info.archetype_handle is None:
+            return None
+        if self.class_cache is not None:
+            source = self.class_cache.source(info.protocol_id)
+            if source is not None:
+                return source
+        return "asset" if self.archetype_species(info.archetype_handle) or info.asset_species else None
+
+    def is_inferred(self, handle: int) -> bool:
+        """True when the species of ``handle`` comes from the saved class cache or the shipped seed, not from this
+        connection. A species deduced from the creature's own creation-record assets ("asset") is wire evidence of this
+        connection and is not marked; ``species_source`` still tells the two apart for the logs and the report."""
+        return self.species_source(handle) in ("cache", "seed")
 
     def archetype_species(self, archetype: int | None) -> str | None:
         """Species of an archetype whose class path was never exported, from the dinosaur assets that accompany the
@@ -1430,6 +1446,55 @@ def attribute_slots(bits: Bits, batch: IrisBatch) -> list[tuple[int, float]]:
     return found
 
 
+# ---------------------------------------------------------------- maxHealth in the creation record
+#
+# The creation record of a creature carries its initial attribute state, not as the 66-bit slots of the state batches
+# but as floats 34 bits apart (value + two flag bits). The derived maxima are among them, and they have a shape no
+# other data has: maxHealth twice in a row and maxHealth / 2 four times in a row (402662: 2606.108, 2606.108, 1303.054
+# x4 at bits 3304..3474; its first block 50 s later said 2620.49, the creature had grown). Health itself and the
+# stamina maxima are NOT in it, nor are growth, hunger and thirst. Seen in every pawn creation of the recorded
+# sessions (Allosaurus, Deinosuchus and the class of protocol 536511885); the layout around it is class specific
+# (the M pair and the M/2 quadruple may be far apart), so the two are searched for separately.
+
+_CREATION_FLOAT_STRIDE = 34
+_CREATION_MIN_BITS = 1500
+_CREATION_MAX_RUN = 4
+
+
+def creation_max_health(bits: Bits, batch: IrisBatch) -> float | None:
+    """maxHealth read from a creation record (None when it does not carry the maxHealth pair and the half quadruple)."""
+    n = batch.data_bit_count
+    if n < _CREATION_MIN_BITS or batch_kind(bits, batch) != KIND_CREATION:
+        return None
+    stride = _CREATION_FLOAT_STRIDE
+    chunk = (bits.big >> batch.data_bit_offset) & mask(n)
+    raw: list[int] = []
+    x = chunk
+    for _ in range(n - 31):
+        raw.append(x & 0xFFFFFFFF)
+        x >>= 1
+    span = stride * (_CREATION_MAX_RUN - 1)
+    pairs: dict[int, int] = {}  # raw float -> first offset of two equal floats `stride` apart
+    quads: list[int] = []  # offsets of four equal floats `stride` apart
+    for r in range(len(raw) - span):
+        v = raw[r]
+        if v == 0:
+            continue
+        if raw[r + stride] == v:
+            pairs.setdefault(v, r)
+            if raw[r + 2 * stride] == v and raw[r + 3 * stride] == v:
+                quads.append(r)
+    for r in quads:
+        half = f32(raw[r])
+        if not math.isfinite(half) or not _MIN_VITAL_MAX / 2 <= half <= 500_000.0:
+            continue
+        for value in pairs:
+            full = f32(value)
+            if math.isfinite(full) and _close(full, 2.0 * half):
+                return full
+    return None
+
+
 @dataclass(slots=True)
 class PawnVitals:
     net_ref_handle: int
@@ -1438,6 +1503,7 @@ class PawnVitals:
     stamina: float | None = None
     max_stamina: float | None = None
     verified: bool = False  # a full block was seen: the maxima are real
+    max_from_creation: bool = False  # max_health is the creation record's: it may be a little low for a growing creature
 
     @property
     def health_pct(self) -> float | None:
@@ -1474,20 +1540,35 @@ class PawnVitalsTracker:
         self._pawns: dict[int, PawnVitals] = {}
         self._trusted: dict[int, set[int]] = {}  # batch header -> offsets of a confirmed health slot
         self._votes: Counter = Counter()
+        self._pending: dict[int, tuple[int, int, float]] = {}  # handle -> (header, offset, health) awaiting a second sighting
         self.blocks = 0
         self.followed = 0
+        self.seeded = 0
 
     def reset(self) -> None:
         self._pawns.clear()
         self._trusted.clear()
         self._votes.clear()
-        self.blocks = self.followed = 0
+        self._pending.clear()
+        self.blocks = self.followed = self.seeded = 0
 
     def forget(self, handle: int) -> None:
         self._pawns.pop(handle, None)
+        self._pending.pop(handle, None)
 
     def get(self, handle: int) -> PawnVitals | None:
         return self._pawns.get(handle)
+
+    def note_creation(self, handle: int, max_health: float | None) -> None:
+        """A creature's creation record carried its maxHealth: a pawn that never sends a full block can still get a
+        percentage. Health is not in the record; it is taken from the first pair that is confirmed (see ``_bootstrap``)."""
+        if max_health is None or max_health < _MIN_VITAL_MAX:
+            return
+        pawn = self._pawns.get(handle)
+        if pawn is not None and pawn.verified:
+            return
+        pawn = self._pawns[handle] = PawnVitals(handle, max_health=max_health, max_from_creation=True)
+        self._pending.pop(handle, None)
 
     def update(self, bits: Bits, batch: IrisBatch) -> PawnVitals | None:
         """The pawn's vitals if this batch changed them, else None."""
@@ -1501,7 +1582,7 @@ class PawnVitalsTracker:
             if block is not None:
                 pawn = self._pawns.setdefault(handle, PawnVitals(handle))
                 pawn.health, pawn.max_health, pawn.stamina, pawn.max_stamina = block.health, block.max_health, block.stamina, block.max_stamina
-                pawn.verified = True
+                pawn.verified, pawn.max_from_creation = True, False
                 self.blocks += 1
                 return pawn
         slots = dict(attribute_slots(bits, batch))
@@ -1512,20 +1593,46 @@ class PawnVitalsTracker:
             if full is not None:
                 pawn = self._pawns.setdefault(handle, PawnVitals(handle))
                 pawn.health, pawn.max_health, pawn.stamina = full
-                pawn.verified = True
+                pawn.verified, pawn.max_from_creation = True, False
                 self.blocks += 1
                 return pawn
-        if pawn is None or not pawn.verified or pawn.health is None or not pawn.max_health:
+        if pawn is None or not pawn.max_health or not (pawn.verified or pawn.max_from_creation):
             return None
+        if pawn.health is None:
+            return self._bootstrap(bits, batch, pawn, slots)
         return self._follow(bits, batch, pawn, slots)
+
+    def _bootstrap(self, bits: Bits, batch: IrisBatch, pawn: PawnVitals, slots: dict[int, float]) -> PawnVitals | None:
+        """First health of a pawn whose maxHealth came from its creation record: a health + stamina pair (66 bits apart)
+        with health inside (2 %, 105 %] of the maximum, seen at the same place of the same batch layout twice with a
+        health that moved less than 10 % of the maximum in between, or at an offset already confirmed on another pawn."""
+        max_h, handle = pawn.max_health, pawn.net_ref_handle
+        header = bits.read(batch.data_bit_offset, ACTOR_STATE_HEADER_BITS)
+        trusted = self._trusted.get(header, ())
+        for rel, health in slots.items():
+            stamina = slots.get(rel + _SLOT_BITS)
+            if stamina is None or not 0.02 * max_h <= health <= 1.05 * max_h or not _MIN_VITAL_MAX <= stamina <= 100_000.0:
+                continue
+            pend = self._pending.get(handle)
+            if rel in trusted or (pend is not None and pend[:2] == (header, rel) and abs(pend[2] - health) <= _FOLLOW_HEALTH_TOL * max_h):
+                self._pending.pop(handle, None)
+                self._trusted.setdefault(header, set()).add(rel)  # two consistent sightings are what ``_follow`` asks for too
+                pawn.health, pawn.stamina = health, stamina
+                self.seeded += 1
+                return pawn
+            self._pending[handle] = (header, rel, health)
+            return None
+        return None
 
     def _follow(self, bits: Bits, batch: IrisBatch, pawn: PawnVitals, slots: dict[int, float]) -> PawnVitals | None:
         header = bits.read(batch.data_bit_offset, ACTOR_STATE_HEADER_BITS)
         max_h, max_s = pawn.max_health, pawn.max_stamina
         trusted = self._trusted.get(header, ())
 
+        slack = 1.2 if pawn.max_from_creation else 1.001  # a growing creature passes the maximum its creation record gave
+
         def plausible_health(v: float) -> bool:
-            return v <= max_h * 1.001
+            return v <= max_h * slack
 
         def plausible_stamina(v: float) -> bool:
             return max_s is None or v <= max_s * 1.001
@@ -1557,6 +1664,8 @@ class PawnVitalsTracker:
             if self._votes[(header, rel)] >= _FOLLOW_TRUST_VOTES:
                 self._trusted.setdefault(header, set()).add(rel)
         pawn.health = health
+        if pawn.max_from_creation and health > pawn.max_health:
+            pawn.max_health = health
         if stamina is not None:
             pawn.stamina = stamina
         self.followed += 1

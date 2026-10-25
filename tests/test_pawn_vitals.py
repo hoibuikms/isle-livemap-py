@@ -186,4 +186,5 @@ def test_label_tail_carries_health_and_stamina():
     head, tail = entity_label_lines(Nearby(e, 0.0, 0.0, 100.0, 90.0))
     assert head == "Allosaurus" and tail.startswith("HP 86% ST 33% ")
     bare = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0)
-    assert "HP" not in entity_label_lines(Nearby(bare, 0.0, 0.0, 100.0, 90.0))[1]
+    tail = entity_label_lines(Nearby(bare, 0.0, 0.0, 100.0, 90.0))[1]
+    assert tail.startswith("HP ? ") and "ST" not in tail  # never read: said so, not guessed

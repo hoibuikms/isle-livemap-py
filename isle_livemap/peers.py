@@ -23,12 +23,15 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Protocol
 
 from .geo import (
-    GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, bearing_deg, canonical_id, is_self, vital_pct,
+    GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, bearing_deg, canonical_id, compass_label,
+    distance_m, is_self, vital_pct,
 )
+from .confidence import is_placeholder_name, species_tier, vitals_tier
 from .nearby import _cm
 
 __all__ = [
@@ -371,6 +374,7 @@ class GamePeerSource:
     ``_heading``). NOT decoded: growth, hunger, thirst."""
 
     STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim)
+    heading_from_movement = True  # read by the overlay: the heading is the direction of travel, so no arrow while at rest
     # Silence limit before a peer is dropped when no destruction record came. Creatures rest for minutes without
     # a single report (captured gaps of 100-300 s), so they stay until the server destroys them; the limit only
     # guards against a missed destruction record. Server animals (fish) are numerous and uninteresting: shorter.
@@ -429,7 +433,12 @@ class GamePeerSource:
         self.identity = IdentityTracker(class_cache)
         self.locator = ActorLocationTracker()
         self.pawn_vitals = PawnVitalsTracker()
+        self._clock = clock
         self._vitals: dict[int, object] = {}  # handle -> decode.PawnVitals (health / stamina percentages, see decode)
+        self._vitals_t: dict[int, float] = {}  # handle -> source clock time of its newest health / stamina reading
+        self._corrected: set[int] = set()  # handles whose label was already corrected once (logged once)
+        self._events: deque[str] = deque(maxlen=64)  # label corrections for the session log (see drain_events)
+        self._conflicts_seen = 0  # class cache entries dropped so far that were already reported
         self._layouts: dict[int, list] = {}  # unclassified handle -> [state batches of the animal size, all state batches, latched]
         self._anchors: dict[int, tuple[float, float]] = {}  # handle -> position the travel direction is measured from
         self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
@@ -483,6 +492,8 @@ class GamePeerSource:
         self.locator.reset()
         self.pawn_vitals.reset()
         self._vitals.clear()
+        self._vitals_t.clear()
+        self._corrected.clear()
         self._layouts.clear()
         self._anchors.clear()
         self._profile.clear()
@@ -607,10 +618,44 @@ class GamePeerSource:
         eid = str(handle)
         old = self.store.get(eid)
         vit = self._vitals.get(handle)
+        inferred = bool(species) and self.identity.is_inferred(handle)
+        self._note_identity(handle, old, species, inferred)
         self.store.update(Entity(
             eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
             health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
-            heading=self._heading(handle, x, y, old.heading if old else None), inferred=bool(species) and self.identity.is_inferred(handle)))
+            heading=self._heading(handle, x, y, old.heading if old else None), inferred=inferred,
+            vitals_t=self._vitals_t.get(handle)))
+
+    def _note_identity(self, handle: int, old: Entity | None, species: str, inferred: bool) -> None:
+        """A species remembered from an earlier session that the server's tables later contradict (or that was dropped
+        from the class cache) changes the label; that is logged once per creature, in the session log and here."""
+        if old is None or handle in self._corrected or not (old.inferred and old.species):
+            return
+        if species and not inferred and species != old.species:
+            text = f"{old.species}~ (remembered class) -> {species} (server tables)"
+        elif not species:
+            text = f"{old.species}~ (remembered class) -> unknown (the class cache entry was dropped)"
+        else:
+            return
+        self._corrected.add(handle)
+        self._events.append(f"label corrected: handle {handle}: {text}")
+        log.info("label corrected: handle %s: %s", handle, text)
+
+    def drain_events(self) -> list[str]:
+        """Label corrections (and class cache drops) since the last call, for the session log."""
+        out = []
+        while self._events:
+            try:
+                out.append(self._events.popleft())
+            except IndexError:
+                break
+        cache = self.class_cache
+        dropped = getattr(cache, "conflicts", 0)
+        if dropped > self._conflicts_seen:
+            out.append(f"class cache: {dropped - self._conflicts_seen} remembered class(es) dropped after the server tables "
+                       f"named something else ({dropped} in total)")
+            self._conflicts_seen = dropped
+        return out
 
     def _drop(self, handle: int) -> None:
         if handle in self._past_own:  # the server removed the old body; the handle may be reused
@@ -621,6 +666,8 @@ class GamePeerSource:
         self.locator.forget(handle)
         self.pawn_vitals.forget(handle)
         self._vitals.pop(handle, None)
+        self._vitals_t.pop(handle, None)
+        self._corrected.discard(handle)
         self._layouts.pop(handle, None)
         self._anchors.pop(handle, None)
         self._profile.pop(handle, None)
@@ -638,7 +685,7 @@ class GamePeerSource:
 
     def _on_inbound(self, d, own_handle: int | None = None) -> None:
         from . import species as sp
-        from .decode import Bits, batch_kind, count_batches, parse_iris_packet, KIND_STATE
+        from .decode import Bits, batch_kind, count_batches, creation_max_health, parse_iris_packet, KIND_CREATION, KIND_STATE
 
         self.packets += 1
         self._last_t = d.observed_at
@@ -670,6 +717,8 @@ class GamePeerSource:
             self.store.remove(str(handle))  # a reused handle is a new actor
             self.pawn_vitals.forget(handle)
             self._vitals.pop(handle, None)
+            self._vitals_t.pop(handle, None)
+            self._corrected.discard(handle)
             self._layouts.pop(handle, None)
             self._anchors.pop(handle, None)
             self._profile.pop(handle, None)
@@ -686,7 +735,12 @@ class GamePeerSource:
             if kind == sp.KIND_OTHER:
                 self.filtered_world_objects += 1
                 continue
-            if batch_kind(bits, batch) != KIND_STATE:
+            bkind = batch_kind(bits, batch)
+            if bkind == KIND_CREATION:
+                if kind != sp.KIND_AI:
+                    self.pawn_vitals.note_creation(handle, creation_max_health(bits, batch))
+                continue
+            if bkind != KIND_STATE:
                 continue
             if kind == sp.KIND_UNKNOWN and self._animal_layout(handle, batch.data_bit_count):
                 kind = sp.KIND_AI
@@ -695,6 +749,7 @@ class GamePeerSource:
                 vit = self.pawn_vitals.update(bits, batch)
                 if vit is not None:
                     self._vitals[handle] = vit
+                    self._vitals_t[handle] = self._clock()
                     self.vitals_blocks = self.pawn_vitals.blocks
             loc = self.locator.update(bits, batch, t, learn=kind in (sp.KIND_DINO, sp.KIND_PLAYER, sp.KIND_AI))
             if (loc is None and kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS
@@ -710,7 +765,14 @@ class GamePeerSource:
             else:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
                 # on the map at its last position instead of letting the TTL remove it.
-                self.store.update(replace(old, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct) if vit is not None else old)
+                upd = old
+                inferred = bool(species) and self.identity.is_inferred(handle)
+                if species and (not old.species or (old.inferred and not inferred)) and (species, inferred) != (old.species, old.inferred):
+                    self._note_identity(handle, old, species, inferred)  # tables arrived later: the label gets the better species
+                    upd = replace(upd, species=species, inferred=inferred)
+                if vit is not None:
+                    upd = replace(upd, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct, vitals_t=self._vitals_t.get(handle))
+                self.store.update(upd)
 
     # -- PeerSource --------------------------------------------------------
     def status(self) -> str:
@@ -774,6 +836,69 @@ class GamePeerSource:
                 f"(layouts {self.locator.trusted_layouts}) | vitals blocks={self.vitals_blocks} | "
                 f"world-object batches skipped={self.filtered_world_objects} | actors with class path="
                 f"{self.identity_resolved()}/{len(self.identity.actors)} player names={len(self.identity.player_names)}")
+
+    # -- what the labels say (session log, tools/label_report.py) -------------------------------------------------
+    LABELS_LISTED = 12  # creatures spelled out in one "labels:" line, nearest first; the rest is counted
+
+    def label_rows(self) -> list[dict]:
+        """One dict per creature on the map (fish included), nearest first: the facts a label is made of, with the
+        confidence of each (``confidence``) and where the species came from. Safe to call from the log thread."""
+        now = self._clock()
+        own = self._own_position()
+        rows = []
+        for p in self.store.entities():
+            e = p.entity
+            try:
+                handle = int(e.id)
+            except ValueError:
+                continue
+            source = self.identity.species_source(handle) if e.species else None
+            age = None if e.vitals_t is None else max(now - e.vitals_t, 0.0)
+            dist = bearing = None
+            if own is not None:
+                dist, bearing = distance_m(own[0], own[1], e.x, e.y), bearing_deg(own[0], own[1], e.x, e.y)
+            rows.append({
+                "handle": handle, "kind": e.kind, "species": e.species, "species_tier": species_tier(e.species, e.inferred),
+                "source": source or "", "name": "" if is_placeholder_name(e.name) else e.name,
+                "hp": e.health_pct, "st": e.stamina_pct, "vitals_age_s": age,
+                "vitals": vitals_tier(e.health_pct, e.stamina_pct, age), "distance_m": dist, "bearing": bearing,
+            })
+        rows.sort(key=lambda r: (r["distance_m"] is None, r["distance_m"] or 0.0, r["handle"]))
+        return rows
+
+    def labels_signature(self) -> frozenset:
+        """What the labels claim, without the values that change all the time: the "labels:" log line is written when
+        this changes (a species gets confirmed, a name is linked, the first health reading arrives)."""
+        return frozenset((r["handle"], r["kind"], r["species"], r["species_tier"], bool(r["name"]), r["hp"] is not None)
+                         for r in self.label_rows() if r["kind"] != "ai")
+
+    def labels_line(self) -> str:
+        """Compact "labels:" line: the creatures that are not fish, nearest first, each with the confidence of what the
+        minimap says about it. Names are the game's player names (they are on the minimap too)."""
+        rows = self.label_rows()
+        fish = sum(1 for r in rows if r["kind"] == "ai")
+        shown = [r for r in rows if r["kind"] != "ai"]
+        parts = []
+        for r in shown[: self.LABELS_LISTED]:
+            sp = (r["species"] + ("~" if r["species_tier"] == "inferred" else "")) if r["species"] else "?"
+            if r["source"]:
+                sp += f"[{r['source']}]"
+            bits = [str(r["handle"]), r["kind"], sp]
+            if r["name"]:
+                bits.append(f'"{r["name"]}"')
+            if r["hp"] is None:
+                bits.append("HP?")
+            else:
+                bits.append(f"HP{r['hp']:.0f}")
+            if r["st"] is not None:
+                bits.append(f"ST{r['st']:.0f}")
+            if r["vitals"] == "stale" and r["vitals_age_s"] is not None:
+                bits.append(f"({r['vitals_age_s']:.0f}s old)")
+            if r["distance_m"] is not None:
+                bits.append(f"{r['distance_m']:.0f}m{compass_label(r['bearing'])}")
+            parts.append(" ".join(bits))
+        more = f" +{len(shown) - self.LABELS_LISTED} more" if len(shown) > self.LABELS_LISTED else ""
+        return f"labels: creatures={len(shown)} fish={fish} | " + (" | ".join(parts) or "none") + more
 
     def snapshot(self) -> PeerSnapshot:
         return self.store.snapshot(self.status(), True)
