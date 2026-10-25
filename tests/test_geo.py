@@ -244,3 +244,39 @@ def test_bundled_zones_counts():
         for zone in z[layer]:
             assert len(zone["points"]) >= 3
             assert all(0 <= a <= 1 and 0 <= b <= 1 for a, b in zone["points"])
+
+
+def _walk_own(dead_reckon, interval=0.144, speed=800.0):
+    it, t, nxt, err, n = Interpolator(tau_s=0.09), 0.0, 0.0, 0.0, 0
+    while t < 6.0:
+        if t >= nxt:
+            nxt += interval
+            it.set_target(speed * t, 0, 0, t) if dead_reckon else it.set_target(speed * t, 0, 0)
+        it.step(1 / 60, t) if dead_reckon else it.step(1 / 60)
+        if t > 2.0:
+            err += speed * t - it.x
+            n += 1
+        t += 1 / 60
+    return err / n
+
+
+def test_own_marker_dead_reckons_between_telemetry_samples():
+    assert _walk_own(False) > 80.0  # sits a send interval + tau behind (8 m/s, ~7 Hz)
+    assert abs(_walk_own(True)) < 20.0
+
+
+def test_own_marker_dead_reckoning_stops_at_the_horizon_and_on_teleport():
+    it = Interpolator(tau_s=0.09)
+    it.set_target(0, 0, 0, 0.0)
+    it.set_target(100, 0, 0, 0.2)  # 500 cm/s
+    for i in range(600):
+        it.step(1 / 60, 0.2 + i / 60)
+    assert it.x == pytest.approx(200.0, abs=1.0)  # 0.2 s horizon, never beyond
+    it.set_target(100, 0, 0, 20.0)  # long silence, then the same spot: velocity dropped
+    it.set_target(100, 0, 0, 20.3)
+    for i in range(120):
+        it.step(1 / 60, 20.3 + i / 60)
+    assert it.x == pytest.approx(100.0, abs=1.0)
+    it.set_target(900_000, 0, 0, 21.0)  # teleport snaps, no velocity from it
+    it.step(1 / 60, 21.0)
+    assert it.x == pytest.approx(900_000, abs=1.0)

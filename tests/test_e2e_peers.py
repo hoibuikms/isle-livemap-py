@@ -148,7 +148,7 @@ def test_default_game_peers_through_real_main_draw_dots_at_their_decoded_positio
     assert set(near) == NEAR_IDS
     for n in near.values():
         assert 700 < n.distance_m < 1000 and 330 < n.bearing < 345  # all roughly NNW of the local player
-        assert n.entity.name.startswith("Actor #") and n.entity.health_pct is None and n.entity.heading is None
+        assert n.entity.name.startswith("Unknown #") and n.entity.health_pct is None and n.entity.heading is None
 
     # rendering: a cyan dot sits at the projected position of every in-view actor (same projection as the arrow)
     cx, cy = screen_of(app.view, pos.x, pos.y)

@@ -495,3 +495,52 @@ def test_heartbeat_with_an_extra_slot_is_recognised_and_locks_the_own_handle(joi
     assert vt.self_handle is None
     vt.track(extra2["payload"], extra2["t"])
     assert vt.self_handle == 85864
+
+
+# ---------------------------------------------------------------- PlayerState reference variants
+def _ref_batch(handle, filler, nbytes=3, lead=100):
+    """A synthetic pawn record: noise, the reference marker, 28 filler bits, then byte count - 1 and the handle."""
+    w = BitWriter()
+    w.write(0, lead)
+    w.write(0b10100011, 8)
+    w.write(filler, 28)
+    w.write(nbytes - 1, 3)
+    w.write(handle, nbytes * 8)
+    w.write(0, 40)
+    return Bits(w.to_bytes()), IrisBatch(1, 0, w.nbits, False, False)
+
+
+@pytest.mark.parametrize("filler", [0x0000001, 0xA000001, 0x4000001, 0x8000000])
+def test_player_state_reference_does_not_depend_on_the_bits_before_the_count(filler):
+    tr = IdentityTracker()
+    bits, batch = _ref_batch(179074, filler)
+    assert tr._reference_candidates(bits, batch, 0) == (179074,)  # noqa: SLF001
+
+
+def test_player_state_reference_two_byte_handle_and_non_canonical_width_rejected():
+    tr = IdentityTracker()
+    assert tr._reference_candidates(*_ref_batch(36450, 5, nbytes=2), 0) == (36450,)  # noqa: SLF001
+    assert tr._reference_candidates(*_ref_batch(36450, 5, nbytes=3), 0) == ()  # noqa: SLF001 - padded, not a handle
+
+
+def test_pawn_links_to_a_player_state_that_arrives_after_it():
+    tr = IdentityTracker()
+    from isle_livemap.decode import ActorInfo
+    info = tr.actors[500] = ActorInfo(500, None, None, 0)
+    info.ref_candidates = (179074, 42)
+    tr._waiting.add(500)  # noqa: SLF001
+    tr._resolve_player_state(info)  # noqa: SLF001
+    assert info.player_state is None and tr.name_of(500) is None
+    tr.player_names[179074] = "pSynthetic"
+    tr._resolve_player_state(info)  # noqa: SLF001
+    assert info.player_state == 179074 and tr.name_of(500) == "pSynthetic" and 500 not in tr._waiting  # noqa: SLF001
+
+
+def test_pawn_with_two_known_player_state_candidates_is_not_linked():
+    from isle_livemap.decode import ActorInfo
+    tr = IdentityTracker()
+    tr.player_names.update({100001: "pA", 100002: "pB"})
+    info = ActorInfo(7, None, None, 0)
+    info.ref_candidates = (100001, 100002)
+    tr._resolve_player_state(info)  # noqa: SLF001
+    assert info.player_state is None

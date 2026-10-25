@@ -138,7 +138,7 @@ def test_peers_come_from_inbound_batches_with_unknown_fields_none(b64):
     assert len(snap.entities) == 15 and g.locations == 15
     e = {p.id: p.entity for p in snap.entities}["93362"]
     # these fixtures hold no creation record for the handle: its class is unknown, so it is neither a player nor a dino
-    assert (e.kind, e.name, e.species) == ("unknown", "Actor #93362", "")
+    assert (e.kind, e.name, e.species) == ("unknown", "Unknown #93362", "")
     assert (e.x, e.y, e.z) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88))
     assert (e.health_pct, e.growth_pct, e.stamina_pct, e.hunger_pct, e.thirst_pct, e.heading) == (None,) * 6
     assert "not available" in snap.status and not peers.status_is_warning(snap.status)
@@ -150,7 +150,7 @@ def test_game_labels_have_no_placeholders_only_id_distance_bearing_and_height(b6
     near = visible_entities([(p.entity, p.entity.x, p.entity.y) for p in g.snapshot().entities], 200_000.0, -250_000.0, 5_000.0)
     assert near
     head, tail, *rest = peer_label_lines(near[0], my_z=30_000.0)
-    assert head == f"Actor #{near[0].entity.id}" and not rest
+    assert head == f"Unknown #{near[0].entity.id}" and not rest
     assert "?" not in head + tail and "HP" not in tail and "G " not in tail
     assert re.fullmatch(r"\d+ m (N|NE|E|SE|S|SW|W|NW) [+-]\d+m", tail), tail
 
@@ -200,6 +200,21 @@ def test_silent_peer_expires_after_ttl(b64):
     assert len(g.snapshot().entities) == 15 and all(clk.t - p.last_seen >= g.stale_s for p in g.snapshot().entities)
     clk.t += g.ttl_s
     assert g.snapshot().entities == ()
+
+
+def test_creature_still_replicated_without_a_position_stays_on_the_map(b64):
+    # Live capture: a creature's position stops changing (no vector in its state batches) but the server keeps
+    # sending its state for minutes and never destroys it. It must stay at its last position, not expire.
+    g, clk = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    before = {p.entity.id: p.entity for p in g.snapshot().entities}
+    assert len(before) == 15
+    g.locator.update = lambda *a, **k: None  # same state batches, no decodable position
+    for _ in range(4):
+        clk.t += g.ttl_s * 0.6
+        g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    after = {p.entity.id: p.entity for p in g.snapshot().entities}
+    assert after == before  # past the TTL since the last position, same ids, same positions
 
 
 def test_garbage_and_non_replication_datagrams_are_ignored():
@@ -381,3 +396,22 @@ def test_destruction_records_count_even_when_the_handle_is_untracked(b64):
     g.on_inbound(inbound(b64("DetachedDamagedAttributes")), None)
     assert g.destruction_records == 1 and g.destroyed == 0
 
+
+
+def test_late_join_labels_actors_unidentified_and_hints_to_rejoin(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    assert not g.late_join() and "Rejoin" not in g.snapshot().status  # too little traffic to say the tables were missed
+    g.packets = g.LATE_JOIN_PACKETS  # many packets, still no export table, no player name, no class
+    snap = g.snapshot()
+    assert g.late_join() and "Rejoin" in snap.status and peers.status_is_warning(snap.status)
+    assert all(p.entity.name.startswith("Unknown #") for p in snap.entities)
+    assert "LATE JOIN" in g.summary()
+
+
+def test_late_join_hint_is_dropped_once_a_player_name_is_known(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    g.packets = g.LATE_JOIN_PACKETS
+    g.identity.player_names[1] = "Someone"
+    assert not g.late_join() and "Rejoin" not in g.snapshot().status and "LATE JOIN" not in g.summary()

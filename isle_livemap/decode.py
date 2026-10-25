@@ -789,10 +789,14 @@ _PLAYER_STATE_MARKER = "BP_PlayerState"
 _NAME_SCAN_FROM = 460
 _NAME_SCAN_TO = 600
 _NAME_MAX_BYTES = 48
-# A pawn's creation record references its PlayerState as ... 0000000001 + packed u64 handle (anchor seen in 4 of 4
-# pawn records that reference one); the anchor is what keeps a random bit run from matching a handle.
-_PS_REF_ANCHOR = (1 << 1) | (1 << 11)  # bits in stream order 0,1,0,0,0,0,0,0,0,0,0,1
-_PS_REF_ANCHOR_BITS = 12
+# A pawn's creation record references its PlayerState as a packed u64 (3-bit byte count - 1 + that many bytes). The
+# 12 bits before the count vary, but the 8 bits that start 36 bits before the count are constant: 1 1 0 0 0 1 0 1
+# (stream order; found before all 8 references in two captures). Several unrelated runs match the marker, so a
+# candidate only counts once it equals the handle of a known PlayerState.
+_PS_REF_MARKER = 0b10100011  # bits in stream order 1,1,0,0,0,1,0,1
+_PS_REF_MARKER_BITS = 8
+_PS_REF_MARKER_GAP = 36  # bits from the start of the marker to the byte-count field
+_PS_REF_MAX_BYTES = 4
 
 
 def _plausible_name(text: str) -> bool:
@@ -836,6 +840,7 @@ class ActorInfo:
     asset_species: tuple[str, ...] = ()  # /Characters/Dinosaurs/<folder>/ assets named in the creation batch
     player_state: int | None = None  # handle of the PlayerState the record references (pawns)
     name: str | None = None  # PlayerState records only: the player name
+    ref_candidates: tuple[int, ...] = ()  # pawns: handles that look like a PlayerState reference (resolved when known)
 
 
 class IdentityTracker:
@@ -851,6 +856,7 @@ class IdentityTracker:
         self.actors: dict[int, ActorInfo] = {}
         self._arch_votes: dict[int, Counter] = {}  # archetype handle -> {species folder: creations that named it}
         self.player_names: dict[int, str] = {}  # PlayerState handle -> name
+        self._waiting: set[int] = set()  # pawns with reference candidates and no known PlayerState yet
         self.creations = 0
         self.exports_seen = 0  # object-export levels recorded
         self.destroyed_known = 0  # destruction records that matched a creation seen in this connection
@@ -919,22 +925,27 @@ class IdentityTracker:
                 found.append(folder)
         return tuple(found)
 
-    def _find_player_state_ref(self, bits: Bits, batch: IrisBatch, start: int) -> int | None:
-        """Handle of a known PlayerState referenced after ``start`` bits of ``batch`` (anchor + packed u64)."""
-        if not self.player_names:
-            return None
+    def _reference_candidates(self, bits: Bits, batch: IrisBatch, start: int) -> tuple[int, ...]:
+        """Packed handles that follow the PlayerState-reference marker in ``batch`` (canonical width only)."""
         base, n = batch.data_bit_offset, batch.data_bit_count
-        found: set[int] = set()
-        for o in range(max(start, _PS_REF_ANCHOR_BITS), n - 11):
-            if bits.read(base + o - _PS_REF_ANCHOR_BITS, _PS_REF_ANCHOR_BITS) != _PS_REF_ANCHOR:
+        found: list[int] = []
+        for o in range(max(start, _PS_REF_MARKER_GAP), n - 11):
+            if bits.read(base + o - _PS_REF_MARKER_GAP, _PS_REF_MARKER_BITS) != _PS_REF_MARKER:
                 continue
             size = bits.read(base + o, 3)
-            if o + 3 + (size + 1) * 8 > n:
+            if size >= _PS_REF_MAX_BYTES or o + 3 + (size + 1) * 8 > n:
                 continue
             handle = bits.read(base + o + 3, (size + 1) * 8)
-            if handle in self.player_names:
-                found.add(handle)
-        return next(iter(found)) if len(found) == 1 else None
+            if handle >> (size * 8) and handle not in found:  # top byte non-zero: the shortest encoding
+                found.append(handle)
+        return tuple(found)
+
+    def _resolve_player_state(self, info: ActorInfo) -> None:
+        """Link ``info`` to the one known PlayerState among its reference candidates (none or several: no link)."""
+        known = {h for h in info.ref_candidates if h in self.player_names}
+        if len(known) == 1:
+            info.player_state = next(iter(known))
+            self._waiting.discard(info.handle)
 
     def feed(self, payload: bytes, packet: IrisPacket | None = None) -> list[Creation]:
         """Update from one datagram; returns the creation records it carried."""
@@ -945,6 +956,7 @@ class IdentityTracker:
             if b.exports is not None:
                 self._record_exports(b.exports)
         for handle in packet.destroyed_handles:
+            self._waiting.discard(handle)
             if self.actors.pop(handle, None) is not None:
                 self.destroyed_known += 1
             else:
@@ -968,8 +980,13 @@ class IdentityTracker:
                 info.name = decode_player_name(bits, b)
                 if info.name:
                     self.player_names[info.handle] = info.name
+                    for waiting in [self.actors[h] for h in self._waiting if h in self.actors]:
+                        self._resolve_player_state(waiting)
             elif folder_species(path) or info.asset_species or not path:
-                info.player_state = self._find_player_state_ref(bits, b, creation.header_bits)
+                info.ref_candidates = self._reference_candidates(bits, b, creation.header_bits)
+                if info.ref_candidates:
+                    self._waiting.add(info.handle)
+                    self._resolve_player_state(info)
             out.append(creation)
         return out
 

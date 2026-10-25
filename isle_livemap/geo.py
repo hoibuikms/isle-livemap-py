@@ -301,23 +301,51 @@ class Interpolator:
         self.x = self.y = self.heading = 0.0
         self.target_x = self.target_y = self.target_heading = 0.0
         self.has_fix = False
+        self._sample_at: float | None = None
+        self._vel: tuple[float, float, float] | None = None  # (vx, vy in cm/s, extrapolation horizon s)
 
-    def set_target(self, x: float, y: float, heading: float | None) -> None:
+    def set_target(self, x: float, y: float, heading: float | None, at: float | None = None) -> None:
+        """New telemetry sample. With ``at`` (the sample's monotonic time) the velocity between the last two
+        samples is kept, and ``step(dt, now)`` advances the target along it (same rules as ``EntitySmoother``)."""
+        prev_x, prev_y, prev_at = self.target_x, self.target_y, self._sample_at
         self.target_x, self.target_y = x, y
         if heading is not None:
             self.target_heading = heading % 360.0
+        if at is None or not self.has_fix or prev_at is None:
+            self._vel = None
+        elif math.hypot(x - prev_x, y - prev_y) > self.snap:
+            self._vel = None
+        elif (x, y) == (prev_x, prev_y):
+            if at - prev_at >= DR_MIN_DT_S:
+                self._vel = None  # re-sent at the same spot: stopped
+        else:
+            dt = at - prev_at
+            if dt >= DR_MIN_DT_S:
+                vx, vy = (x - prev_x) / dt, (y - prev_y) / dt
+                ok = dt <= DR_MAX_INTERVAL_S and math.hypot(vx, vy) <= DR_MAX_SPEED
+                self._vel = (vx, vy, min(dt, DR_MAX_EXTRAP_S)) if ok else None
+        self._sample_at = at
         if not self.has_fix:
             self.x, self.y, self.heading = x, y, self.target_heading
             self.has_fix = True
 
-    def step(self, dt: float) -> tuple[float, float, float]:
+    def _aim(self, now: float | None) -> tuple[float, float]:
+        """The newest sample advanced along its velocity, plus ``tau`` of lead so the filter's steady lag cancels."""
+        v, at = self._vel, self._sample_at
+        if now is None or v is None or at is None:
+            return self.target_x, self.target_y
+        ahead = min(max(now - at, 0.0) + self.tau, v[2])
+        return self.target_x + v[0] * ahead, self.target_y + v[1] * ahead
+
+    def step(self, dt: float, now: float | None = None) -> tuple[float, float, float]:
         if not self.has_fix:
             return self.x, self.y, self.heading
         if math.hypot(self.target_x - self.x, self.target_y - self.y) > self.snap:
             self.x, self.y = self.target_x, self.target_y  # respawn / teleport
+        tx, ty = self._aim(now)
         a = 1.0 - math.exp(-max(dt, 0.0) / self.tau) if self.tau > 0 else 1.0
-        self.x += (self.target_x - self.x) * a
-        self.y += (self.target_y - self.y) * a
+        self.x += (tx - self.x) * a
+        self.y += (ty - self.y) * a
         self.heading = (self.heading + shortest_arc(self.heading, self.target_heading) * a) % 360.0
         return self.x, self.y, self.heading
 
@@ -685,21 +713,22 @@ class EntitySmoother:
             self._vel.pop(eid, None)
         self.entities = {**{i: e for i, e in self.entities.items() if i in self.pos}, **new}
 
-    def target(self, eid: str, now: float | None = None) -> tuple[float, float]:
-        """Where the entity is expected to be at ``now``: its last sample, advanced along its velocity."""
+    def target(self, eid: str, now: float | None = None, lead: float = 0.0) -> tuple[float, float]:
+        """Where the entity is expected to be at ``now``: its last sample, advanced along its velocity
+        (``lead`` seconds further, still within the horizon)."""
         e = self.entities[eid]
         v = self._vel.get(eid)
         s = self._sample.get(eid)
         if now is None or v is None or s is None:
             return e.x, e.y
-        ahead = min(max(now - s[2], 0.0), v[2])
+        ahead = min(max(now - s[2], 0.0) + lead, v[2])
         return e.x + v[0] * ahead, e.y + v[1] * ahead
 
     def step(self, dt: float, now: float | None = None) -> None:
         a = 1.0 - math.exp(-max(dt, 0.0) / self.tau) if self.tau > 0 else 1.0
         for eid, e in self.entities.items():
             p = self.pos[eid]
-            tx, ty = self.target(eid, now)
+            tx, ty = self.target(eid, now, self.tau)  # tau of lead cancels the filter's steady lag
             p[0] += (tx - p[0]) * a
             p[1] += (ty - p[1]) * a
             h = self.heading.get(eid)

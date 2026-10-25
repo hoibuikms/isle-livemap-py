@@ -117,8 +117,8 @@ class MapView(QWidget):
         t = self.pipeline.latest
         if t.position is not None and t.position_at != self._last_pos_at:
             self._last_pos_at = t.position_at
-            self.interp.set_target(t.position.x, t.position.y, t.position.map_heading_degrees)
-        self.interp.step(dt)
+            self.interp.set_target(t.position.x, t.position.y, t.position.map_heading_degrees, t.position_at)
+        self.interp.step(dt, now)
         if self.peers is not None:
             snap = self.peers.snapshot()
             self.peer_status = snap.status if snap.enabled else ""

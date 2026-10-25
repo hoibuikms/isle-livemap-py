@@ -69,7 +69,7 @@ class PeerSource(Protocol):
     def snapshot(self) -> PeerSnapshot: ...
 
 
-_WARN_WORDS = ("error", "unavailable", "failed", "not implemented", "waiting", "no ")
+_WARN_WORDS = ("error", "unavailable", "failed", "not implemented", "waiting", "no ", "rejoin")
 
 
 def status_is_warning(status: str) -> bool:
@@ -353,6 +353,8 @@ class GamePeerSource:
       * A destruction record removes the peer at once and forgets its identity (the server reuses handles). Iris
         replicates changes only, so a creature that stands still goes quiet: the fallback is generous (dim after
         ``STALE_S`` = 8 s, remove after ``TTL_S`` = 30 s without any report), not the 3 s / 5 s of the lab feed.
+        Any state update of a tracked creature counts as a report, also one without a position: live captures show
+        pawns that keep sending state for minutes after their position stopped changing.
       * Every decoded position is written to the store at once (no buffering); the overlay smooths and
         dead-reckons between samples (``geo.EntitySmoother``).
 
@@ -363,6 +365,8 @@ class GamePeerSource:
     STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim) and the smoother (TTL)
     TTL_S = GAME_PEER_TTL_S
     stale_s, ttl_s = STALE_S, TTL_S
+
+    LATE_JOIN_PACKETS = 100  # a fresh join sends the export tables within the first packets; this many without = missed
 
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
 
@@ -434,7 +438,7 @@ class GamePeerSource:
         old = self.store.get(eid)
         vit = self._vitals.get(handle)
         self.store.update(Entity(
-            eid, kind, name or f"Actor #{eid}", species, x, y, z,
+            eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
             health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
             heading=old.heading if old else None))
 
@@ -489,8 +493,10 @@ class GamePeerSource:
             if loc is not None:
                 self.locations += 1
                 self._emit(handle, loc.x, loc.y, loc.z if loc.z_reliable else None, kind, species, name)
-            elif vit is not None and (old := self.store.get(str(handle))) is not None:
-                self.store.update(replace(old, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct))
+            elif (old := self.store.get(str(handle))) is not None:
+                # Still replicated (no destruction record) but this update carries no position: keep the creature
+                # on the map at its last position instead of letting the TTL remove it.
+                self.store.update(replace(old, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct) if vit is not None else old)
 
     # -- PeerSource --------------------------------------------------------
     def status(self) -> str:
@@ -505,9 +511,18 @@ class GamePeerSource:
         if not peers:
             return f"game: waiting for actor locations ({self.packets} pkts, {own})"
         known = sum(1 for p in peers if p.entity.species)
+        if self.late_join():
+            return (f"game: {len(peers)} actors, none identified: the app started after you joined, so the server's "
+                    f"class and player tables were missed. Rejoin the server to get species and names ({own})")
         seen = (f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}")
         return (f"game: {len(peers)} actors ({known} with species; {seen}; "
                 f"growth, hunger, thirst and heading not available; {own})")
+
+    def late_join(self) -> bool:
+        """True when actors are on the map but none could be identified and no player name was ever seen: the capture started after the join, and the server will not resend those tables until a rejoin."""
+        peers = self.store.entities()
+        return (bool(peers) and self.packets >= self.LATE_JOIN_PACKETS and not self.identity.player_names
+                and all(p.entity.kind == "unknown" for p in peers))
 
     def summary(self) -> str:
         """One line for the session log: what is on the map, how it was decoded and what was filtered."""
@@ -515,6 +530,8 @@ class GamePeerSource:
         for p in self.store.entities():
             kinds[p.entity.kind] = kinds.get(p.entity.kind, 0) + 1
         shown = " ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"
+        if self.late_join():
+            shown += " (LATE JOIN: class/name tables missed, rejoin the server)"
         return (f"on map: {shown} | positions fixed={self.locator.fixed} learned={self.locator.learned} "
                 f"(layouts {self.locator.trusted_layouts}) | vitals blocks={self.vitals_blocks} | "
                 f"world-object batches skipped={self.filtered_world_objects} | classes known="

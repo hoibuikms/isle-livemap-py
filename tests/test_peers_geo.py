@@ -222,3 +222,15 @@ def test_peer_label_includes_known_vitals_only_in_order():
     assert peer_label_lines(n, my_z=10_000.0) == ["P1", "HP 92% G 40% 250 m E +30m"]
     n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
     assert peer_label_lines(n) == ["P1", "G 40% 250 m E"]
+
+
+def test_lead_cancels_the_filter_lag_behind_a_walking_actor():
+    assert _walk(EntitySmoother(tau_s=0.09), 0.33) < 15.0  # was ~tau * speed (72 cm) before the lead
+
+
+def test_target_lead_stays_inside_the_horizon():
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
+    s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)
+    assert s.target("a", 0.5, 0.09)[0] == pytest.approx(400.0 + 800.0 * 0.09)
+    assert s.target("a", 9.0, 0.09)[0] == pytest.approx(800.0)  # horizon (0.5 s) still caps it
