@@ -49,6 +49,7 @@ MAX_ABS_COORD_M = 100_000.0  # |coordinate| beyond 100 km means wrong layout/end
 class PeerEntity:
     entity: Entity
     last_seen: float  # monotonic seconds of the source clock
+    born: int = 0  # serial of the store entry: a removed and re-added id (a reused game handle) gets a new one
 
     @property
     def id(self) -> str:
@@ -110,14 +111,16 @@ class PeerStore:
     set of ids or any entity value changes (a repeated identical packet just refreshes last_seen)."""
 
     def __init__(self, ttl: float = PEER_TTL_S, clock: Callable[[], float] = time.monotonic,
-                 self_ids: Iterable[str] = ()) -> None:
+                 self_ids: Iterable[str] = (), ttl_for: Callable[[Entity], float] | None = None) -> None:
         self.ttl, self.clock = ttl, clock
+        self.ttl_for = ttl_for  # per-entity silence limit (the game feed keeps creatures far longer than fish)
         self._lock = threading.Lock()
         self._seen: dict[str, PeerEntity] = {}
         self._config: set[str] = {canonical_id(i) for i in self_ids}  # user-configured (Settings.peer_self_ids)
         self._owned: set[str] = set()  # ids a backend owns (lab id 0, the learned game handle): survive set_self_ids
         self._self: set[str] = set(self._config)
         self._version = 0
+        self._serial = 0
         self._cached: tuple[PeerEntity, ...] | None = ()
         self._snap: PeerSnapshot | None = None
         self.dropped_self = 0
@@ -130,7 +133,9 @@ class PeerStore:
                 self.dropped_self += 1
                 return False
             old = self._seen.get(entity.id)
-            self._seen[entity.id] = PeerEntity(entity, now)
+            if old is None:
+                self._serial += 1
+            self._seen[entity.id] = PeerEntity(entity, now, old.born if old is not None else self._serial)
             self._cached = self._snap = None
             if old is None or old.entity != entity:
                 self._version += 1
@@ -192,7 +197,8 @@ class PeerStore:
             self._cached = self._snap = None
 
     def _expire(self, now: float) -> None:
-        gone = [i for i, p in self._seen.items() if now - p.last_seen >= self.ttl]
+        ttl_for = self.ttl_for
+        gone = [i for i, p in self._seen.items() if now - p.last_seen >= (ttl_for(p.entity) if ttl_for else self.ttl)]
         for i in gone:
             del self._seen[i]
         if gone:
@@ -349,7 +355,7 @@ class GamePeerSource:
         records. ``species.describe`` turns a class path into ``kind`` (dino / player / ai / other) and a species
         name. Objects of kind "other" (plants, fruit, gore, items, level actors) are never drawn.
       * ``decode.ActorLocationTracker`` decodes positions: the two verified fixed layouts, plus layouts learned
-        from creation anchors and continuity (pawns). ``decode.decode_vitals_block`` reads health and stamina.
+        from creation anchors and continuity (pawns). ``decode.PawnVitalsTracker`` reads health and stamina (full blocks, then the pair that follows them).
       * A peer is keyed by its handle. The own handle is excluded as soon as the heartbeat lock gives it; a
         provisional peer with that handle is purged retroactively (``PeerStore.set_owned_self_ids``).
       * A destruction record removes the peer at once and forgets its identity (the server reuses handles). Iris
@@ -364,16 +370,28 @@ class GamePeerSource:
     health and stamina percentages (when the 9-slot attribute block is sent), heading (derived from movement, see
     ``_heading``). NOT decoded: growth, hunger, thirst."""
 
-    STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim) and the smoother (TTL)
-    TTL_S = GAME_PEER_TTL_S
+    STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim)
+    # Silence limit before a peer is dropped when no destruction record came. Creatures rest for minutes without
+    # a single report (captured gaps of 100-300 s), so they stay until the server destroys them; the limit only
+    # guards against a missed destruction record. Server animals (fish) are numerous and uninteresting: shorter.
+    TTL_S = 180.0
+    TTL_AI_S = GAME_PEER_TTL_S
     stale_s, ttl_s = STALE_S, TTL_S
+    # A creature the server destroyed leaves the map this long afterwards (not 30 s: a dot of something that is gone
+    # is a stuck dot). Read by the overlay's smoother.
+    GONE_GRACE_S = 1.5
+    gone_grace_s = GONE_GRACE_S
 
     # Actors whose creation record was never captured have no class. Their state batches still have a class-typical
     # size: every server-controlled animal of the recorded captures (33 resolved, 73 never created) repeats a 155 or
-    # 158 bit state, and no dinosaur or world object does. Eight state batches, 90 % of them that size: "ai".
+    # 158 bit state, and no dinosaur or world object does. The first batch of that size says "ai" (waiting for more
+    # drew every new fish as an unknown creature for 2-3 s); the verdict is kept until the actor has clearly stopped
+    # looking like an animal, so it cannot flap between two kinds.
     AI_LAYOUT_BITS = (155, 158)
-    AI_LAYOUT_MIN_BATCHES = 8
+    AI_LAYOUT_MIN_BATCHES = 1
     AI_LAYOUT_SHARE = 0.9
+    AI_LAYOUT_KEEP_SHARE = 0.6  # a latched verdict is revoked only below this share ...
+    AI_LAYOUT_REVOKE_BATCHES = 8  # ... after at least this many batches
 
     # Heading is not in the replicated data we can decode, so it is the direction of travel: the bearing from an anchor
     # position to the first later position at least this far away (a metre filters the position quantisation noise),
@@ -394,27 +412,34 @@ class GamePeerSource:
     HIDDEN_RECENT_S = 30.0  # a hidden creature must have sent state this recently (datagram time)
     PROFILE_MAX = 20_000
 
+    HEADLINE_HOLD_S = 12.0  # a new headline replaces the shown one only after this long (datagram time): no flapping
+
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
 
     def __init__(self, self_ids: Iterable[str] = (), pipeline=None, clock: Callable[[], float] = time.monotonic,
                  class_cache=None) -> None:
-        from .decode import ActorLocationTracker, IdentityTracker
+        from .decode import ActorLocationTracker, IdentityTracker, PawnVitalsTracker
 
         self._config_self = tuple(canonical_id(i) for i in self_ids)
-        self.store = PeerStore(ttl=self.TTL_S, clock=clock, self_ids=self._config_self)
+        self.store = PeerStore(ttl=self.TTL_S, clock=clock, self_ids=self._config_self,
+                               ttl_for=lambda e: self.TTL_AI_S if e.kind == "ai" else self.TTL_S)
         self.pipeline = pipeline
         self.own_handle: int | None = None
         self.class_cache = class_cache  # classcache.ClassCache | None: classes learned in earlier sessions
         self.identity = IdentityTracker(class_cache)
         self.locator = ActorLocationTracker()
-        self._vitals: dict[int, object] = {}  # handle -> decode.ActorVitals
-        self._layouts: dict[int, list[int]] = {}  # unclassified handle -> [state batches of the animal size, all state batches]
+        self.pawn_vitals = PawnVitalsTracker()
+        self._vitals: dict[int, object] = {}  # handle -> decode.PawnVitals (health / stamina percentages, see decode)
+        self._layouts: dict[int, list] = {}  # unclassified handle -> [state batches of the animal size, all state batches, latched]
         self._anchors: dict[int, tuple[float, float]] = {}  # handle -> position the travel direction is measured from
         self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
         self._past_own: set[int] = set()  # earlier own pawns (respawn): the old body is not "another creature"
         self._last_t = 0.0  # datagram time of the newest inbound packet
         self._hidden_cache: tuple[float, int] = (-1e9, 0)
+        self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
         self.packets = 0  # inbound datagrams seen
+        self.decode_errors = 0  # datagrams whose decoding raised (the rest of the stream is still decoded)
+        self._error_t = -1e9  # datagram time of the newest decode error
         self.locations = 0  # actor locations decoded (all sources)
         self.destroyed = 0  # destruction records that removed a tracked peer
         self.creation_records = 0  # batches whose prefix says "creation"
@@ -456,12 +481,21 @@ class GamePeerSource:
             self.class_cache.save(force=True)
         self.identity.reset()
         self.locator.reset()
+        self.pawn_vitals.reset()
         self._vitals.clear()
         self._layouts.clear()
         self._anchors.clear()
         self._profile.clear()
         self._past_own.clear()
         self._hidden_cache = (-1e9, 0)
+        self._headline = (-1e9, "")
+
+    def _sync_owned(self) -> None:
+        """The own pawn and its earlier bodies are not other creatures: none of them is ever put on the map."""
+        ids = [str(h) for h in self._past_own]
+        if self.own_handle is not None:
+            ids.append(str(self.own_handle))
+        self.store.set_owned_self_ids(ids)
 
     def _heading(self, handle: int, x: float, y: float, previous: float | None) -> float | None:
         """Direction of travel (degrees clockwise from north) once the creature has moved ``HEADING_MIN_MOVE_CM``
@@ -490,11 +524,17 @@ class GamePeerSource:
         return kind, species, self.identity.name_of(handle) or ""
 
     def _animal_layout(self, handle: int, bits: int) -> bool:
-        """Count one state batch of an actor without class information; True once it looks like a server animal."""
-        seen = self._layouts.setdefault(handle, [0, 0])
+        """Count one state batch of an actor without class information; True while it looks like a server animal."""
+        seen = self._layouts.setdefault(handle, [0, 0, False])
         seen[0] += bits in self.AI_LAYOUT_BITS
         seen[1] += 1
-        return seen[1] >= self.AI_LAYOUT_MIN_BATCHES and seen[0] >= seen[1] * self.AI_LAYOUT_SHARE
+        share = seen[0] / seen[1]
+        if seen[2]:
+            if seen[1] >= self.AI_LAYOUT_REVOKE_BATCHES and share < self.AI_LAYOUT_KEEP_SHARE:
+                seen[2] = False
+        elif seen[1] >= self.AI_LAYOUT_MIN_BATCHES and share >= self.AI_LAYOUT_SHARE:
+            seen[2] = True
+        return seen[2]
 
     def _note_unplaced(self, handle: int, nbits: int, t: float) -> None:
         """Profile of a creature-like actor that sent a state batch but has no position on the map."""
@@ -516,7 +556,7 @@ class GamePeerSource:
         from . import species as sp
 
         count = 0
-        for handle, (n, band, fish, last) in self._profile.items():
+        for handle, (n, band, fish, last) in list(self._profile.items()):  # decoder thread inserts: iterate a copy
             if (n < self.HIDDEN_KNOWN_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
                     or handle in self._past_own or self.store.get(str(handle)) is not None):
                 continue
@@ -531,21 +571,37 @@ class GamePeerSource:
 
     def headline(self) -> str:
         """The few words the overlay can show (its status line is elided to about 30 characters): what the user
-        should do or know. Empty when there is nothing to add."""
+        should do or know. Empty when there is nothing to add. A change is held back for ``HEADLINE_HOLD_S`` so a
+        count that flips between two values (1 hidden / none) does not make the line flicker."""
+        raw = self._raw_headline()
+        since, shown = self._headline
+        if raw != shown and (self._last_t - since >= self.HEADLINE_HOLD_S or not shown and not raw):
+            self._headline = (self._last_t, raw)
+            return raw
+        return shown
+
+    def _raw_headline(self) -> str:
+        if self.decode_errors and self._last_t - self._error_t < self.HEADLINE_HOLD_S * 5:
+            return "Decode errors: see log"
         if self.pipeline is None or self.error or self.packets < self.LATE_JOIN_PACKETS:
             return ""
         peers = self.store.entities()
         unknown = sum(1 for p in peers if p.entity.kind == "unknown")
         hidden = self.hidden_creatures()
-        if self.identity.tables_missed() and (hidden or unknown):
-            return f"Rejoin server: {hidden} hidden" if hidden else "Rejoin server to identify"
         if self.identity.tables_missed():
-            return "Started late: rejoin to see all"  # sleeping creatures cannot be placed, so "nobody" is not known
+            # One constant message for as long as this lasts. It used to say "Rejoin server: N hidden" / "to identify" /
+            # "Started late" depending on a count that flipped between 0 and 1 every few seconds.
+            return "Started late: rejoin to see all"
         if hidden:
             return f"{hidden} creature{'s' if hidden > 1 else ''}: no position yet"
         if not unknown and not any(p.entity.kind in ("dino", "player") for p in peers):
             return "No other players nearby"
         return ""
+
+    def _own_position(self) -> tuple[float, float, float] | None:
+        latest = getattr(self.pipeline, "latest", None)
+        pos = getattr(latest, "position", None)
+        return None if pos is None else (pos.x, pos.y, pos.z)
 
     def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str) -> None:
         eid = str(handle)
@@ -557,17 +613,32 @@ class GamePeerSource:
             heading=self._heading(handle, x, y, old.heading if old else None), inferred=bool(species) and self.identity.is_inferred(handle)))
 
     def _drop(self, handle: int) -> None:
+        if handle in self._past_own:  # the server removed the old body; the handle may be reused
+            self._past_own.discard(handle)
+            self._sync_owned()
         if self.store.remove(str(handle)):
             self.destroyed += 1
         self.locator.forget(handle)
+        self.pawn_vitals.forget(handle)
         self._vitals.pop(handle, None)
         self._layouts.pop(handle, None)
         self._anchors.pop(handle, None)
         self._profile.pop(handle, None)
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
+        """Decode one inbound datagram. A failure costs that datagram only, but it is counted and shown (status line,
+        log): a decoder that throws on every packet would otherwise look like "nobody is nearby"."""
+        try:
+            self._on_inbound(d, own_handle)
+        except Exception:  # noqa: BLE001 - the capture worker must go on with the next datagram
+            self.decode_errors += 1
+            self._error_t = d.observed_at
+            if self.decode_errors <= 3 or self.decode_errors % 1000 == 0:
+                log.exception("game peers: decoding a datagram failed (%d so far)", self.decode_errors)
+
+    def _on_inbound(self, d, own_handle: int | None = None) -> None:
         from . import species as sp
-        from .decode import Bits, batch_kind, count_batches, decode_vitals_block, parse_iris_packet, KIND_STATE
+        from .decode import Bits, batch_kind, count_batches, parse_iris_packet, KIND_STATE
 
         self.packets += 1
         self._last_t = d.observed_at
@@ -575,7 +646,8 @@ class GamePeerSource:
             if self.own_handle is not None:
                 self._past_own.add(self.own_handle)  # died and respawned: the old pawn lingers as a body
             self.own_handle = own_handle  # replaces (not adds to) the previous own handle
-            self.store.set_owned_self_ids((str(own_handle),))
+            self._past_own.discard(own_handle)
+            self._sync_owned()
             self._profile.pop(own_handle, None)
         packet = parse_iris_packet(d.payload)
         if packet is None:
@@ -592,7 +664,11 @@ class GamePeerSource:
             self.class_cache.save()  # rate limited; a failed write never reaches the decoder
         for creation in created:
             handle = creation.net_ref_handle
+            if handle in self._past_own:  # reused handle: a new actor, not the old body
+                self._past_own.discard(handle)
+                self._sync_owned()
             self.store.remove(str(handle))  # a reused handle is a new actor
+            self.pawn_vitals.forget(handle)
             self._vitals.pop(handle, None)
             self._layouts.pop(handle, None)
             self._anchors.pop(handle, None)
@@ -614,11 +690,16 @@ class GamePeerSource:
                 continue
             if kind == sp.KIND_UNKNOWN and self._animal_layout(handle, batch.data_bit_count):
                 kind = sp.KIND_AI
-            vit = decode_vitals_block(bits, batch) if batch.data_bit_count >= 593 else None
-            if vit is not None:
-                self._vitals[handle] = vit
-                self.vitals_blocks += 1
+            vit = None
+            if kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS:
+                vit = self.pawn_vitals.update(bits, batch)
+                if vit is not None:
+                    self._vitals[handle] = vit
+                    self.vitals_blocks = self.pawn_vitals.blocks
             loc = self.locator.update(bits, batch, t, learn=kind in (sp.KIND_DINO, sp.KIND_PLAYER, sp.KIND_AI))
+            if (loc is None and kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS
+                    and self.store.get(str(handle)) is None):
+                loc = self.locator.bootstrap(bits, batch, t, self._own_position())
             if loc is not None:
                 self.locations += 1
                 self._profile.pop(handle, None)
@@ -671,7 +752,7 @@ class GamePeerSource:
                 and any(p.entity.kind == "unknown" for p in self.store.entities()))
 
     def identity_resolved(self) -> int:
-        return sum(1 for h in self.identity.actors if self.identity.class_path(h) is not None)
+        return sum(1 for h in list(self.identity.actors) if self.identity.class_path(h) is not None)
 
     def summary(self) -> str:
         """One line for the session log: what is on the map, how it was decoded and what was filtered."""
@@ -684,6 +765,8 @@ class GamePeerSource:
         hidden = self.hidden_creatures()
         if hidden:
             shown += f" ({hidden} creature(s) replicated but never placed: no position received; rejoin to see them)"
+        if self.decode_errors:
+            shown += f" ({self.decode_errors} DECODE ERRORS)"
         inferred = sum(1 for p in self.store.entities() if p.entity.inferred)
         if inferred:
             shown += f" ({inferred} species from the saved class cache)"

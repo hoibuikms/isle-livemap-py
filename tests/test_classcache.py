@@ -224,7 +224,7 @@ def test_hint_says_what_is_left_after_the_cache_names_some_actors(join_packets):
     g.store.update(Entity("999999", "unknown", "Unknown #999999", "", 1.0, 2.0))  # created before the app started
     assert g.late_join()
     status = g.snapshot().status
-    assert "unidentified" in status and "saved class cache" in status and "Rejoin" in status
+    assert "unidentified" in status and "saved class cache" in status and "rejoin" in status.lower()
     for p in g.store.entities():
         if p.entity.kind == "unknown":
             g.store.remove(p.entity.id)
@@ -241,26 +241,35 @@ def state_batch(handle: int, bits: int):
     return Bits(w.to_bytes()), IrisBatch(handle, 0, bits, True, False)
 
 
-def test_unclassified_actor_with_the_animal_state_size_becomes_ai_after_enough_batches():
+def test_unclassified_actor_with_the_animal_state_size_is_ai_from_its_first_batch():
     g = GamePeerSource(clock=Clock())
-    for bits in (155, 158, 155, 158, 155, 158, 155):
-        assert not g._animal_layout(7, bits)
-    assert g._animal_layout(7, 158)  # the eighth batch
-    assert g._animal_layout(7, 155)
+    assert g._animal_layout(7, 155) and g._animal_layout(7, 158)  # waiting for more drew every new fish as a creature
 
 
-@pytest.mark.parametrize("sizes", [(155, 158, 48, 81, 190, 155, 158, 70), (81,) * 20, (155,) * 7 + (190,) * 3])
+def test_animal_verdict_does_not_flap_on_a_stray_batch():
+    g = GamePeerSource(clock=Clock())
+    assert all(g._animal_layout(7, bits) for bits in (155,) * 5 + (190,) + (155,) * 5)
+
+
+@pytest.mark.parametrize("sizes", [(81,) * 20, (190, 155, 190, 190, 155, 190, 190, 190), (48, 155, 158)])
 def test_other_state_sizes_are_not_taken_for_animals(sizes):
     g = GamePeerSource(clock=Clock())
     assert not any(g._animal_layout(9, s) for s in sizes)
 
 
+def test_animal_verdict_is_revoked_once_the_actor_clearly_stops_looking_like_one():
+    g = GamePeerSource(clock=Clock())
+    verdicts = [g._animal_layout(9, s) for s in (155, 158, 48, 81, 190, 155, 158, 70)]
+    assert verdicts[0] and not verdicts[-1]  # latched at first, revoked after 8 batches of which only half fit
+
+
 def test_layout_counters_are_dropped_with_the_actor():
     g = GamePeerSource(clock=Clock())
-    for _ in range(8):
+    for _ in range(4):
         g._animal_layout(5, 155)
     g._drop(5)
-    assert 5 not in g._layouts and not g._animal_layout(5, 155)
+    assert 5 not in g._layouts
+    assert g._animal_layout(5, 155) and g._layouts[5][:2] == [1, 1]  # a reused handle starts counting again
     g.on_reset()
     assert not g._layouts
 

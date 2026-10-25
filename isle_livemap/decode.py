@@ -1180,8 +1180,18 @@ class ActorLocationTracker:
     MAX_GAP = 3.0  # s: a silent actor is assumed to have moved at most this long
     ANCHOR_LIFETIME = 120.0  # s: an anchor older than this is not trusted
     TRUST_VOTES = 2
+    # A vector this close to the last position needs no second sighting: by chance a 3 x 22 bit vector falls within
+    # 15 m of a given point about once in 10^7 offsets tried. Walking dinosaurs do 10-17 m/s, so the tight radius
+    # grows at 20 m/s (not the 100 m/s of ``MAX_SPEED``) up to ``MAX_GAP`` seconds.
+    TIGHT_SLACK = 1_500.0
+    TIGHT_SPEED = 2_000.0
     MIN_COMP = 22  # learned vectors: 22 bits = |raw| up to 21 km: world positions, not velocities
     SCAN_FROM, SCAN_TAIL = 5, 60
+    # A creature whose creation record was missed has no anchor, so a position can only be told from the other
+    # vectors of its state by where it is: near the local player (the server replicates only what is close) and
+    # moving like a creature between two batches. Both must hold in two consecutive batches of the same actor.
+    BOOT_RADIUS = 100_000.0  # cm around the local player
+    MAX_BOOT = 5_000
 
     def __init__(self) -> None:
         self.reset()
@@ -1190,7 +1200,8 @@ class ActorLocationTracker:
         self._last: dict[int, tuple[float, float, float, float]] = {}  # handle -> (t, x, y, z)
         self._votes: Counter = Counter()
         self._trusted: dict[int, set[int]] = {}  # header -> trusted vector offsets
-        self.fixed = self.learned = self.rejected = 0
+        self._boot: dict[int, tuple[float, list[tuple[int, float, float, float]]]] = {}  # handle -> (t, candidates)
+        self.fixed = self.learned = self.rejected = self.bootstrapped = 0
 
     @property
     def trusted_layouts(self) -> int:
@@ -1208,6 +1219,40 @@ class ActorLocationTracker:
 
     def forget(self, handle: int) -> None:
         self._last.pop(handle, None)
+        self._boot.pop(handle, None)
+
+    def bootstrap(self, bits: Bits, batch: IrisBatch, t: float,
+                  origin: tuple[float, float, float] | None) -> ActorLocation | None:
+        """Position of an actor without an anchor: a vector of its state batch near ``origin`` (the local player) that
+        continues one of the previous batch's candidates at creature speed. The accepted position anchors the actor."""
+        handle, n = batch.net_ref_handle, batch.data_bit_count
+        if origin is None or handle in self._last or n < self.SCAN_FROM + self.SCAN_TAIL:
+            return None
+        base, ox, oy, oz = batch.data_bit_offset, *origin
+        cands = []
+        for off in range(self.SCAN_FROM, n - self.SCAN_TAIL):
+            vec = _vector_at(bits, base, n, off, self.MIN_COMP)
+            if vec is not None and math.hypot(vec[1] - ox, vec[2] - oy) <= self.BOOT_RADIUS \
+                    and abs(vec[3] - oz) <= self.BOOT_RADIUS / 2:
+                cands.append(vec)
+        prev = self._boot.get(handle)
+        if len(self._boot) >= self.MAX_BOOT:
+            self._boot.clear()
+        if not cands:
+            return None
+        self._boot[handle] = (t, cands)
+        if prev is None or not 0.0 <= t - prev[0] <= self.MAX_GAP:
+            return None
+        radius = self._radius(t - prev[0])
+        best = min(((math.dist(c[1:], q[1:]), c) for c in cands for q in prev[1]
+                    if math.dist(c[1:], q[1:]) <= radius and c is not q), key=lambda r: r[0], default=None)
+        if best is None:
+            return None
+        vec = best[1]
+        self._boot.pop(handle, None)
+        self._last[handle] = (t, vec[1], vec[2], vec[3])
+        self.bootstrapped += 1
+        return ActorLocation(handle, vec[1], vec[2], vec[3], vec[0])
 
     def last_known(self, handle: int) -> tuple[float, float, float] | None:
         last = self._last.get(handle)
@@ -1252,9 +1297,12 @@ class ActorLocationTracker:
                 return None
             key = (header << 16) | best[1]
             self._votes[key] += 1
+            tight = self.TIGHT_SLACK + self.TIGHT_SPEED * min(max(t - last[0], 0.0), self.MAX_GAP)
             if self._votes[key] < self.TRUST_VOTES:
-                return None  # a lone coincidence is not a layout
-            self._trusted.setdefault(header, set()).add(best[1])
+                if best[0] > tight:
+                    return None  # a lone coincidence is not a layout
+            else:
+                self._trusted.setdefault(header, set()).add(best[1])
         _, _, vec = best
         self._last[handle] = (t, vec[1], vec[2], vec[3])
         self.learned += 1
@@ -1340,3 +1388,176 @@ def decode_vitals_block(bits: Bits, batch: IrisBatch) -> ActorVitals | None:
     return None
 
 
+
+
+# ---------------------------------------------------------------- following health / stamina of OTHER creatures
+#
+# The 9-slot block above is sent rarely (a few times per minute at most, and then often without the max-stamina slot:
+# 8 slots). Between two blocks a pawn keeps replicating its two changing attributes in small state batches, every
+# second or so while it regenerates (179-bit batches: health at bit 47, stamina at bit 113; 224-bit: 92 / 158; the
+# larger movement batches carry the same pair at other offsets). Health is always followed by stamina, 66 bits later.
+# Evidence (hhh captures, pawn 402662, 80 s): health 2192.47, 2193.03, 2193.60, ... 2274.58 in steps of 0.56 per
+# 0.75 s, stamina 533.8 ... 661 next to it, and the max values from the 8-slot block (2620.49) arrive 50 s later.
+# So the pair is followed by continuity: a slot is health when it is close to the last health; once an offset has
+# been confirmed twice for a batch header, any plausible value at that offset is accepted (a bite is a big jump).
+# A percentage needs the max, so nothing is shown until the first block of the pawn.
+
+_SLOT_BITS = 66
+_FOLLOW_HEALTH_TOL = 0.10  # of maxHealth: how far a health slot may move between two batches and still be "the same slot"
+_FOLLOW_STAMINA_TOL = 0.35
+_FOLLOW_SINGLE_TOL = 0.03
+_FOLLOW_TRUST_VOTES = 2
+
+
+def attribute_slots(bits: Bits, batch: IrisBatch) -> list[tuple[int, float]]:
+    """(offset relative to the batch, value) of every GAS attribute slot (float, flag bit 1, the same float again)."""
+    n = batch.data_bit_count
+    if n < 65:
+        return []
+    chunk = (bits.big >> batch.data_bit_offset) & mask(n)
+    flags = (chunk >> 32) & mask(n - 64)
+    found: list[tuple[int, float]] = []
+    while flags:
+        low = flags & -flags
+        flags ^= low
+        rel = low.bit_length() - 1
+        raw = (chunk >> rel) & 0xFFFFFFFF
+        if raw != (chunk >> (rel + 33)) & 0xFFFFFFFF:
+            continue
+        value = f32(raw)
+        if math.isfinite(value) and 0.0 <= value <= 1_000_000.0:
+            found.append((rel, value))
+    return found
+
+
+@dataclass(slots=True)
+class PawnVitals:
+    net_ref_handle: int
+    health: float | None = None
+    max_health: float | None = None
+    stamina: float | None = None
+    max_stamina: float | None = None
+    verified: bool = False  # a full block was seen: the maxima are real
+
+    @property
+    def health_pct(self) -> float | None:
+        if self.health is None or not self.max_health:
+            return None
+        return max(0.0, min(100.0, 100.0 * self.health / self.max_health))
+
+    @property
+    def stamina_pct(self) -> float | None:
+        if self.stamina is None or not self.max_stamina:
+            return None
+        return max(0.0, min(100.0, 100.0 * self.stamina / self.max_stamina))
+
+
+def _full_block_8(slots: dict[int, float]) -> tuple[float, float, float] | None:
+    """(health, maxHealth, stamina) of the 8-slot block (the 9-slot block without the unchanged max stamina)."""
+    for a, health in slots.items():
+        v = [slots.get(a + _SLOT_BITS * i) for i in range(1, 8)]
+        if any(x is None for x in v):
+            continue
+        max_health, stamina, again, half1, half2, again2, again3 = v
+        if (max_health < _MIN_VITAL_MAX or health > max_health * 1.001 or stamina > 100_000.0 or not _close(again, max_health)
+                or not _close(half1, max_health / 2) or not _close(half2, max_health / 2) or not _close(again2, max_health)
+                or not _close(again3, max_health)):
+            continue
+        return health, max_health, stamina
+    return None
+
+
+class PawnVitalsTracker:
+    """Health and stamina of other creatures from their blocks and from the pair that follows (see section above)."""
+
+    def __init__(self) -> None:
+        self._pawns: dict[int, PawnVitals] = {}
+        self._trusted: dict[int, set[int]] = {}  # batch header -> offsets of a confirmed health slot
+        self._votes: Counter = Counter()
+        self.blocks = 0
+        self.followed = 0
+
+    def reset(self) -> None:
+        self._pawns.clear()
+        self._trusted.clear()
+        self._votes.clear()
+        self.blocks = self.followed = 0
+
+    def forget(self, handle: int) -> None:
+        self._pawns.pop(handle, None)
+
+    def get(self, handle: int) -> PawnVitals | None:
+        return self._pawns.get(handle)
+
+    def update(self, bits: Bits, batch: IrisBatch) -> PawnVitals | None:
+        """The pawn's vitals if this batch changed them, else None."""
+        handle = batch.net_ref_handle
+        n = batch.data_bit_count
+        if n < 65:
+            return None
+        pawn = self._pawns.get(handle)
+        if n >= _VITALS_BLOCK_BITS:
+            block = decode_vitals_block(bits, batch)
+            if block is not None:
+                pawn = self._pawns.setdefault(handle, PawnVitals(handle))
+                pawn.health, pawn.max_health, pawn.stamina, pawn.max_stamina = block.health, block.max_health, block.stamina, block.max_stamina
+                pawn.verified = True
+                self.blocks += 1
+                return pawn
+        slots = dict(attribute_slots(bits, batch))
+        if not slots:
+            return None
+        if n >= 8 * _SLOT_BITS:
+            full = _full_block_8(slots)
+            if full is not None:
+                pawn = self._pawns.setdefault(handle, PawnVitals(handle))
+                pawn.health, pawn.max_health, pawn.stamina = full
+                pawn.verified = True
+                self.blocks += 1
+                return pawn
+        if pawn is None or not pawn.verified or pawn.health is None or not pawn.max_health:
+            return None
+        return self._follow(bits, batch, pawn, slots)
+
+    def _follow(self, bits: Bits, batch: IrisBatch, pawn: PawnVitals, slots: dict[int, float]) -> PawnVitals | None:
+        header = bits.read(batch.data_bit_offset, ACTOR_STATE_HEADER_BITS)
+        max_h, max_s = pawn.max_health, pawn.max_stamina
+        trusted = self._trusted.get(header, ())
+
+        def plausible_health(v: float) -> bool:
+            return v <= max_h * 1.001
+
+        def plausible_stamina(v: float) -> bool:
+            return max_s is None or v <= max_s * 1.001
+
+        best = None  # (distance, rel, health, stamina | None)
+        for rel, health in slots.items():
+            if not plausible_health(health):
+                continue
+            stamina = slots.get(rel + _SLOT_BITS)
+            if stamina is not None and not plausible_stamina(stamina):
+                stamina = None
+            near = abs(health - pawn.health) <= _FOLLOW_HEALTH_TOL * max_h
+            if stamina is not None and pawn.stamina is not None and max_s:
+                near = near and abs(stamina - pawn.stamina) <= _FOLLOW_STAMINA_TOL * max_s
+            if rel in trusted and (stamina is not None or near):
+                near = True
+            elif stamina is None:
+                near = near and abs(health - pawn.health) <= _FOLLOW_SINGLE_TOL * max_h
+            if not near:
+                continue
+            distance = abs(health - pawn.health) / max_h
+            if best is None or distance < best[0]:
+                best = (distance, rel, health, stamina)
+        if best is None:
+            return None
+        _, rel, health, stamina = best
+        if rel not in trusted:
+            self._votes[(header, rel)] += 1
+            if self._votes[(header, rel)] >= _FOLLOW_TRUST_VOTES:
+                self._trusted.setdefault(header, set()).add(rel)
+        pawn.health = health
+        if stamina is not None:
+            pawn.stamina = stamina
+        self.followed += 1
+        return pawn

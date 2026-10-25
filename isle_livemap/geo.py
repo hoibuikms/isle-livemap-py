@@ -564,7 +564,7 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
 
 def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None) -> tuple[str, str]:
     """(head, tail) of the minimap label. Only what is known is printed: name (or id) and species on the head;
-    the tail holds the known vitals ("HP 92%", "G 40%"), then distance, compass bearing and height difference.
+    the tail holds the known vitals ("HP 92%", "ST 40%", "G 40%"), then distance, compass bearing and height difference.
     Unknown fields are omitted, never shown as a placeholder."""
     e, dz = n.entity, height_delta_m(n, my_z)
     mark = "~" if e.inferred else ""
@@ -576,6 +576,8 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None)
     parts = []
     if e.health_pct is not None:
         parts.append(f"HP {e.health_pct:.0f}%")
+    if e.stamina_pct is not None:
+        parts.append(f"ST {e.stamina_pct:.0f}%")
     if e.growth_pct is not None:
         parts.append(f"G {e.growth_pct:.0f}%")
     parts += [format_distance(n.distance_m), compass_label(n.bearing)]
@@ -646,29 +648,48 @@ def entity_summary(n: Nearby, my_z: float | None = None) -> str:
 Rect = tuple[float, float, float, float]  # x, y, w, h
 
 
-def _overlaps(a: Rect, b: Rect) -> bool:
-    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+def _overlaps(a: Rect, b: Rect, tol: float = 0.0) -> bool:
+    return a[0] < b[0] + b[2] - tol and b[0] < a[0] + a[2] - tol and a[1] < b[1] + b[3] - tol and b[1] < a[1] + a[3] - tol
+
+
+def label_slots(ax: float, ay: float, w: float, h: float, bounds: Rect) -> list[Rect]:
+    """Candidate rects for a label at anchor (ax, ay), best first: centred under the marker, then above (centred),
+    right, left, then hung to one side of the marker near the edge of a round view, then one row further out."""
+    bx, _by, bw, _bh = bounds
+    cx = min(max(ax - w / 2, bx), bx + bw - w)  # centred under/above, clamped into the view
+    return [(cx, ay + 8, w, h), (cx, ay - 8 - h, w, h),
+            (ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h),
+            (ax - 8, ay + 8, w, h), (ax + 8 - w, ay + 8, w, h), (ax - 8, ay - 8 - h, w, h), (ax + 8 - w, ay - 8 - h, w, h),
+            (cx, ay + 9 + h, w, h), (cx, ay - 9 - 2 * h, w, h)]
+
+
+SLOT_SLACK_PX = 3.0  # the slot a label already has may be this much worse than a new one would be allowed to be
 
 
 def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect,
-                accept: Callable[[Rect], bool] | None = None) -> Rect | None:
-    """Pick a label rect for anchor (ax, ay), preferring centred directly under the marker, then
-    above (centred), right, left. A centred candidate is shifted sideways so it stays inside
-    ``bounds``; every candidate must lie inside ``bounds``, overlap no already placed label and satisfy
-    ``accept`` (e.g. lie inside the round minimap). Returns None if none fits."""
+                accept: Callable[[Rect], bool] | None = None, prefer: int | None = None,
+                slot: list[int] | None = None, prefer_accept: Callable[[Rect], bool] | None = None) -> Rect | None:
+    """Pick a label rect for anchor (ax, ay): the first candidate of ``label_slots`` that lies inside ``bounds``,
+    overlaps no already placed label and satisfies ``accept`` (e.g. lie inside the round minimap). ``prefer`` is the
+    index chosen for this marker last time: it is tried first, and with ``SLOT_SLACK_PX`` of tolerance on the bounds,
+    on overlaps and (through ``prefer_accept``) on ``accept``, so a label keeps its side while it still more or less
+    fits. Without that a dot moving along the edge of the round view made its label jump between two sides every few
+    frames. ``slot`` (a list) receives the chosen index. Returns None if none fits."""
     bx, by, bw, bh = bounds
     if w > bw:
         return None
-    cx = min(max(ax - w / 2, bx), bx + bw - w)  # centred under/above, clamped into the view
-    for r in ((cx, ay + 8, w, h), (cx, ay - 8 - h, w, h),
-              (ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h),
-              # near the edge of a round view the centred label does not fit: hang it to one side of the marker
-              (ax - 8, ay + 8, w, h), (ax + 8 - w, ay + 8, w, h), (ax - 8, ay - 8 - h, w, h), (ax + 8 - w, ay - 8 - h, w, h),
-              # two creatures side by side: the second label goes one row further out
-              (cx, ay + 9 + h, w, h), (cx, ay - 9 - 2 * h, w, h)):
-        inside = (r[0] >= bx and r[1] >= by and r[0] + r[2] <= bx + bw and r[1] + r[3] <= by + bh)
-        if inside and (accept is None or accept(r)) and not any(_overlaps(r, o) for o in placed):
+    slots = label_slots(ax, ay, w, h, bounds)
+    order = range(len(slots)) if prefer is None or not 0 <= prefer < len(slots) else \
+        [prefer, *[i for i in range(len(slots)) if i != prefer]]
+    for i in order:
+        r = slots[i]
+        tol = SLOT_SLACK_PX if i == prefer else 0.0
+        inside = (r[0] >= bx - tol and r[1] >= by - tol and r[0] + r[2] <= bx + bw + tol and r[1] + r[3] <= by + bh + tol)
+        test = (prefer_accept or accept) if tol else accept
+        if inside and (test is None or test(r)) and not any(_overlaps(r, o, tol) for o in placed):
             placed.append(r)
+            if slot is not None:
+                slot[:] = [i]
             return r
     return None
 
@@ -681,6 +702,8 @@ DR_MIN_DT_S = 0.05  # samples closer than this give a noisy velocity; the old ve
 DR_MAX_INTERVAL_S = 3.0  # samples further apart are not one continuous movement: no velocity
 DR_MAX_EXTRAP_S = 1.0
 DR_MAX_SPEED = 6_000.0  # cm/s (60 m/s); faster is a glitch or a respawn, not movement
+DR_CORR_TAU_S = 0.2  # a new sample is blended in over this long, so a late or off-course sample bends the path instead of jumping
+DR_FF_GRACE_S = 0.3  # the dot keeps its velocity this long past the horizon: a sample that is a little late must not stop it
 
 
 class EntitySmoother:
@@ -695,6 +718,12 @@ class EntitySmoother:
 
     def __init__(self, tau_s: float = 0.15, snap_distance_units: float = 200_000.0, ttl_s: float = PEER_TTL_S) -> None:
         self.tau, self.snap, self.ttl = tau_s, snap_distance_units, ttl_s
+        # None: an id the source stopped listing stays until ``ttl_s`` after its last report (a lab feed that drops one
+        # packet). A number: the source is authoritative (the game feed removes a creature when the server destroys it),
+        # so a missing id leaves after this many seconds.
+        self.missing_grace_s: float | None = None
+        self._missing: dict[str, float] = {}  # id -> time it was first absent from an update
+        self._born: dict[str, int] = {}  # id -> serial of the source's entry: a new one is a different creature (reused id)
         self.entities: dict[str, Entity] = {}
         self.pos: dict[str, list[float]] = {}
         self.heading: dict[str, float] = {}
@@ -723,12 +752,21 @@ class EntitySmoother:
     def update(self, entities, now: float | None = None) -> None:
         new: dict[str, Entity] = {}
         seen: dict[str, float] = {}
+        born_of: dict[str, int] = {}
         for item in entities:
             e = getattr(item, "entity", item)
             new[e.id] = e
+            born_of[e.id] = getattr(item, "born", 0)
             ls = getattr(item, "last_seen", None)
             seen[e.id] = ls if ls is not None else (now if now is not None else 0.0)
         for eid, e in new.items():
+            born = born_of.get(eid, 0)
+            if born and self._born.get(eid, born) != born:  # the id was reused: not the creature the dot was following
+                self.pos.pop(eid, None)
+                self._sample.pop(eid, None)
+                self._vel.pop(eid, None)
+                self.heading.pop(eid, None)
+            self._born[eid] = born
             cur = self.pos.get(eid)
             if cur is None or math.hypot(e.x - cur[0], e.y - cur[1]) > self.snap:
                 self.pos[eid] = [e.x, e.y]
@@ -740,10 +778,25 @@ class EntitySmoother:
             elif eid not in self.heading:
                 self.heading[eid] = e.heading
         self.last_seen.update(seen)
+        for eid in new:
+            self._missing.pop(eid, None)
         if now is None:
             gone = set(self.pos) - set(new)
-        else:  # keep missing ids until their TTL runs out
-            gone = {i for i in self.pos if i not in new and now - self.last_seen.get(i, now) >= self.ttl}
+        else:
+            for eid in self.pos:
+                if eid not in new:
+                    self._missing.setdefault(eid, now)
+            gone = self._expired(now)
+        self._forget(gone)
+        self.entities = {**{i: e for i, e in self.entities.items() if i in self.pos}, **new}
+
+    def _expired(self, now: float) -> set[str]:
+        grace = self.missing_grace_s
+        if grace is None:
+            return {i for i in self._missing if now - self.last_seen.get(i, now) >= self.ttl}
+        return {i for i, since in self._missing.items() if now - since >= grace}
+
+    def _forget(self, gone) -> None:
         for eid in gone:
             self.pos.pop(eid, None)
             self.heading.pop(eid, None)
@@ -751,7 +804,16 @@ class EntitySmoother:
             self.entities.pop(eid, None)
             self._sample.pop(eid, None)
             self._vel.pop(eid, None)
-        self.entities = {**{i: e for i, e in self.entities.items() if i in self.pos}, **new}
+            self._missing.pop(eid, None)
+            self._born.pop(eid, None)
+
+    def prune(self, now: float) -> None:
+        """Drop ids that the source no longer lists once their grace is over. ``update`` only runs when the source
+        changed, but time passes every frame: without this a destroyed creature would stay until the next change."""
+        if self._missing:
+            gone = self._expired(now)
+            if gone:
+                self._forget(gone)
 
     def target(self, eid: str, now: float | None = None, lead: float = 0.0) -> tuple[float, float]:
         """Where the entity is expected to be at ``now``: its last sample, advanced along its velocity
@@ -765,12 +827,25 @@ class EntitySmoother:
         return e.x + v[0] * ahead, e.y + v[1] * ahead
 
     def step(self, dt: float, now: float | None = None) -> None:
-        a = 1.0 - math.exp(-max(dt, 0.0) / self.tau) if self.tau > 0 else 1.0
+        dt = max(dt, 0.0)
+        a = 1.0 - math.exp(-dt / self.tau) if self.tau > 0 else 1.0
+        c = 1.0 - math.exp(-dt / max(self.tau, DR_CORR_TAU_S))
         for eid, e in self.entities.items():
             p = self.pos[eid]
-            tx, ty = self.target(eid, now, self.tau)  # tau of lead cancels the filter's steady lag
-            p[0] += (tx - p[0]) * a
-            p[1] += (ty - p[1]) * a
+            v = self._vel.get(eid)
+            s = self._sample.get(eid)
+            if now is None or v is None or s is None:
+                p[0] += (e.x - p[0]) * a
+                p[1] += (e.y - p[1]) * a
+            else:
+                # Feed-forward: the dot moves at the measured velocity all the time and the error to the newest sample
+                # (advanced along that velocity, within its horizon) is blended in. It never waits at the end of a
+                # horizon for a late sample and never jumps when the sample arrives: no stop-and-go, no lag at a steady pace.
+                age = max(now - s[2], 0.0)
+                f = min(age, v[2])
+                go = dt if age <= v[2] + DR_FF_GRACE_S else 0.0
+                p[0] += v[0] * go + (e.x + v[0] * f - p[0]) * c
+                p[1] += v[1] * go + (e.y + v[1] * f - p[1]) * c
             h = self.heading.get(eid)
             if h is not None and e.heading is not None:
                 self.heading[eid] = (h + shortest_arc(h, e.heading) * a) % 360.0

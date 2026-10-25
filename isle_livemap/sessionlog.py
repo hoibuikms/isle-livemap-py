@@ -301,9 +301,11 @@ class SessionLog:
             rec = self.recorder
             summary = getattr(self.peers, "summary", None)
             self.event("%s: in=%d out=%d decoded=%d dropped=%d | creation=%d exports=%d destroyed=%d | "
-                       "actors tracked=%d distinct handles=%d | recorded=%s%s",
+                       "actors tracked=%d distinct handles=%d | worker queue max=%d slow decodes=%d capture errors=%d "
+                       "worker restarts=%d | recorded=%s%s",
                        label, c.get("inbound", 0), c.get("outbound", 0), c.get("decoded", 0), c.get("dropped", 0),
                        self.creation, self.exports, self.destroyed, actors, len(self.handles),
+                       c.get("queue_max", 0), c.get("slow_decodes", 0), c.get("capture_errors", 0), c.get("worker_restarts", 0),
                        f"{rec.packets} pkts in {rec.path.name}" if rec is not None else "no",
                        f" | {summary()}" if callable(summary) else "")
         except Exception:  # noqa: BLE001

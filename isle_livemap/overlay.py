@@ -14,7 +14,7 @@ from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
-    PEER_STALE_S, PEER_TTL_S, LABEL_RANK, label_limits, place_label, vital_lines, visible_entities,
+    PEER_STALE_S, PEER_TTL_S, LABEL_RANK, SLOT_SLACK_PX, label_limits, place_label, vital_lines, visible_entities,
 )
 from .peers import status_is_warning
 from .tracking import Vitals
@@ -47,6 +47,11 @@ class MapView(QWidget):
         self.record_status = ""  # set by App once a second while --record is active
         self._marker_tools: dict[tuple[str, bool], tuple[QPen, QColor]] = {}
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
+        self._label_slot: dict[str, int] = {}  # peer id -> label slot used last frame: tried first, so labels do not hop
+        self._labelled: set[str] = set()  # peers that had a label last frame: they keep it over equally near newcomers
+        self.errors = 0  # frames in which tick() or paintEvent() raised (the frame is still scheduled)
+        self.last_error = ""
+        self._snap_ok = True
         self.interp = Interpolator()
         self.full_map = False
         self.edit_mode = False
@@ -112,25 +117,53 @@ class MapView(QWidget):
     def tick(self) -> None:
         now = time.monotonic()
         dt, self._last = now - self._last, now
+        try:
+            self._advance(now, dt)
+        except Exception as err:  # noqa: BLE001 - one bad frame must not freeze the minimap: draw what we have
+            self._note_error("tick", err)
+        finally:
+            self.update()  # always: the dots keep moving (dead reckoning) even when nothing new arrives
+
+    def _note_error(self, where: str, err: Exception) -> None:
+        self.errors += 1
+        self.last_error = f"{where}: {type(err).__name__}: {err}"
+        if self.errors <= 3 or self.errors % 600 == 0:  # a per-frame failure must not flood the log at 60 lines/s
+            import logging
+
+            logging.getLogger("isle_livemap.overlay").exception("minimap %s failed (%d so far)", where, self.errors)
+
+    def _advance(self, now: float, dt: float) -> None:
         t = self.pipeline.latest
         if t.position is not None and t.position_at != self._last_pos_at:
             self._last_pos_at = t.position_at
             self.interp.set_target(t.position.x, t.position.y, t.position.map_heading_degrees, t.position_at)
+        elif t.position is None and self.interp.has_fix:
+            # the pipeline was reset (new server, game closed): the old position is not the player's any more, and a
+            # marker parked there with "nearby" measured from it is a stuck map. Say "waiting" until a new fix arrives.
+            self.interp.has_fix = False
+            self._last_pos_at = 0.0
         self.interp.step(dt, now)
         if self.peers is not None:
-            snap = self.peers.snapshot()
-            self.peer_status = snap.status if snap.enabled else ""
-            # the source decides how long silence is tolerated (game: deltas only, so idle actors go quiet)
-            self.ents.ttl = getattr(self.peers, "ttl_s", PEER_TTL_S)
-            self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
-            # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
-            if snap is not self._peers_snap or snap.version != self._peers_version:
-                self._peers_snap, self._peers_version = snap, snap.version
-                self.ents.update(snap.entities, now)
+            try:
+                snap = self.peers.snapshot()
+            except Exception as err:  # noqa: BLE001 - keep drawing the last good snapshot
+                self._note_error("peer snapshot", err)
+                snap = self._peers_snap
+            if snap is not None:
+                self.peer_status = snap.status if snap.enabled else ""
+                # the source decides how long silence is tolerated (game: deltas only, so idle actors go quiet)
+                self.ents.ttl = getattr(self.peers, "ttl_s", PEER_TTL_S)
+                self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
+                # a source that removes creatures itself (the game: destruction records) needs no second, longer timer here
+                self.ents.missing_grace_s = getattr(self.peers, "gone_grace_s", None)
+                # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
+                if snap is not self._peers_snap or snap.version != self._peers_version:
+                    self._peers_snap, self._peers_version = snap, snap.version
+                    self.ents.update(snap.entities, now)
         else:
             self.peer_status = ""
+        self.ents.prune(now)
         self.ents.step(dt, now)
-        self.update()
 
     def nearby(self, radius_m: float | None = ..., now: float | None = None) -> list[Nearby]:
         """Other players relative to the local player, nearest first (``geo.visible_entities``,
@@ -167,23 +200,27 @@ class MapView(QWidget):
     # ---- painting ---------------------------------------------------------
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
-        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        r = QRectF(self.rect())
-        if not self.full_map:
-            p.setClipRegion(self._circle_region())
-        p.fillRect(r, QColor(10, 14, 18, 150 if self.full_map else 90))
-        self._draw_map(p)
-        self._draw_zones(p)
-        self._draw_rings(p)
-        self._draw_markers(p)
-        self._draw_entities(p)
-        self._draw_player(p)
-        p.setClipping(False)
-        self._draw_border(p)
-        self._draw_hud(p)
-        self._draw_peer_status(p)
-        self._draw_record_status(p)
-        p.end()
+        try:
+            p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+            r = QRectF(self.rect())
+            if not self.full_map:
+                p.setClipRegion(self._circle_region())
+            p.fillRect(r, QColor(10, 14, 18, 150 if self.full_map else 90))
+            for layer in (self._draw_map, self._draw_zones, self._draw_rings, self._draw_markers, self._draw_entities,
+                          self._draw_player):
+                self._paint_layer(layer, p)
+            p.setClipping(False)
+            for layer in (self._draw_border, self._draw_hud, self._draw_peer_status, self._draw_record_status):
+                self._paint_layer(layer, p)
+        finally:
+            p.end()  # an unbalanced painter would blank every later frame
+
+    def _paint_layer(self, layer, p: QPainter) -> None:
+        """One layer failing (a bad value in one peer) must not take the others, or the next frame, with it."""
+        try:
+            layer(p)
+        except Exception as err:  # noqa: BLE001
+            self._note_error(layer.__name__, err)
 
     def _circle_region(self):
         from PySide6.QtGui import QRegion
@@ -254,6 +291,7 @@ class MapView(QWidget):
         # Minimap: only within the configured radius. Full map: every known peer.
         near = self.nearby(None if self.full_map else self.settings.peer_radius_m)
         if not near:
+            self._label_slot, self._labelled = {}, set()
             return
         bounds = (0.0, 0.0, float(self.width()), float(self.height()))
         # one view() per frame instead of one per entity (to_screen recomputes it every call)
@@ -276,6 +314,10 @@ class MapView(QWidget):
             (groups.get(n.entity.kind, other) if inside else off).append((n, pt))
         if off:
             self._draw_edge_indicators(p, off)
+        labelled_before = self._labelled
+        if labelled_before:  # a peer that had a label keeps it over a newcomer at almost the same distance
+            for items in groups.values():
+                items.sort(key=lambda it: it[0].distance_m * (0.8 if it[0].entity.id in labelled_before else 1.0))
         by_priority = [it for kind in sorted(groups, key=LABEL_RANK.get) for it in groups[kind]] + other
         ai_on_screen = len(groups["ai"])
         max_labels, max_ai_labels = label_limits(len(by_priority) - ai_on_screen, ai_on_screen, self.full_map)
@@ -284,9 +326,12 @@ class MapView(QWidget):
         p.setFont(font)
         centre, radius = QPointF(self.width() / 2, self.height() / 2), self.width() / 2 - 3
 
-        def in_circle(r) -> bool:  # the minimap clips to its circle: a label must not run past the edge
-            return self.full_map or all(math.hypot(x - centre.x(), y - centre.y()) <= radius
+        def in_circle(r, extra: float = 0.0) -> bool:  # the minimap clips to its circle: a label must not run past the edge
+            return self.full_map or all(math.hypot(x - centre.x(), y - centre.y()) <= radius + extra
                                         for x in (r[0], r[0] + r[2]) for y in (r[1], r[1] + r[3]))
+
+        def in_circle_loose(r) -> bool:  # for the slot a label already has (see geo.SLOT_SLACK_PX)
+            return in_circle(r, SLOT_SLACK_PX)
 
         placed: list[tuple[float, float, float, float]] = []  # label rectangles already taken; the status lines are too
         top = 6.0 if self.full_map else 18.0
@@ -295,6 +340,7 @@ class MapView(QWidget):
             if shown:
                 placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
         labelled = attempts = ai_labelled = 0
+        slots_now: dict[str, int] = {}
         widths = self._text_widths  # text measuring is the slow part of the layer: measure each string once
         if len(widths) > 2000:
             widths.clear()
@@ -317,13 +363,16 @@ class MapView(QWidget):
             lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail)
             w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
             h = fm.height() * len(lines)
-            r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle)
+            eid = n.entity.id
+            prefer, slot = self._label_slot.get(eid), [0]
+            r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose)
             if r is not None:
                 placed.append(r)
             elif not is_ai:
-                r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle)
+                r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose)
             if r is None:
                 continue
+            slots_now[eid] = slot[0]
             labelled += 1
             ai_labelled += is_ai
             alpha = STALE_ALPHA if n.stale else 255
@@ -334,6 +383,8 @@ class MapView(QWidget):
                 p.drawText(base + QPointF(1, 1), text)
                 p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
+        self._label_slot = slots_now
+        self._labelled = set(slots_now)
 
     def _draw_entity_marker(self, p: QPainter, n: Nearby, pt: QPointF) -> None:
         """Peer glyph: arrow when a heading is known, else a dot (diamond for ai); dim when stale.

@@ -163,7 +163,8 @@ class TelemetryPipeline:
         self._reset_observers: list[Callable[[], None]] = []
         # fn(datagram) for EVERY datagram handed to handle(), both directions, before decoding (the recorder).
         self._datagram_observers: list[Callable[[Datagram], None]] = []
-        self._counts = {"outbound": 0, "inbound": 0, "dropped": 0, "udp_total": 0, "decoded": 0}
+        self._counts = {"outbound": 0, "inbound": 0, "dropped": 0, "udp_total": 0, "decoded": 0,
+                        "queue_max": 0, "slow_decodes": 0, "capture_errors": 0, "worker_restarts": 0}
         # fn(where) called from inside an ``except`` block when a decoder/observer raised (the session log
         # records the traceback); the exception itself is still swallowed so capture never stops.
         self.error_hook: Callable[[str], None] | None = None
@@ -232,6 +233,14 @@ class TelemetryPipeline:
 
     def note_dropped(self, n: int = 1) -> None:
         self._counts["dropped"] += n
+
+    def note_gauge(self, name: str, value: int) -> None:
+        """Keep the largest value seen (queue depth)."""
+        if value > self._counts.get(name, 0):
+            self._counts[name] = value
+
+    def note_count(self, name: str, n: int = 1) -> None:
+        self._counts[name] = self._counts.get(name, 0) + n
 
     def note_udp(self, n: int = 1) -> None:
         """Count every UDP packet the sniffer sees (before port filtering)."""
@@ -429,7 +438,12 @@ class PreCaptureBuffer:
     them and opening Npcap takes seconds, and the server's join tables are sent only once). Packets of unowned ports
     wait here for ``MAX_AGE_S``; when ``set_ports`` learns a port, the packets of that port are handed over first, in
     arrival order, with their original timestamps, so a connection started during the delay is decoded from its first
-    datagram. ``offer`` and ``set_ports`` share one lock, which keeps replayed packets ahead of newer ones."""
+    datagram.
+
+    The hand-over runs OUTSIDE the lock (parsing thousands of packets used to keep the sniffer thread out of ``offer``
+    for 100 ms and more). Until it has caught up, the new ports stay "unowned": ``offer`` keeps holding their packets,
+    and the hand-over loop takes them too, so a packet that arrives during the hand-over still comes after the older
+    ones. Only then do the ports become owned."""
 
     MAX_AGE_S = 15.0
     MAX_PACKETS = 4096
@@ -437,12 +451,19 @@ class PreCaptureBuffer:
     def __init__(self, max_age_s: float = MAX_AGE_S, max_packets: int = MAX_PACKETS) -> None:
         self.max_age_s, self.max_packets = max_age_s, max_packets
         self._lock = threading.Lock()
+        self._handover = threading.Lock()  # one set_ports at a time
         self._held: collections.deque = collections.deque()  # (time, packet, source port, destination port)
         self.owned: frozenset[int] = frozenset()
+        self._draining: frozenset[int] = frozenset()
         self.replayed = 0
 
     def __len__(self) -> int:
         return len(self._held)
+
+    @property
+    def ports(self) -> frozenset[int]:
+        """Ports whose packets may be turned into datagrams now: owned, or being handed over."""
+        return self.owned | self._draining
 
     def offer(self, at: float, packet, sport: int, dport: int) -> bool:
         """True: held (nobody owns either port). False: the caller handles the packet now."""
@@ -459,20 +480,34 @@ class PreCaptureBuffer:
         """Replace the owned ports; ``emit(time, packet)`` gets every held packet of a newly owned port. Returns
         how many were handed over."""
         ports = frozenset(ports)
-        with self._lock:
-            new = ports - self.owned
-            self.owned = ports
-            if not new or not self._held:
-                return 0
-            keep: collections.deque = collections.deque()
+        with self._handover:
+            with self._lock:
+                self.owned = self.owned & ports  # a port the game closed is unowned again at once
+                new = ports - self.owned
+                if not new:
+                    return 0
+                self._draining = new
             handed = 0
-            for item in self._held:
-                if item[2] in new or item[3] in new:
-                    emit(item[0], item[1])
-                    handed += 1
-                else:
-                    keep.append(item)
-            self._held = keep
+            try:
+                while True:
+                    with self._lock:
+                        mine = [item for item in self._held if item[2] in new or item[3] in new]
+                        if not mine:
+                            self.owned = self.owned | new
+                            self._draining = frozenset()
+                            break
+                        self._held = collections.deque(i for i in self._held if not (i[2] in new or i[3] in new))
+                    for item in mine:
+                        try:
+                            emit(item[0], item[1])
+                        except Exception:  # noqa: BLE001 - one bad packet must not leave the ports half handed over
+                            pass
+                        handed += 1
+            finally:
+                with self._lock:
+                    if self._draining:  # emit raised something worse than an Exception: still end the hand-over
+                        self.owned = self.owned | self._draining
+                        self._draining = frozenset()
             self.replayed += handed
             return handed
 
@@ -493,16 +528,34 @@ class LiveCapture:
         self._all_mode = False
         self._opened_at = 0.0
         self._udp_at_open = 0
+        self._tracked_pid: int | None = None
+        self._stall_udp = -1
+        self._stall_at = 0.0
+        self._reopened_at = 0.0
+        self._work_thread: threading.Thread | None = None
+        self._packet_errors = 0
+
+    RETRY_STEP_S = 1.0  # after a failed supervisor step: wait this much per failure in a row ...
+    RETRY_MAX_S = 5.0  # ... up to this
+    STALL_S = 10.0  # the game owns UDP ports but not one UDP packet was seen this long: the interface is not the right one
+    STALL_COOLDOWN_S = 30.0
+    SLOW_DECODE_S = 0.05  # a datagram that takes the worker longer than this is counted ("slow decodes")
 
     def start(self) -> None:
         if not is_windows():
             raise CaptureUnavailable("Live capture needs Windows + Npcap. Use --replay on this OS.")
         if not npcap_available():
             raise CaptureUnavailable("Npcap not found. Install it from https://npcap.com (WinPcap API-compatible mode).")
-        for target in (self._supervise, self._work):
-            t = threading.Thread(target=target, daemon=True, name=f"isle-{target.__name__}")
-            t.start()
-            self._threads.append(t)
+        self._start_worker()
+        t = threading.Thread(target=self._supervise, daemon=True, name="isle-_supervise")
+        t.start()
+        self._threads.append(t)
+
+    def _start_worker(self) -> None:
+        t = threading.Thread(target=self._work, daemon=True, name="isle-_work")
+        t.start()
+        self._work_thread = t
+        self._threads.append(t)
 
     def stop(self) -> None:
         self._stop.set()
@@ -518,24 +571,36 @@ class LiveCapture:
             now = time.monotonic()
             if self._precap.offer(now, pkt, int(pkt[UDP].sport), int(pkt[UDP].dport)):
                 return  # no game socket owns this port yet: kept for the moment one does
-            d = datagram_from_scapy(pkt, self._precap.owned, now)
+            d = datagram_from_scapy(pkt, self._precap.ports, now)
             if d is not None:
                 self._q.put_nowait(d)
         except queue.Full:
             self.pipeline.note_dropped()
         except Exception:  # noqa: BLE001 - malformed traffic must not stop capture
-            pass
+            self._packet_errors += 1
+            self.pipeline.note_count("capture_errors")
+            if self._packet_errors <= 3:
+                get_logger().exception("sniffer callback failed (%d so far)", self._packet_errors)
 
     def _work(self) -> None:
+        """Decode worker. Nothing a datagram does may end this loop; if it ends anyway the supervisor starts it again."""
+        depth_seen = 0
         while not self._stop.is_set():
             try:
                 d = self._q.get(timeout=0.25)
             except queue.Empty:
                 continue
+            depth = self._q.qsize()
+            if depth > depth_seen:
+                depth_seen = depth
+                self.pipeline.note_gauge("queue_max", depth)
+            began = time.perf_counter()
             try:
                 self.pipeline.handle(d)
             except Exception:  # noqa: BLE001
                 self.pipeline.report_error("pipeline.handle")
+            if time.perf_counter() - began > self.SLOW_DECODE_S:
+                self.pipeline.note_count("slow_decodes")
 
     # -- sniffer management ------------------------------------------------
 
@@ -586,7 +651,7 @@ class LiveCapture:
         self._sniffers = []
 
     def _emit_held(self, at: float, pkt) -> None:
-        d = datagram_from_scapy(pkt, self._precap.owned, at)
+        d = datagram_from_scapy(pkt, self._precap.ports, at)  # the ports being handed over are not owned yet
         if d is None:
             return
         try:
@@ -653,46 +718,83 @@ class LiveCapture:
             self._force_all = True  # one-shot widening
 
     def _supervise(self) -> None:
+        """Supervisor thread: one step every second or so. A step that raises is logged and retried (the old loop
+        ended for good, leaving the app with a minimap that never updated again and a status line saying why only once)."""
+        log = get_logger()
+        failures = 0
         try:
-            self._supervise_inner()
+            from scapy.config import conf
+
+            conf.use_pcap = True  # sniff through Npcap
         except Exception as e:  # noqa: BLE001
-            get_logger().exception("supervisor crashed")
+            log.exception("scapy unavailable")
             self.pipeline.set_status(f"capture failed: {type(e).__name__}: {e}"[:160])
-
-    def _supervise_inner(self) -> None:
-        from scapy.config import conf
-
-        conf.use_pcap = True  # sniff through Npcap
-        tracked_pid: int | None = None
+            return
         while not self._stop.is_set():
-            pid = find_game_pid()
-            if pid is None:
-                if tracked_pid is not None:
-                    self.pipeline.reset()
-                    tracked_pid = None
-                    self._precap.set_ports((), self._emit_held)
-                self.pipeline.set_status("waiting for game")
-                self._ensure_early()  # already sniffing when the game starts and joins
-                self._stop.wait(1.0)
-                continue
-            ports = owned_udp_ports(pid)
-            if not ports:
-                self.pipeline.set_status("game running, no UDP socket yet")
-                self._ensure_early()
-                self._stop.wait(0.5)
-                continue
-            if pid != tracked_pid:
-                self.pipeline.reset()
-                tracked_pid = pid
-                self._opened_at = time.monotonic()  # the 5 s "no UDP at all" check starts with the game
-                self._udp_at_open = self.pipeline.counts().get("udp_total", 0)
-            self._precap.set_ports(ports, self._emit_held)  # packets held for a newly owned port go first
-            self._watchdog()
-            self._ensure_capture()
-            if self._sniffers and self.pipeline.latest.status not in ("capturing", "tracking"):
-                self.pipeline.set_status("capturing")
-            self._stop.wait(2.0)
+            try:
+                wait = self._step()
+                failures = 0
+            except Exception as e:  # noqa: BLE001
+                failures += 1
+                self.pipeline.note_count("capture_errors")
+                if failures <= 3 or failures % 30 == 0:
+                    log.exception("supervisor step failed (%d in a row)", failures)
+                self.pipeline.set_status(f"capture error, retrying: {type(e).__name__}: {e}"[:160])
+                wait = min(failures * self.RETRY_STEP_S, self.RETRY_MAX_S)
+            self._stop.wait(wait)
         self._close_sniffers()
+
+    def _ensure_worker(self) -> None:
+        t = self._work_thread
+        if t is not None and not t.is_alive() and not self._stop.is_set():
+            get_logger().error("decode worker died; starting a new one")
+            self.pipeline.note_count("worker_restarts")
+            self._start_worker()
+
+    def _check_stall(self, now: float) -> None:
+        """The game has a UDP socket but no UDP packet at all has been seen for ``STALL_S``: the sniffers listen on an
+        interface the traffic no longer uses (Wi-Fi to cable, VPN up or down). Reopen on every interface."""
+        udp = self.pipeline.counts().get("udp_total", 0)
+        if udp != self._stall_udp:
+            self._stall_udp, self._stall_at = udp, now
+        elif self._sniffers and now - self._stall_at >= self.STALL_S and now - self._reopened_at >= self.STALL_COOLDOWN_S:
+            get_logger().warning("no UDP seen for %.0f s on %s although the game has a socket; reopening on all interfaces",
+                                 now - self._stall_at, [n for n, _ in self._sniffers])
+            self._close_sniffers()
+            self._force_all = True
+            self._reopened_at = now
+            self._stall_at = now
+
+    def _step(self) -> float:
+        """One supervisor round; returns how long to wait before the next."""
+        self._ensure_worker()
+        pid = find_game_pid()
+        if pid is None:
+            if self._tracked_pid is not None:
+                self.pipeline.reset()
+                self._tracked_pid = None
+                self._precap.set_ports((), self._emit_held)
+            self.pipeline.set_status("waiting for game")
+            self._ensure_early()  # already sniffing when the game starts and joins
+            return 1.0
+        ports = owned_udp_ports(pid)
+        if not ports:
+            self.pipeline.set_status("game running, no UDP socket yet")
+            self._ensure_early()
+            return 0.5
+        if pid != self._tracked_pid:
+            self.pipeline.reset()
+            self._tracked_pid = pid
+            self._opened_at = time.monotonic()  # the 5 s "no UDP at all" check starts with the game
+            self._udp_at_open = self.pipeline.counts().get("udp_total", 0)
+            self._stall_udp, self._stall_at = -1, time.monotonic()
+        self._precap.set_ports(ports, self._emit_held)  # packets held for a newly owned port go first
+        self._watchdog()
+        self._ensure_capture()
+        self._check_stall(time.monotonic())
+        if self._sniffers and self.pipeline.latest.status not in ("capturing", "tracking"):
+            self.pipeline.set_status("capturing")
+        return 2.0
 
 
 def _thread_alive(sniffer) -> bool:

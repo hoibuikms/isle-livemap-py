@@ -137,8 +137,9 @@ def test_peers_come_from_inbound_batches_with_unknown_fields_none(b64):
     snap = g.snapshot()
     assert len(snap.entities) == 15 and g.locations == 15
     e = {p.id: p.entity for p in snap.entities}["93362"]
-    # these fixtures hold no creation record for the handle: its class is unknown, so it is neither a player nor a dino
-    assert (e.kind, e.name, e.species) == ("unknown", "Unknown #93362", "")
+    # these fixtures hold no creation record for the handle, and every state batch is the animal size (155/158 bits):
+    # a server animal ("ai"), neither a player nor a dino, from its very first batch
+    assert (e.kind, e.name, e.species) == ("ai", "Actor #93362", "")
     assert (e.x, e.y, e.z) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88))
     assert (e.health_pct, e.growth_pct, e.stamina_pct, e.hunger_pct, e.thirst_pct, e.heading) == (None,) * 6
     assert "not available" in snap.status and not peers.status_is_warning(snap.status)
@@ -150,7 +151,7 @@ def test_game_labels_have_no_placeholders_only_id_distance_bearing_and_height(b6
     near = visible_entities([(p.entity, p.entity.x, p.entity.y) for p in g.snapshot().entities], 200_000.0, -250_000.0, 5_000.0)
     assert near
     head, tail, *rest = peer_label_lines(near[0], my_z=30_000.0)
-    assert head == f"Unknown #{near[0].entity.id}" and not rest
+    assert head == f"Actor #{near[0].entity.id}" and not rest
     assert "?" not in head + tail and "HP" not in tail and "G " not in tail
     assert re.fullmatch(r"\d+ m (N|NE|E|SE|S|SW|W|NW) [+-]\d+m", tail), tail
 
@@ -173,7 +174,7 @@ def test_own_handle_change_replaces_the_exclusion(b64):
     g.on_inbound(inbound(b64("SecondHeartbeat")), 82_008)  # respawn: new pawn, old handle may belong to someone else
     ids = {p.id for p in g.snapshot().entities}
     assert "82008" not in ids and "84466" not in ids  # configured self id kept
-    assert "93362" in ids
+    assert "93362" not in ids  # the old pawn is my own body: never a "nearby creature" (a dot that never moves again)
 
 
 def test_destruction_record_removes_a_tracked_peer_only(b64):
@@ -191,13 +192,24 @@ def test_silent_peer_expires_after_ttl(b64):
     # Iris sends changes only, so an idle actor is silent: game peers are dimmed late and kept long (destruction
     # records remove them at once), unlike the 3 s / 5 s of the lab feed.
     g, clk = make()
-    assert (g.stale_s, g.ttl_s) == (GAME_PEER_STALE_S, GAME_PEER_TTL_S) and g.ttl_s > peers.PEER_TTL_S
+    assert (g.stale_s, g.TTL_AI_S) == (GAME_PEER_STALE_S, GAME_PEER_TTL_S) and g.TTL_AI_S > peers.PEER_TTL_S
+    assert g.ttl_s > g.TTL_AI_S  # creatures rest for minutes without a report: they wait for the destruction record
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     clk.t += peers.PEER_TTL_S + 1.0  # past the lab TTL: a stationary game actor is still there
     sn = g.snapshot()
     assert len(sn.entities) == 15 and all(clk.t - p.last_seen < g.stale_s for p in sn.entities)  # not even dimmed yet
     clk.t += g.stale_s
     assert len(g.snapshot().entities) == 15 and all(clk.t - p.last_seen >= g.stale_s for p in g.snapshot().entities)
+    clk.t += g.TTL_AI_S
+    assert g.snapshot().entities == ()  # server animals (these fixtures): the short limit
+
+
+def test_silent_creature_outlives_the_animal_limit_but_not_a_missed_destruction_record():
+    g, clk = make()
+    g.store.update(peers.Entity("7", "dino", "Actor #7", "Deinosuchus", 1.0, 2.0, 3.0))
+    g.store.update(peers.Entity("8", "ai", "Actor #8", "", 1.0, 2.0, 3.0))
+    clk.t += g.TTL_AI_S + 1.0
+    assert [p.id for p in g.snapshot().entities] == ["7"]  # resting dino stays, the fish is gone
     clk.t += g.ttl_s
     assert g.snapshot().entities == ()
 
@@ -211,7 +223,7 @@ def test_creature_still_replicated_without_a_position_stays_on_the_map(b64):
     assert len(before) == 15
     g.locator.update = lambda *a, **k: None  # same state batches, no decodable position
     for _ in range(4):
-        clk.t += g.ttl_s * 0.6
+        clk.t += g.TTL_AI_S * 0.6  # these actors are server animals: the shorter limit applies
         g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     after = {p.entity.id: p.entity for p in g.snapshot().entities}
     assert after == before  # past the TTL since the last position, same ids, same positions
@@ -401,11 +413,11 @@ def test_destruction_records_count_even_when_the_handle_is_untracked(b64):
 def test_late_join_labels_actors_unidentified_and_hints_to_rejoin(b64):
     g, _ = make()
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
-    assert not g.late_join() and "Rejoin" not in g.snapshot().status  # too little traffic to say the tables were missed
+    g.store.update(peers.Entity("999999", "unknown", "Unknown #999999", "", 1.0, 2.0, 3.0))  # a creature with no class
+    assert not g.late_join() and "rejoin" not in g.snapshot().status.lower()  # too little traffic to say the tables were missed
     g.packets = g.LATE_JOIN_PACKETS  # many packets, still no export table, no player name, no class
     snap = g.snapshot()
-    assert g.late_join() and "Rejoin" in snap.status and peers.status_is_warning(snap.status)
-    assert all(p.entity.name.startswith("Unknown #") for p in snap.entities)
+    assert g.late_join() and "rejoin" in snap.status.lower() and peers.status_is_warning(snap.status)
     assert "LATE JOIN" in g.summary()
 
 
@@ -415,7 +427,7 @@ def test_late_join_hint_is_dropped_once_a_player_name_is_known(b64):
     g.packets = g.LATE_JOIN_PACKETS
     g.identity.player_names[1] = "Someone"
     g.identity.table_classes = 1  # the export tables were seen: names can only come from them (or the class cache)
-    assert not g.late_join() and "Rejoin" not in g.snapshot().status and "LATE JOIN" not in g.summary()
+    assert not g.late_join() and "rejoin" not in g.snapshot().status.lower() and "LATE JOIN" not in g.summary()
 
 
 def test_summary_counts_actors_with_a_class_path_not_just_tracked_actors(b64):

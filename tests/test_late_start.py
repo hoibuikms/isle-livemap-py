@@ -100,9 +100,9 @@ def test_a_class_known_dinosaur_needs_fewer_batches():
 def test_headline_tells_a_late_start_to_rejoin_and_leads_the_status():
     g = source()
     feed(g, 171102, PAWN)
-    assert g.headline() == "Rejoin server: 1 hidden"
+    assert g.headline() == "Started late: rejoin to see all"
     status = g.status()
-    assert status.startswith("Rejoin server: 1 hidden | ")
+    assert status.startswith("Started late: rejoin to see all | ")
     assert peers.status_is_warning(status)
     assert len(g.headline()) <= 32  # the overlay elides the line to about 62 % of the minimap width
 
@@ -120,7 +120,37 @@ def test_headline_says_nobody_nearby_only_when_that_is_known():
     late = source()  # the tables were missed: sleeping creatures cannot be placed, so nobody-nearby is not known
     assert late.headline() == "Started late: rejoin to see all"
     seen.store.update(Entity("9", "player", "Someone", "Deinosuchus", 1.0, 2.0))
+    assert seen.headline() == "No other players nearby"  # a change waits HEADLINE_HOLD_S so the line does not flicker
+    seen._last_t += seen.HEADLINE_HOLD_S  # noqa: SLF001
     assert seen.headline() == ""
+
+
+def test_headline_is_one_constant_message_while_the_tables_are_missing():
+    g = source()
+    feed(g, 171102, PAWN)
+    assert g.headline() == "Started late: rejoin to see all"
+    for step in range(6):  # the hidden count flips between 1 and 0: the words must not
+        g._profile.clear() if step % 2 else feed(g, 171102, PAWN, t=g._last_t)  # noqa: SLF001
+        g._hidden_cache = (-1e9, 0)  # noqa: SLF001
+        g._last_t += 1.0  # noqa: SLF001
+        assert g.headline() == "Started late: rejoin to see all"
+
+
+def test_headline_with_the_tables_seen_does_not_flicker_between_two_values():
+    g = source(tables_seen=True)
+    feed(g, 171102, PAWN)
+    assert g.headline() == "1 creature: no position yet"
+    g._profile.clear()  # noqa: SLF001 - the hidden creature moved and was placed
+    g._hidden_cache = (-1e9, 0)  # noqa: SLF001
+    g._last_t += 3.0  # noqa: SLF001
+    assert g.headline() == "1 creature: no position yet"  # still inside the hold
+    feed(g, 171102, PAWN, t=g._last_t)  # noqa: SLF001 - it went quiet again
+    g._hidden_cache = (-1e9, 0)  # noqa: SLF001
+    assert g.headline() == "1 creature: no position yet"
+    g._profile.clear()  # noqa: SLF001
+    g._hidden_cache = (-1e9, 0)  # noqa: SLF001
+    g._last_t += g.HEADLINE_HOLD_S  # noqa: SLF001
+    assert g.headline() == "No other players nearby"
 
 
 def test_headline_is_quiet_until_enough_traffic_has_been_seen():

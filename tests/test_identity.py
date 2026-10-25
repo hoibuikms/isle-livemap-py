@@ -343,7 +343,7 @@ def test_learned_layout_needs_an_anchor_continuity_and_repeated_confirmation():
     t = ActorLocationTracker()
     bits, batch = synthetic_state_batch(HDR, (130_000.0, -320_000.0, 36_000.0), 94)
     assert t.update(bits, batch, 10.0, learn=True) is None  # no anchor: a plausible vector alone proves nothing
-    t.note_creation(5, (129_900.0, -320_050.0, 36_000.0), 9.0)
+    t.note_creation(5, (122_000.0, -320_000.0, 36_000.0), 9.0)  # 80 m away: inside the loose radius, outside the tight one
     assert t.update(bits, batch, 10.0, learn=False) is None  # learning is only for creature classes
     assert t.update(bits, batch, 10.0, learn=True) is None  # first sighting of (header, offset): a coincidence so far
     assert t.trusted_layouts == 0
@@ -355,6 +355,15 @@ def test_learned_layout_needs_an_anchor_continuity_and_repeated_confirmation():
     far, fb = synthetic_state_batch(HDR, (190_000.0, -320_000.0, 36_000.0), 94)  # 600 m in 0.5 s
     assert t.update(far, fb, 11.5, learn=True) is None
     assert t.last_known(5) == pytest.approx((130_300.0, -320_000.0, 36_000.0))
+
+
+def test_a_vector_right_next_to_the_anchor_needs_no_second_sighting():
+    t = ActorLocationTracker()
+    bits, batch = synthetic_state_batch(HDR, (130_000.0, -320_000.0, 36_000.0), 94)
+    t.note_creation(5, (129_000.0, -320_050.0, 36_000.0), 9.0)  # 10 m away after one second: a walking creature
+    loc = t.update(bits, batch, 10.0, learn=True)
+    assert loc is not None and (loc.x, loc.y) == pytest.approx((130_000.0, -320_000.0))
+    assert t.trusted_layouts == 0  # accepted, not yet a trusted layout
 
 
 def test_stale_anchor_and_creation_far_away_are_rejected():

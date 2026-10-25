@@ -32,6 +32,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 OWN_FIX = (442_020.33, -162_148.37)
 NEAR_IDS = {"104114", "84466", "105096", "89308", "94432"}  # actors 752..838 m from OWN_FIX in the recorded packets
 CYAN = (77, 208, 255)  # geo.ENTITY_STYLE["player"].color
+ORANGE = (255, 138, 61)  # geo.ENTITY_STYLE["ai"].color: the recorded actors only ever send the 155/158 bit animal state
 
 
 def build_pcap(path: Path, inbound=("FirstHeartbeat", "SecondHeartbeat", "PeriodicAttributes")) -> Path:
@@ -148,17 +149,18 @@ def test_default_game_peers_through_real_main_draw_dots_at_their_decoded_positio
     assert set(near) == NEAR_IDS
     for n in near.values():
         assert 700 < n.distance_m < 1000 and 330 < n.bearing < 345  # all roughly NNW of the local player
-        assert n.entity.name.startswith("Unknown #") and n.entity.health_pct is None and n.entity.heading is None
+        assert n.entity.kind == "ai" and n.entity.name.startswith("Actor #")
+        assert n.entity.health_pct is None and n.entity.heading is None
 
-    # rendering: a cyan dot sits at the projected position of every in-view actor (same projection as the arrow)
+    # rendering: a dot sits at the projected position of every in-view actor (same projection as the arrow)
     cx, cy = screen_of(app.view, pos.x, pos.y)
     assert near_color(img, cx, cy, (255, 64, 64), r=6)  # the red local arrow is at the player's position
     drawn = 0
     for n in near.values():
         sx, sy = screen_of(app.view, n.x, n.y)
         if math.hypot(sx - cx, sy - cy) < app.view.width() / 2 - 8:
-            drawn += near_color(img, sx, sy)
-    assert drawn >= 4, "actors inside the circle must be drawn as cyan dots at their projected positions"
+            drawn += near_color(img, sx, sy, ORANGE)
+    assert drawn >= 4, "actors inside the circle must be drawn at their projected positions"
 
 
 def test_out_of_view_actor_in_radius_gets_an_edge_pointer_through_real_main(tmp_path, monkeypatch):
@@ -174,7 +176,7 @@ def test_out_of_view_actor_in_radius_gets_an_edge_pointer_through_real_main(tmp_
         sx, sy = screen_of(app.view, n.x, n.y)
         assert math.hypot(sx - cx, sy - cy) > app.view.width() / 2  # really outside the circle
         ax, ay = edge_anchor(cx, cy, sx, sy, app.view.width() / 2 - 7)
-        hit += near_color(img, ax, ay, r=5)
+        hit += near_color(img, ax, ay, ORANGE, r=5)
     assert hit == len(NEAR_IDS)
 
 

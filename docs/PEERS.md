@@ -48,7 +48,7 @@ Tray menu items: "Show other players", "Nearby radius...", "Vitals detail on lab
 ## Behaviour common to all sources
 
 - Self is excluded by identity, never by position. Lab: id 0 is the lab's "me". Game: the entity whose Iris handle equals the own handle (learned from the survival heartbeat) is dropped, and a provisional peer with that handle is purged when the lock arrives. `peer_self_ids` adds more.
-- Silence timeouts are a property of the source. Lab and synthetic peers are dimmed after 3 s without an update and removed after 5 s. Game peers are dimmed after 8 s and removed after 30 s (`GAME_PEER_STALE_S` / `GAME_PEER_TTL_S`), because Iris replicates changes only: an actor that stands still sends nothing, so silence is not absence. The game source also removes a tracked handle at once when the packet carries a destruction record for it (431 records in the recorded capture, 431 of 431 handles seen in that capture, 430 with a creation record). The 8 s / 30 s values are a judgement call, not a measured number.
+- Silence timeouts are a property of the source. Lab and synthetic peers are dimmed after 3 s without an update and removed after 5 s. Game peers are dimmed after 8 s (`GAME_PEER_STALE_S`) and, without a destruction record, removed after 180 s for creatures (`GamePeerSource.TTL_S`: captured resting pawns went silent for 100-300 s and came back) or 30 s for server animals (`TTL_AI_S`), because Iris replicates changes only: an actor that stands still sends nothing, so silence is not absence. The game source also removes a tracked handle when the packet carries a destruction record for it (the dot is gone 1.5 s later: `GamePeerSource.GONE_GRACE_S`, applied by `EntitySmoother.prune` every frame; it used to stay dimmed for 30 s) (431 records in the recorded capture, 431 of 431 handles seen in that capture, 430 with a creation record). The 8 s / 30 s values are a judgement call, not a measured number.
 - The game server is the destination of the first outbound datagram. A different destination only replaces it after 5 outbound datagrams in a row while the old server has been silent for 1 s (a real server change). A single datagram from the game's second socket to another host (a 1300-byte latency probe was seen once per session) is ignored: it used to count as a server change and wiped the identity tables, the peers and the own-vitals lock, twice within 30 ms (once for the probe, once when the real server was "learned" again).
 - Missing fields are `None` and are simply not printed: the minimap label never shows `?`, `HP ?` or `G ?`. The label is the player name with the species in brackets; a creature without a player name is labelled by its species alone (`Deinosuchus`, `Longear`; a `~` marks a species taken from the saved class cache) and only a creature with no class at all shows `Unknown #<handle>`. Second line: the known vitals, distance, compass bearing and height difference, e.g. `Rainbow Fish` / `666 m N` or `<name> (Pteranodon)` / `HP 86% 787 m NNE +60m`. Labels go to players first, then dinosaurs, then server animals (fish: at most 3 labels, none in a crowd of 20+); they avoid the status lines, the dots of players and the edge of the round minimap. The Nearby table keeps `-` / `?` only because its columns need a cell. Nothing is guessed. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet is a dot, one that has moved is an arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
@@ -69,10 +69,14 @@ Evidence and method: "Identity, species and positions" (section 13) of `docs/trd
 | Species | `Pteranodon`, `Gallimimus`, `Longear`, `Rainbow Fish` in the capture. Any other class is shown under its cleaned asset name (`BP_Foo_C` -> `Foo`), never invented. The mapping is `species.py` (`CLASS_RULES`, `DISPLAY_NAMES`) |
 | Player name | decoded for pawns whose creation record references their PlayerState (name from the PlayerState creation record: 382 of 388 PlayerStates in the capture). A creature whose PlayerState was created before the capture, or an AI animal, has no name |
 | Position x, y, z | decoded: creation position (16 x the raw/100 value, see TRD 13.4), two fixed state layouts (BP_Longear, BP_Fish_RainbowFish: x and y only), and layouts learned from creation anchor + continuity (pteranodon pawns). Most pawn state batches carry no position at all |
-| Health, stamina | decoded for other creatures from the 9-slot attribute block (health, maxHealth, stamina, maxStamina, then maxHealth repeated three times and half of it twice): shown as percentages when the block has been seen |
-| Growth, hunger, thirst | NOT decoded: growth is only sent when it changes (never alongside the block in the capture); hunger and thirst of others were not found |
+| Health, stamina | decoded for other creatures from the full attribute block (9 slots: health, maxHealth, stamina, maxStamina, then maxHealth repeated three times and half of it twice; or 8 slots without maxStamina when that did not change), then **followed** between blocks: a pawn that regenerates sends the pair health + stamina (66 bits apart) in small state batches every second or so (`decode.PawnVitalsTracker`). A slot is the health when it is close to the last health (or sits at an offset confirmed twice for that batch header, which then also takes a bite). A percentage needs the maxima of the block, so nothing is shown for a pawn that has not sent one yet (in the hhh capture 26 % of the dino-seconds had HP, 17 % had stamina: the block comes rarely and the 8-slot form has no maxStamina). Label: `HP 86% ST 33% 408 m E -31m` |
+| Growth, hunger, thirst | NOT decoded, and probably not replicated to other clients: the own pawn's survival heartbeat (hunger, thirst, hunger repeated) was found 283 times in the own batches of one capture and not once in the batches of other pawns (their repeats were maxHealth blocks); no slot next to the health slot of another pawn holds a growth fraction. maxHealth of a juvenile grows (72.75 -> 73.76 in 20 s) but without the adult maximum of the species that is not a percentage |
 | Despawn | destruction records (layout fixed, see TRD 13.3); TTL is the fallback |
 | Heading | derived from movement: the bearing from an anchor to the first position at least 1 m away (jumps over 200 m ignored), kept while the creature stands still; the dot becomes an arrow |
+
+A creature whose creation record was missed has no anchor. `ActorLocationTracker.bootstrap` places it from two consecutive state batches: a canonical 22+ bit vector within 1 km of the local player in both, the second continuing one of the first batch's candidates at creature speed. A vector within 15 m (+20 m/s) of the last position is accepted at its first sighting (the layout still needs two sightings to be trusted). In the hhh captures this placed 4 more creatures and raised the fixes of walking dinosaurs from 33 to 42 of 89 batches (a resting creature sends only health and stamina, so it has no position to decode).
+
+The overlay line (`GamePeerSource.headline`) keeps a headline for `HEADLINE_HOLD_S` = 12 s before it changes ("Started late" / "Rejoin server: 1 hidden" used to alternate every second or two). An unclassified actor becomes `ai` after four state batches of the animal size (155/158 bits), not eight.
 
 Not all creatures in view are positioned: the capture shows creatures (Deinosuchus, Triceratops, more pteranodons) whose pawn was never created in the capture and whose state does not use a verified layout; they have vitals and species evidence (animation assets) but no map dot.
 
@@ -82,7 +86,8 @@ The own marker follows the client's own outbound move packets (no network hop). 
 
 - Every decoded location is written to the store immediately (no buffering, decode cost 0.04..3 ms per packet) and the overlay reads the store every frame (16 ms timer), the same tick that moves the own marker.
 - Between samples the dot is dead-reckoned (`geo.EntitySmoother`, `DR_*`): the target advances along the velocity of the last two distinct samples, for at most one measured interval and never more than 1 s; a position re-sent unchanged, a gap over 3 s, a teleport or an implausible speed (over 60 m/s) switches it off. Position only: it never produces a heading.
-- The smoothing time constant of peers equals the own marker's (0.09 s).
+- The dot is **feed-forward**: it moves at the measured velocity all the time and the error to the newest sample is blended in over `DR_CORR_TAU_S` (0.2 s). The earlier version chased the target with a 0.09 s lag filter; with samples 0.7-1 s apart it stood still at the end of each horizon and jumped when the next sample came (6-20 visible jumps a minute). A sample that is late by up to `DR_FF_GRACE_S` (0.3 s) no longer stops the dot. The own marker still uses the 0.09 s filter with the lead (its samples come every ~0.1 s).
+- A reused handle (`PeerEntity.born` changes) is a different creature: the dot starts at its position instead of gliding there from the old one.
 
 What stays inherent: the first sample after a silence, network latency and the server's send interval.
 
@@ -131,11 +136,67 @@ The server sends the class and player-name tables, and the creation record (with
 
 - **Nothing is hidden by the animal rule.** Every actor classed `ai` without a creation record repeats a 155/158 bit state in at least 99 % of its batches (checked on five captures: no dinosaur, player or world object matched).
 - **Still creatures never get a position.** The game only sends changed fields, so a creature that has not moved since you joined sends no position batch. Three such Deinosuchus were replicated for over 200 s in the `as` captures with no position (no `0xc0000348` / `0xc0100348` batch at all); no bit scan can find a value that is not in the stream. The app counts them (`GamePeerSource.hidden_creatures`: 30+ state batches, at least 80 % of them 60-400 bits, under 10 % animal sized, recent, not an earlier own pawn) and says so.
-- **The overlay line is elided to about 30 characters**, so `GamePeerSource.status()` now starts with a short headline and appends the detail: `Rejoin server: N hidden` (tables missed), `Started late: rejoin to see all` (tables missed, nothing hidden), `N creatures: no position yet` (tables seen), `No other players nearby` (tables seen, no dinosaur or player on the map). "Rejoin" means leaving the server and joining again with the app already running.
-- **Own handle changes** (`own handle changed: A -> B`) are a death and respawn: the heartbeat lock lets go of the silent pawn and takes the new one. The old pawn keeps streaming as a body for a while; it is remembered (`_past_own`) and never counted as another creature.
+- **The overlay line is elided to about 30 characters**, so `GamePeerSource.status()` now starts with a short headline and appends the detail: `Started late: rejoin to see all` (tables missed; one constant message, because the old `Rejoin server: N hidden` / `to identify` variants flipped every few seconds with the hidden count), `N creatures: no position yet` (tables seen), `No other players nearby` (tables seen, no dinosaur or player on the map). "Rejoin" means leaving the server and joining again with the app already running.
+- **Own handle changes** (`own handle changed: A -> B`) are a death and respawn: the heartbeat lock lets go of the silent pawn and takes the new one. The old pawn keeps streaming as a body for a while; it is remembered (`_past_own`), never counted as another creature and never put on the map (it used to appear as a dot labelled with your own species).
 - **Species without tables** come from `class_cache.json` (learned on this machine) and the shipped `isle_livemap/assets/class_seed.json` (51 protocol ids from captures that saw the tables; `python tools/build_class_seed.py PCAP...` rebuilds it; asset paths only). A table that disagrees with a seeded or learned id blocks it for the process. Species from either show with a `~`.
 
 Tests: use the project environment, `.venv/bin/python -m pytest` (Qt and Pillow are installed there; the system `python3` skips the 10 tests that need them).
+
+## Stability budgets (stuck, lag, flicker) and how they are measured
+
+`tools/stability_replay.py` replays recorded sessions through the real path (pcap -> `TelemetryPipeline` -> `GamePeerSource` -> `MapView.tick` at 60 fps -> `MapView.grab` at 5 Hz, offscreen Qt) with `time.monotonic` replaced by a simulated clock that follows the datagram times, so the numbers do not depend on the machine:
+
+    .venv/bin/python -I tools/stability_replay.py DIR/session_*.pcap --check      # exit 1 on a violated budget
+    ISLE_CAPTURES=DIR .venv/bin/python -m pytest tests/test_stability_replay.py   # the same, as tests (skipped without ISLE_CAPTURES)
+
+Budgets (`BUDGETS`, `check_budgets`) and the values measured on seven recorded sessions (`sadsad`, `qq`, `as`, `hhh`; 26-562 s each), before -> after the stability work:
+
+| What | Budget | Before | After |
+|---|---|---|---|
+| Dot of a destroyed creature stays | max 2 s | 30 s (101 of 101 destructions) | 1.6 s (131 of 131) |
+| Ghost dot-seconds (shown, not in the store), all sessions | - | 2 600 s | 150 s (= the grace) |
+| Dot frozen while the server shows it moving | 1 s | 0 s | 0-0.1 s |
+| Dot beyond what dead reckoning allows, longest run | 3 s | n/a | 0.3 s |
+| Own marker frozen while it moves | 0.5 s | 0 s | 0 s |
+| Visible jumps of a dot per minute | 10 | 0-20 | 0-7 |
+| Dot error vs the path, p50 (the dot that stays on the newest sample is 100 %) | 80 % | - | 52-84 % |
+| Kind / name changes per actor | no actor twice | up to 37 per minute (unknown -> ai) | up to 0.1 per minute, none twice |
+| Headline changes | 1.2 per minute | 2-13 per session | 1-5 per session (the 364 s session with a table dump: 5) |
+| Label side changes (A -> B -> A within 2 s counts as a flip-flop) | 0 flip-flops, 3 hops per minute | up to 4.1 hops per minute | 0 flip-flops, up to 1.9 hops |
+| Label on/off toggles per minute | 1 | up to 0.7 | up to 0.2 |
+| Time to first dot (p50 / worst p95) | 0.5 s / 5 s | 0.03 s / 3.0 s | unchanged |
+| Decode time per datagram (worst p99 / max) | 5 ms / 50 ms | 3.4 / 12.8 ms | 3.3 / 15.2 ms |
+| Backlog of one decode worker (max wait / max queue) | 250 ms / 200 | 88 ms / 30 | 87 ms / 30 (the 256 KB table dump) |
+| Exceptions in tick / decoder / pipeline | 0 | 0 | 0 |
+| `tick()` p95 / paint p95 (worst session) | 2 ms / 16 ms | 0.1 / 6.1 ms | 0.12 / 6.0 ms |
+
+Time to first dot is measured from the later of the creature's first record and the first own position fix; creatures whose creation record was missed and that do not move have no position to draw (the "N creatures: no position yet" headline) and are outside the budget.
+
+What was found and fixed:
+
+- **Ghosts.** A creature the server destroyed stayed on the map, dimmed, for the remaining 30 s of the smoother's TTL (the source had already removed it; the smoother kept its own copy). Now `EntitySmoother.missing_grace_s` (1.5 s for the game feed) removes it, and `prune()` runs every frame, because `update()` only runs when the source changes.
+- **Resting creatures vanishing.** Dinosaurs and players were dropped after 30 s without a report although captured pawns are silent for 100-300 s while resting. They now wait for the destruction record (180 s safety limit); fish keep 30 s.
+- **Stop-and-go and jumps.** See "Update rate and lag".
+- **Flicker.** New fish were drawn as `Unknown #id` creatures for 2-3 s before the animal rule turned them into `ai` (with a label and a different colour); the rule now decides from the first batch and keeps its verdict (it is revoked only after 8 batches of which less than 60 % fit). The headline is one constant message while the tables are missing. A label tries the side it had last frame first, with `SLOT_SLACK_PX` of tolerance, and a peer that has a label keeps it over a newcomer at less than 20 % smaller distance.
+- **A frozen frame.** `MapView.tick()` ended early when `peers.snapshot()` raised (a "dictionary changed size during iteration" from the UI thread reading decoder-thread tables was possible), so nothing was repainted again. `tick()` now always schedules the repaint, keeps the last good snapshot, and `paintEvent` isolates each layer and always ends the painter; `MapView.errors` / `last_error` count them. The status text iterates copies of the decoder's dictionaries. A datagram that makes the decoder raise is counted (`GamePeerSource.decode_errors`, "Decode errors: see log" headline, session summary) instead of looking like "nobody is nearby".
+- **Own pawn after respawn** is excluded for good (see above); after a pipeline reset (new server, game closed) the own marker drops its old fix and says "Waiting for game" instead of staying parked.
+
+### Live capture robustness (cannot be run on macOS; unit-tested with fakes in `tests/test_capture_robustness.py`)
+
+- The supervisor loop (`LiveCapture._supervise` / `_step`) no longer ends for good when a step raises: it logs, shows `capture error, retrying: ...` in the status and tries again after 1-5 s. The decode worker is restarted if its thread dies (`worker restarts` in the session counters).
+- No UDP packet at all for 10 s while the game owns a socket (interface switched: Wi-Fi to cable, VPN up or down) reopens the sniffers on every interface (at most every 30 s).
+- `PreCaptureBuffer.set_ports` hands the buffered packets over **outside** its lock. Handing over 4 096 real packets takes about 92 ms; it used to hold the sniffer thread for all of it, now `offer()` from the sniffer thread waits under 0.01 ms meanwhile. Arrival order is kept because the new ports stay "unowned" (their packets are still held, and handed over too) until the hand-over has caught up.
+- Saving the class cache runs on the decode thread at most every 30 s and only when something was learned: 20-44 ms at the 5 000-entry maximum, 1-3 ms for the few hundred entries of a real cache.
+- The session log's counters line now ends its first part with `worker queue max=N slow decodes=N capture errors=N worker restarts=N` (a slow decode is over 50 ms).
+
+### To check live on Windows (what the replays cannot show)
+
+1. **Start order.** Start the app, wait for the status `waiting for server traffic`, then join. The log's first lines should show `sniffing before the game starts` and, after joining, a `first creation record` within the first seconds. Check `worker queue max` stays below ~100 and `slow decodes` stays 0 or tiny in the `counters:` lines.
+2. **Dots.** Stand still near a known creature for a minute: the dot must not drift (the dead-reckoned dot stops within ~1.5 s after it stops). Watch a walking creature: motion should look continuous, with no stop-and-go every ~0.8 s.
+3. **Destruction.** Walk away until a nearby creature leaves relevance: its dot and label should disappear about 1.5 s after the `destruction record` line in the log, not 30 s later.
+4. **Own marker.** Die and respawn: no dot with your own species stays where you died; leave the server to the menu: the minimap shows `Waiting for game`.
+5. **Interface change.** With the game running, switch Wi-Fi to cable (or toggle a VPN): within ~10-15 s the log shows `no UDP seen for ... reopening on all interfaces` and the minimap resumes.
+6. **Kill the capture.** Nothing to do by hand; a `supervisor step failed` or `decode worker died` line in the log is the signal that a failure was survived. Send the log if you see one.
 
 ## Recording steps for the owner
 
