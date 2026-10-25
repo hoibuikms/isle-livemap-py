@@ -412,3 +412,29 @@ A 9-slot block (66-bit GAS slots: float, flag, float): health, maxHealth, stamin
 ### 13.10 Still unknown
 
 Growth, hunger, thirst and heading of others; land dinosaurs (none came into relevance); whether the PlayerState link names the right player (needs a known neighbour); the structure of handle-0 batches (they mention the six creation-less creatures at join); the semantics of the destruction record's bit and of the one undecoded bit in export chains; why creation vectors are 1/16; the reason the rainbow-fish z runs away; layouts of land dinosaurs.
+
+## 14. Rev 9: sessions that miss the join tables
+
+The server sends the class and player tables once, at join. A capture that starts later (app launched mid-session)
+has creation records but no class paths. Measured on two captures of one server (`session_20261025_123033`, tables
+present; `session_20261025_131510`, mid-connection, 515 creations, 0 class paths):
+
+* **Protocol id is stable.** Every creation record carries a 32-bit protocol id (a hash of the class's replicated
+  layout). 33 of the 34 ids of the mid-connection capture also occur in the first one, with the same archetype
+  handle and one class path each (511 of 515 creations). `classcache.ClassCache` stores `protocol id -> archetype
+  class path` in `<data dir>/class_cache.json` (schema 1, 90-day expiry, atomic writes), learned only from a
+  connection's own export tables. A table that later names another path evicts the entry for the process. Complete
+  paths only (`/Game/...`): a cut-off path could pass a dinosaur off as a world object. Cache hits are flagged
+  `Entity.inferred` and drawn as `(Species~)`.
+* **Result on the mid-connection capture:** player names come back (the 9 PlayerStates are recognised by protocol id),
+  pawns link to them through the PlayerState reference, fruit/plants/gore are filtered again.
+* **Animals without a creation record.** Server animals repeat a 155 or 158 bit state batch (33 of 33 resolved
+  animals, 73 never-created actors; no dinosaur or world object does). Eight state batches, 90 % of them that size,
+  make an unclassified actor `ai`. The 14 leftover `unknown` dots of the mid-connection capture all became `ai`.
+* **Not recoverable:** species of pawns created before the app started and not in the cache (e.g. a dinosaur class
+  never seen with tables). Tables are not resent mid-connection: a new class only exports its own archetype
+  (`IdentityTracker.tables_missed` is true when under 10 % of the creations got a class from the tables). The hint
+  "rejoin the server" remains for actors that stay `unknown`.
+* **Early sniffing.** `LiveCapture` opens the Npcap sniffers before the game is found and keeps unowned UDP in a
+  `PreCaptureBuffer` (15 s, 4096 packets); when the game's port becomes known the buffered packets of that port are
+  decoded first, with their original timestamps. Not testable off Windows: unit tests cover the buffer only.

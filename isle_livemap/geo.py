@@ -13,6 +13,7 @@ import sys
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 from .decode import normalize_degrees
 
@@ -378,6 +379,7 @@ class Entity:
     hunger_pct: float | None = None
     thirst_pct: float | None = None
     heading: float | None = None  # map heading, degrees clockwise from north (like the local arrow); None = unknown
+    inferred: bool = False  # the species comes from the saved class cache (the join tables were missed), not the server
 
     def __post_init__(self) -> None:
         h = self.heading
@@ -565,7 +567,12 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None)
     the tail holds the known vitals ("HP 92%", "G 40%"), then distance, compass bearing and height difference.
     Unknown fields are omitted, never shown as a placeholder."""
     e, dz = n.entity, height_delta_m(n, my_z)
-    head = truncate(e.name or e.id, name_max) + (f" ({truncate(e.species, 14)})" if e.species else "")
+    mark = "~" if e.inferred else ""
+    name = e.name or e.id
+    if e.species and name.startswith(PLACEHOLDER_NAME):  # no player name known: the species is the best name there is
+        head = truncate(e.species, name_max) + mark
+    else:
+        head = truncate(name, name_max) + (f" ({truncate(e.species, 14)}{mark})" if e.species else "")
     parts = []
     if e.health_pct is not None:
         parts.append(f"HP {e.health_pct:.0f}%")
@@ -575,6 +582,34 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None)
     if dz is not None:
         parts.append(f"{dz:+.0f}m")
     return head, " ".join(parts)
+
+
+PLACEHOLDER_NAME = "Actor #"  # peers.GamePeerSource name of a creature whose player name is not known
+LABEL_RANK = {"player": 0, "dino": 1, "unknown": 2, "ai": 3}  # who gets a label first when the minimap is crowded
+LABELS_MINIMAP, LABELS_FULL = 8, 24
+AI_LABELS_MINIMAP, AI_LABELS_FULL = 3, 8  # fish and other server animals must never use up the labels of players
+CROWDED_ON_SCREEN = 20  # above this many peers of a group that group gets only a few labels
+CROWDED_LABELS = 4
+
+
+def label_rank(n: Nearby) -> int:
+    return LABEL_RANK.get(n.entity.kind, len(LABEL_RANK))
+
+
+def label_sort_key(n: Nearby) -> tuple[int, float, str]:
+    """Order in which peers compete for a label: players, then dinosaurs, unidentified, server animals; nearest first."""
+    return label_rank(n), n.distance_m, n.entity.id
+
+
+def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) -> tuple[int, int]:
+    """(max labels in total, max labels for server animals) for the peers currently drawn on screen."""
+    total = LABELS_FULL if full_map else LABELS_MINIMAP
+    ai = AI_LABELS_FULL if full_map else AI_LABELS_MINIMAP
+    if creatures_on_screen > CROWDED_ON_SCREEN:
+        total = min(total, CROWDED_LABELS)
+    if ai_on_screen > CROWDED_ON_SCREEN:
+        ai = 0
+    return total, ai
 
 
 def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False) -> list[str]:
@@ -588,7 +623,7 @@ def peer_label_lines(n: Nearby, my_z: float | None = None, detail: bool = False)
 def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
     """Table cells: name, species, health, growth, stamina, hunger, water, distance, 3D distance, height delta."""
     e, dz = n.entity, height_delta_m(n, my_z)
-    return (truncate(e.name or e.id, 24), e.species or "-", _pct(e.health_pct), _pct(e.growth_pct),
+    return (truncate(e.name or e.id, 24), (e.species + "~" if e.inferred and e.species else e.species) or "-", _pct(e.health_pct), _pct(e.growth_pct),
             _pct(e.stamina_pct), _pct(e.hunger_pct), _pct(e.thirst_pct),
             format_distance(n.distance_m), f"{distance_3d_m(n, my_z):.0f} m",
             "?" if dz is None else f"{dz:+.0f} m {'higher' if dz > 0 else 'lower' if dz < 0 else 'level'}")
@@ -615,19 +650,24 @@ def _overlaps(a: Rect, b: Rect) -> bool:
     return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
 
 
-def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect) -> Rect | None:
+def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect,
+                accept: Callable[[Rect], bool] | None = None) -> Rect | None:
     """Pick a label rect for anchor (ax, ay), preferring centred directly under the marker, then
     above (centred), right, left. A centred candidate is shifted sideways so it stays inside
-    ``bounds``; every candidate must lie inside ``bounds`` and overlap no already placed label.
-    Returns None if none fits."""
+    ``bounds``; every candidate must lie inside ``bounds``, overlap no already placed label and satisfy
+    ``accept`` (e.g. lie inside the round minimap). Returns None if none fits."""
     bx, by, bw, bh = bounds
     if w > bw:
         return None
     cx = min(max(ax - w / 2, bx), bx + bw - w)  # centred under/above, clamped into the view
     for r in ((cx, ay + 8, w, h), (cx, ay - 8 - h, w, h),
-              (ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h)):
+              (ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h),
+              # near the edge of a round view the centred label does not fit: hang it to one side of the marker
+              (ax - 8, ay + 8, w, h), (ax + 8 - w, ay + 8, w, h), (ax - 8, ay - 8 - h, w, h), (ax + 8 - w, ay - 8 - h, w, h),
+              # two creatures side by side: the second label goes one row further out
+              (cx, ay + 9 + h, w, h), (cx, ay - 9 - 2 * h, w, h)):
         inside = (r[0] >= bx and r[1] >= by and r[0] + r[2] <= bx + bw and r[1] + r[3] <= by + bh)
-        if inside and not any(_overlaps(r, o) for o in placed):
+        if inside and (accept is None or accept(r)) and not any(_overlaps(r, o) for o in placed):
             placed.append(r)
             return r
     return None

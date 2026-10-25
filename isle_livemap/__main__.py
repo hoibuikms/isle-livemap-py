@@ -121,7 +121,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.replay == "synthetic":
             peers = create_peer_source("off", anchor, synthetic=True)
         else:
-            peers = create_peer_source("game", anchor, self_ids=settings.peer_self_ids, pipeline=pipeline)
+            from .classcache import ClassCache
+            from .geo import data_dir
+
+            cache = ClassCache.load((args.data_dir or data_dir()) / "class_cache.json")
+            peers = create_peer_source("game", anchor, self_ids=settings.peer_self_ids, pipeline=pipeline,
+                                       class_cache=cache)
         peers.start()
         if session is not None and session.log is not None:
             session.log.peers = peers

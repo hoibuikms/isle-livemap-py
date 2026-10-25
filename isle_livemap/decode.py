@@ -797,6 +797,7 @@ _PS_REF_MARKER = 0b10100011  # bits in stream order 1,1,0,0,0,1,0,1
 _PS_REF_MARKER_BITS = 8
 _PS_REF_MARKER_GAP = 36  # bits from the start of the marker to the byte-count field
 _PS_REF_MAX_BYTES = 4
+_UNLEARNED_MAX = 4096
 
 
 def _plausible_name(text: str) -> bool:
@@ -846,10 +847,13 @@ class ActorInfo:
 class IdentityTracker:
     """Export tables + creation records of one connection. Feed it every inbound datagram, in order."""
 
-    def __init__(self) -> None:
+    def __init__(self, class_cache=None) -> None:
+        self.class_cache = class_cache  # classcache.ClassCache | None: protocol id -> class path from earlier sessions
         self.reset()
 
     def reset(self) -> None:
+        self._unlearned: set[int] = set()  # handles whose archetype path was not exported yet (offered to the cache later)
+        self.table_classes = 0  # creations whose class path this connection's export tables gave (0: tables missed)
         self._object_names: dict[int, str] = {}  # object-name token index -> text (the implicit-type token space)
         self.tokens: dict[tuple[int, int], str] = {}  # (type id, index) -> text: names, gameplay tags
         self.objects: dict[int, ObjectExport] = {}
@@ -884,7 +888,22 @@ class IdentityTracker:
         info = self.actors.get(handle)
         if info is None:
             return None
-        return self.object_path(info.archetype_handle if info.archetype_handle is not None else handle)
+        path = self.object_path(info.archetype_handle if info.archetype_handle is not None else handle)
+        if path is None and self.class_cache is not None and info.archetype_handle is not None:
+            return self.class_cache.lookup(info.protocol_id)  # the join tables were missed: what an earlier session saw
+        return path
+
+    def tables_missed(self) -> bool:
+        """True when almost no creation of this connection got its class path from the export tables: the capture
+        began after the join (the server sends those tables once; a later class only exports its own archetype)."""
+        return self.table_classes * 10 <= self.creations
+
+    def is_inferred(self, handle: int) -> bool:
+        """True when the class of ``handle`` comes from the saved class cache, not from this connection's tables."""
+        info = self.actors.get(handle)
+        if info is None or info.archetype_handle is None or self.class_cache is None:
+            return False
+        return self.object_path(info.archetype_handle) is None and self.class_cache.lookup(info.protocol_id) is not None
 
     def archetype_species(self, archetype: int | None) -> str | None:
         """Species of an archetype whose class path was never exported, from the dinosaur assets that accompany the
@@ -947,14 +966,32 @@ class IdentityTracker:
             info.player_state = next(iter(known))
             self._waiting.discard(info.handle)
 
+    def _settle_class(self, handle: int) -> bool:
+        """True once nothing is pending for ``handle``: its archetype path is known from this connection's tables
+        (counted, and offered to the class cache) or it has no archetype."""
+        info = self.actors.get(handle)
+        if info is None or info.archetype_handle is None:
+            return True
+        path = self.object_path(info.archetype_handle)
+        if path is None:
+            return False
+        self.table_classes += 1
+        if self.class_cache is not None:
+            self.class_cache.learn(info.protocol_id, path)
+        return True
+
     def feed(self, payload: bytes, packet: IrisPacket | None = None) -> list[Creation]:
         """Update from one datagram; returns the creation records it carried."""
         packet = packet or parse_iris_packet(payload)
         if packet is None:
             return []
+        exported = False
         for b in packet.batches:
             if b.exports is not None:
                 self._record_exports(b.exports)
+                exported = True
+        if exported and self._unlearned:  # tables that arrive after their creations
+            self._unlearned = {h for h in self._unlearned if not self._settle_class(h)}
         for handle in packet.destroyed_handles:
             self._waiting.discard(handle)
             if self.actors.pop(handle, None) is not None:
@@ -975,6 +1012,8 @@ class IdentityTracker:
             if info.archetype_handle is not None:
                 votes = self._arch_votes.setdefault(info.archetype_handle, Counter())
                 votes.update(info.asset_species)
+            if not self._settle_class(info.handle) and len(self._unlearned) < _UNLEARNED_MAX:
+                self._unlearned.add(info.handle)
             path = self.class_path(info.handle) or ""
             if _PLAYER_STATE_MARKER in path:
                 info.name = decode_player_name(bits, b)

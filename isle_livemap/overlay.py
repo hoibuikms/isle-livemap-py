@@ -14,7 +14,7 @@ from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, local_entity, peer_label_lines,
-    PEER_STALE_S, PEER_TTL_S, place_label, vital_lines, visible_entities,
+    PEER_STALE_S, PEER_TTL_S, LABEL_RANK, label_limits, place_label, vital_lines, visible_entities,
 )
 from .peers import status_is_warning
 from .tracking import Vitals
@@ -24,9 +24,7 @@ BASE_VIEW_FRACTION = 0.2  # minimap shows 20 % of map width at zoom 1
 KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "dinosaur": "#ff6b6b", "other": "#c8c8c8"}
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
 EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
-MAX_LABELS_MINIMAP, MAX_LABELS_FULL = 8, 24
-CROWDED_ON_SCREEN = 20  # above this only the nearest few get labels
-CROWDED_LABELS = 4
+DOT_CLEARANCE_PX = 7.0  # no label may cover the dot of a player or dinosaur
 LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
 
 
@@ -265,42 +263,69 @@ class MapView(QWidget):
         ox, oy = self.width() / 2 + (X_OFFSET / MAP_WIDTH - cl) * scale, self.height() / 2 + (Y_OFFSET / MAP_HEIGHT - ct) * scale * MAP_HEIGHT / MAP_WIDTH
         half = self.width() / 2
         lim = (half + 4) ** 2 if not self.full_map else None
-        pts, off = [], []
+        off = []
+        groups = {kind: [] for kind in LABEL_RANK}  # on-screen peers by kind, nearest first inside each group
+        other: list = []
+        w, h_px = self.width(), self.height()
         for n in near:
             pt = QPointF(ox + n.x * sx, oy + n.y * sy)
             if lim is None:
-                inside = -10 <= pt.x() <= self.width() + 10 and -10 <= pt.y() <= self.height() + 10
+                inside = -10 <= pt.x() <= w + 10 and -10 <= pt.y() <= h_px + 10
             else:
-                inside = (pt.x() - half) ** 2 + (pt.y() - self.height() / 2) ** 2 <= lim
-            (pts if inside else off).append((n, pt))
+                inside = (pt.x() - half) ** 2 + (pt.y() - h_px / 2) ** 2 <= lim
+            (groups.get(n.entity.kind, other) if inside else off).append((n, pt))
         if off:
             self._draw_edge_indicators(p, off)
-        max_labels = MAX_LABELS_FULL if self.full_map else MAX_LABELS_MINIMAP
-        if len(pts) > CROWDED_ON_SCREEN:
-            max_labels = min(max_labels, CROWDED_LABELS)
+        by_priority = [it for kind in sorted(groups, key=LABEL_RANK.get) for it in groups[kind]] + other
+        ai_on_screen = len(groups["ai"])
+        max_labels, max_ai_labels = label_limits(len(by_priority) - ai_on_screen, ai_on_screen, self.full_map)
         font = QFont("Segoe UI", 8)
         fm = QFontMetricsF(font)
         p.setFont(font)
-        placed: list[tuple[float, float, float, float]] = []
-        labelled = attempts = 0
+        centre, radius = QPointF(self.width() / 2, self.height() / 2), self.width() / 2 - 3
+
+        def in_circle(r) -> bool:  # the minimap clips to its circle: a label must not run past the edge
+            return self.full_map or all(math.hypot(x - centre.x(), y - centre.y()) <= radius
+                                        for x in (r[0], r[0] + r[2]) for y in (r[1], r[1] + r[3]))
+
+        placed: list[tuple[float, float, float, float]] = []  # label rectangles already taken; the status lines are too
+        top = 6.0 if self.full_map else 18.0
+        room = self.width() * (0.9 if self.full_map else 0.62)
+        for shown, row in ((self.peer_status, 0), (self.record_status, 1)):
+            if shown:
+                placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
+        labelled = attempts = ai_labelled = 0
         widths = self._text_widths  # text measuring is the slow part of the layer: measure each string once
         if len(widths) > 2000:
             widths.clear()
-        for n, pt in reversed(pts):  # far first so near markers end up on top
+        for n, pt in reversed(by_priority):  # players on top, far before near
             self._draw_entity_marker(p, n, pt)
+        # dots of players and dinosaurs that can compete with a label: kept clear when possible (a preference, so two
+        # creatures standing next to each other still both get a label)
+        dots = [(pt.x() - DOT_CLEARANCE_PX, pt.y() - DOT_CLEARANCE_PX, 2 * DOT_CLEARANCE_PX, 2 * DOT_CLEARANCE_PX)
+                for n, pt in by_priority[:max_labels * 2] if n.entity.kind != "ai"]
         pos = self.pipeline.latest.position
         my_z = pos.z if pos is not None else None
-        for n, pt in pts:  # near first so near labels win placement
+        # players and dinosaurs claim label space before server animals (fish) do, each group nearest first
+        for n, pt in by_priority:
             if labelled >= max_labels or attempts >= max_labels * LABEL_ATTEMPTS_PER_LABEL:
                 break
+            is_ai = n.entity.kind == "ai"
+            if is_ai and ai_labelled >= max_ai_labels:
+                continue
             attempts += 1
             lines = peer_label_lines(n, my_z, self.settings.show_vitals_detail)
             w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
             h = fm.height() * len(lines)
-            r = place_label(pt.x(), pt.y(), w, h, placed, bounds)
+            r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle)
+            if r is not None:
+                placed.append(r)
+            elif not is_ai:
+                r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle)
             if r is None:
                 continue
             labelled += 1
+            ai_labelled += is_ai
             alpha = STALE_ALPHA if n.stale else 255
             color = _qcolor(ENTITY_STYLE.get(n.entity.kind, ENTITY_STYLE["player"]).color, alpha)
             for i, text in enumerate(lines):

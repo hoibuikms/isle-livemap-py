@@ -414,4 +414,15 @@ def test_late_join_hint_is_dropped_once_a_player_name_is_known(b64):
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     g.packets = g.LATE_JOIN_PACKETS
     g.identity.player_names[1] = "Someone"
+    g.identity.table_classes = 1  # the export tables were seen: names can only come from them (or the class cache)
     assert not g.late_join() and "Rejoin" not in g.snapshot().status and "LATE JOIN" not in g.summary()
+
+
+def test_summary_counts_actors_with_a_class_path_not_just_tracked_actors(b64):
+    g, _ = make()
+    g.on_inbound(inbound(b64("SecondHeartbeat")), None)
+    tracked = len(g.identity.actors)
+    resolved = g.identity_resolved()
+    assert resolved <= tracked
+    assert f"actors with class path={resolved}/{tracked}" in g.summary()
+    assert "classes known" not in g.summary()

@@ -26,7 +26,9 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Protocol
 
-from .geo import GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, canonical_id, is_self, vital_pct
+from .geo import (
+    GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, bearing_deg, canonical_id, is_self, vital_pct,
+)
 from .nearby import _cm
 
 __all__ = [
@@ -359,27 +361,44 @@ class GamePeerSource:
         dead-reckons between samples (``geo.EntitySmoother``).
 
     Decoded: handle, x/y/z, class, species, kind, player name (when the creature references its PlayerState),
-    health and stamina percentages (when the 9-slot attribute block is sent). NOT decoded: growth, hunger, thirst,
-    heading."""
+    health and stamina percentages (when the 9-slot attribute block is sent), heading (derived from movement, see
+    ``_heading``). NOT decoded: growth, hunger, thirst."""
 
     STALE_S = GAME_PEER_STALE_S  # read by the overlay (dim) and the smoother (TTL)
     TTL_S = GAME_PEER_TTL_S
     stale_s, ttl_s = STALE_S, TTL_S
 
+    # Actors whose creation record was never captured have no class. Their state batches still have a class-typical
+    # size: every server-controlled animal of the recorded captures (33 resolved, 73 never created) repeats a 155 or
+    # 158 bit state, and no dinosaur or world object does. Eight state batches, 90 % of them that size: "ai".
+    AI_LAYOUT_BITS = (155, 158)
+    AI_LAYOUT_MIN_BATCHES = 8
+    AI_LAYOUT_SHARE = 0.9
+
+    # Heading is not in the replicated data we can decode, so it is the direction of travel: the bearing from an anchor
+    # position to the first later position at least this far away (a metre filters the position quantisation noise),
+    # and not more than HEADING_MAX_STEP_CM (a larger jump is a respawn or a glitch, not walking).
+    HEADING_MIN_MOVE_CM = 100.0
+    HEADING_MAX_STEP_CM = 20_000.0
+
     LATE_JOIN_PACKETS = 100  # a fresh join sends the export tables within the first packets; this many without = missed
 
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
 
-    def __init__(self, self_ids: Iterable[str] = (), pipeline=None, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, self_ids: Iterable[str] = (), pipeline=None, clock: Callable[[], float] = time.monotonic,
+                 class_cache=None) -> None:
         from .decode import ActorLocationTracker, IdentityTracker
 
         self._config_self = tuple(canonical_id(i) for i in self_ids)
         self.store = PeerStore(ttl=self.TTL_S, clock=clock, self_ids=self._config_self)
         self.pipeline = pipeline
         self.own_handle: int | None = None
-        self.identity = IdentityTracker()
+        self.class_cache = class_cache  # classcache.ClassCache | None: classes learned in earlier sessions
+        self.identity = IdentityTracker(class_cache)
         self.locator = ActorLocationTracker()
         self._vitals: dict[int, object] = {}  # handle -> decode.ActorVitals
+        self._layouts: dict[int, list[int]] = {}  # unclassified handle -> [state batches of the animal size, all state batches]
+        self._anchors: dict[int, tuple[float, float]] = {}  # handle -> position the travel direction is measured from
         self.packets = 0  # inbound datagrams seen
         self.locations = 0  # actor locations decoded (all sources)
         self.destroyed = 0  # destruction records that removed a tracked peer
@@ -409,6 +428,8 @@ class GamePeerSource:
         if self._attached and self.pipeline is not None:
             self.pipeline.remove_observer(self.on_inbound, self.on_reset)
         self._attached = False
+        if self.class_cache is not None:
+            self.class_cache.save(force=True)
 
     # -- pipeline callbacks (decode worker thread; must not raise) ---------
     def on_reset(self) -> None:
@@ -416,9 +437,26 @@ class GamePeerSource:
         self.own_handle = None
         self.store.set_owned_self_ids(())
         self.store.clear()
+        if self.class_cache is not None:
+            self.class_cache.save(force=True)
         self.identity.reset()
         self.locator.reset()
         self._vitals.clear()
+        self._layouts.clear()
+        self._anchors.clear()
+
+    def _heading(self, handle: int, x: float, y: float, previous: float | None) -> float | None:
+        """Direction of travel (degrees clockwise from north) once the creature has moved ``HEADING_MIN_MOVE_CM``
+        from its anchor; ``previous`` while it stands still."""
+        anchor = self._anchors.get(handle)
+        if anchor is None:
+            self._anchors[handle] = (x, y)
+            return previous
+        moved = math.hypot(x - anchor[0], y - anchor[1])
+        if moved < self.HEADING_MIN_MOVE_CM:
+            return previous
+        self._anchors[handle] = (x, y)
+        return bearing_deg(*anchor, x, y) if moved <= self.HEADING_MAX_STEP_CM else previous
 
     def _identity(self, handle: int) -> tuple[str, str, str]:
         """(kind, species, name) of an actor from what its creation record and the export tables say."""
@@ -433,6 +471,13 @@ class GamePeerSource:
             species = sp.display_name(info.asset_species[0])
         return kind, species, self.identity.name_of(handle) or ""
 
+    def _animal_layout(self, handle: int, bits: int) -> bool:
+        """Count one state batch of an actor without class information; True once it looks like a server animal."""
+        seen = self._layouts.setdefault(handle, [0, 0])
+        seen[0] += bits in self.AI_LAYOUT_BITS
+        seen[1] += 1
+        return seen[1] >= self.AI_LAYOUT_MIN_BATCHES and seen[0] >= seen[1] * self.AI_LAYOUT_SHARE
+
     def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str) -> None:
         eid = str(handle)
         old = self.store.get(eid)
@@ -440,13 +485,15 @@ class GamePeerSource:
         self.store.update(Entity(
             eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
             health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
-            heading=old.heading if old else None))
+            heading=self._heading(handle, x, y, old.heading if old else None), inferred=bool(species) and self.identity.is_inferred(handle)))
 
     def _drop(self, handle: int) -> None:
         if self.store.remove(str(handle)):
             self.destroyed += 1
         self.locator.forget(handle)
         self._vitals.pop(handle, None)
+        self._layouts.pop(handle, None)
+        self._anchors.pop(handle, None)
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
         from . import species as sp
@@ -466,10 +513,15 @@ class GamePeerSource:
         t = d.observed_at
         for handle in packet.destroyed_handles:
             self._drop(handle)
-        for creation in self.identity.feed(d.payload, packet):
+        created = self.identity.feed(d.payload, packet)
+        if self.class_cache is not None:
+            self.class_cache.save()  # rate limited; a failed write never reaches the decoder
+        for creation in created:
             handle = creation.net_ref_handle
             self.store.remove(str(handle))  # a reused handle is a new actor
             self._vitals.pop(handle, None)
+            self._layouts.pop(handle, None)
+            self._anchors.pop(handle, None)
             self.locator.note_creation(handle, creation.location, t)
             kind, species, name = self._identity(handle)
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
@@ -485,6 +537,8 @@ class GamePeerSource:
                 continue
             if batch_kind(bits, batch) != KIND_STATE:
                 continue
+            if kind == sp.KIND_UNKNOWN and self._animal_layout(handle, batch.data_bit_count):
+                kind = sp.KIND_AI
             vit = decode_vitals_block(bits, batch) if batch.data_bit_count >= 593 else None
             if vit is not None:
                 self._vitals[handle] = vit
@@ -512,17 +566,27 @@ class GamePeerSource:
             return f"game: waiting for actor locations ({self.packets} pkts, {own})"
         known = sum(1 for p in peers if p.entity.species)
         if self.late_join():
-            return (f"game: {len(peers)} actors, none identified: the app started after you joined, so the server's "
-                    f"class and player tables were missed. Rejoin the server to get species and names ({own})")
+            unknown = sum(1 for p in peers if p.entity.kind == "unknown")
+            cached = sum(1 for p in peers if p.entity.inferred)
+            if unknown == len(peers):
+                return (f"game: {len(peers)} actors, none identified: the app started after you joined, so the server's "
+                        f"class and player tables were missed. Rejoin the server to get species and names ({own})")
+            via = f"; {cached} named from the saved class cache (marked ~)" if cached else ""
+            return (f"game: {len(peers)} actors, {unknown} unidentified: the app started after you joined and missed the "
+                    f"server's class tables{via}. Rejoin the server to identify the rest ({own})")
         seen = (f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}")
         return (f"game: {len(peers)} actors ({known} with species; {seen}; "
-                f"growth, hunger, thirst and heading not available; {own})")
+                f"heading from movement; growth, hunger and thirst not available; {own})")
 
     def late_join(self) -> bool:
-        """True when actors are on the map but none could be identified and no player name was ever seen: the capture started after the join, and the server will not resend those tables until a rejoin."""
-        peers = self.store.entities()
-        return (bool(peers) and self.packets >= self.LATE_JOIN_PACKETS and not self.identity.player_names
-                and all(p.entity.kind == "unknown" for p in peers))
+        """True when this connection's class tables were (nearly) never seen (many packets, no class path from them) and
+        actors on the map are still unidentified. Classes recovered from the saved class cache do not clear it for
+        the actors that stay unknown: the server will not resend the tables until a rejoin."""
+        return (self.packets >= self.LATE_JOIN_PACKETS and self.identity.tables_missed()
+                and any(p.entity.kind == "unknown" for p in self.store.entities()))
+
+    def identity_resolved(self) -> int:
+        return sum(1 for h in self.identity.actors if self.identity.class_path(h) is not None)
 
     def summary(self) -> str:
         """One line for the session log: what is on the map, how it was decoded and what was filtered."""
@@ -532,10 +596,13 @@ class GamePeerSource:
         shown = " ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"
         if self.late_join():
             shown += " (LATE JOIN: class/name tables missed, rejoin the server)"
+        inferred = sum(1 for p in self.store.entities() if p.entity.inferred)
+        if inferred:
+            shown += f" ({inferred} species from the saved class cache)"
         return (f"on map: {shown} | positions fixed={self.locator.fixed} learned={self.locator.learned} "
                 f"(layouts {self.locator.trusted_layouts}) | vitals blocks={self.vitals_blocks} | "
-                f"world-object batches skipped={self.filtered_world_objects} | classes known="
-                f"{len(self.identity.actors)} player names={len(self.identity.player_names)}")
+                f"world-object batches skipped={self.filtered_world_objects} | actors with class path="
+                f"{self.identity_resolved()}/{len(self.identity.actors)} player names={len(self.identity.player_names)}")
 
     def snapshot(self) -> PeerSnapshot:
         return self.store.snapshot(self.status(), True)
@@ -543,14 +610,16 @@ class GamePeerSource:
 
 # ----------------------------------------------------------------- factory
 def create_peer_source(kind: str, anchor: Callable[[], tuple[float, float] | None] | None = None, *,
-                       lab_port: int = LAB_PORT, self_ids: Iterable[str] = (), synthetic: bool = False, pipeline=None):
+                       lab_port: int = LAB_PORT, self_ids: Iterable[str] = (), synthetic: bool = False, pipeline=None,
+                       class_cache=None):
     """``kind``: "off" | "lab" | "game" -> unstarted source (None for off/unknown). ``pipeline`` is the
-    ``TelemetryPipeline`` the "game" source taps.
+    ``TelemetryPipeline`` the "game" source taps; ``class_cache`` (``classcache.ClassCache``) is the class
+    memory it falls back on when the join tables were missed.
     ``synthetic=True`` (the --replay default) returns ``SyntheticPeers`` instead (needs ``anchor``)."""
     if synthetic:
         return SyntheticPeers(anchor or (lambda: None))
     if kind == "lab":
         return LabPeerSource(lab_port, self_ids=self_ids)
     if kind == "game":
-        return GamePeerSource(self_ids, pipeline)
+        return GamePeerSource(self_ids, pipeline, class_cache=class_cache)
     return None

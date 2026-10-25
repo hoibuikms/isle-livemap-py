@@ -16,6 +16,7 @@ its pure logic is testable) on any OS.
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import queue
 import struct
@@ -421,6 +422,61 @@ def datagram_from_scapy(pkt, owned_ports: set[int], now: float) -> Datagram | No
     )
 
 
+class PreCaptureBuffer:
+    """Recent UDP packets whose ports no game socket owns (yet).
+
+    The sniffers run from the moment the app starts, before the game's process or its UDP socket is known (finding
+    them and opening Npcap takes seconds, and the server's join tables are sent only once). Packets of unowned ports
+    wait here for ``MAX_AGE_S``; when ``set_ports`` learns a port, the packets of that port are handed over first, in
+    arrival order, with their original timestamps, so a connection started during the delay is decoded from its first
+    datagram. ``offer`` and ``set_ports`` share one lock, which keeps replayed packets ahead of newer ones."""
+
+    MAX_AGE_S = 15.0
+    MAX_PACKETS = 4096
+
+    def __init__(self, max_age_s: float = MAX_AGE_S, max_packets: int = MAX_PACKETS) -> None:
+        self.max_age_s, self.max_packets = max_age_s, max_packets
+        self._lock = threading.Lock()
+        self._held: collections.deque = collections.deque()  # (time, packet, source port, destination port)
+        self.owned: frozenset[int] = frozenset()
+        self.replayed = 0
+
+    def __len__(self) -> int:
+        return len(self._held)
+
+    def offer(self, at: float, packet, sport: int, dport: int) -> bool:
+        """True: held (nobody owns either port). False: the caller handles the packet now."""
+        with self._lock:
+            if sport in self.owned or dport in self.owned:
+                return False
+            held = self._held
+            held.append((at, packet, sport, dport))
+            while held and (len(held) > self.max_packets or at - held[0][0] > self.max_age_s):
+                held.popleft()
+            return True
+
+    def set_ports(self, ports: Iterable[int], emit: Callable[[float, object], None]) -> int:
+        """Replace the owned ports; ``emit(time, packet)`` gets every held packet of a newly owned port. Returns
+        how many were handed over."""
+        ports = frozenset(ports)
+        with self._lock:
+            new = ports - self.owned
+            self.owned = ports
+            if not new or not self._held:
+                return 0
+            keep: collections.deque = collections.deque()
+            handed = 0
+            for item in self._held:
+                if item[2] in new or item[3] in new:
+                    emit(item[0], item[1])
+                    handed += 1
+                else:
+                    keep.append(item)
+            self._held = keep
+            self.replayed += handed
+            return handed
+
+
 class LiveCapture:
     """Background capture: supervisor thread + sniffer + decode worker."""
 
@@ -429,7 +485,8 @@ class LiveCapture:
         self.iface = iface
         self._stop = threading.Event()
         self._q: queue.Queue[Datagram] = queue.Queue(maxsize=8192)
-        self._ports: set[int] = set()
+        self._precap = PreCaptureBuffer()
+        self._early_retry_at = 0.0
         self._threads: list[threading.Thread] = []
         self._sniffers: list = []
         self._force_all = False
@@ -455,9 +512,13 @@ class LiveCapture:
         try:
             from scapy.layers.inet import UDP
 
-            if UDP in pkt:
-                self.pipeline.note_udp()
-            d = datagram_from_scapy(pkt, self._ports, time.monotonic())
+            if UDP not in pkt:
+                return
+            self.pipeline.note_udp()
+            now = time.monotonic()
+            if self._precap.offer(now, pkt, int(pkt[UDP].sport), int(pkt[UDP].dport)):
+                return  # no game socket owns this port yet: kept for the moment one does
+            d = datagram_from_scapy(pkt, self._precap.owned, now)
             if d is not None:
                 self._q.put_nowait(d)
         except queue.Full:
@@ -524,8 +585,29 @@ class LiveCapture:
                 pass
         self._sniffers = []
 
-    def _ensure_capture(self) -> None:
-        """Open sniffers if none are healthy: preferred interface first, then all."""
+    def _emit_held(self, at: float, pkt) -> None:
+        d = datagram_from_scapy(pkt, self._precap.owned, at)
+        if d is None:
+            return
+        try:
+            self._q.put_nowait(d)
+        except queue.Full:
+            self.pipeline.note_dropped()
+
+    def _ensure_early(self) -> None:
+        """Keep sniffers open while the game is not (fully) up. A failure is retried every 10 s, silently: the
+        normal path reports it once the game runs."""
+        if self._sniffers and not any(not (getattr(s, "running", False) and _thread_alive(s)) for _n, s in self._sniffers):
+            return
+        if time.monotonic() < self._early_retry_at:
+            return
+        self._ensure_capture(quiet=True)
+        if not self._sniffers:
+            self._early_retry_at = time.monotonic() + 10.0
+
+    def _ensure_capture(self, quiet: bool = False) -> None:
+        """Open sniffers if none are healthy: preferred interface first, then all. ``quiet``: the game is not
+        running yet, so leave the status alone (it keeps saying what the app is waiting for)."""
         log = get_logger()
         dead = [n for n, s in self._sniffers if not (getattr(s, "running", False) and _thread_alive(s))]
         if dead and self._sniffers:
@@ -556,6 +638,9 @@ class LiveCapture:
             opened, errors = more, {**errors, **errs}
         self._opened_at = time.monotonic()
         self._udp_at_open = self.pipeline.counts().get("udp_total", 0)
+        if quiet:
+            log.info("sniffing before the game starts (opened=%s, errors=%s)", opened, errors)
+            return
         self.pipeline.set_status(derive_capture_status(opened, errors))
         log.info("status after open: %s (opened=%s)", self.pipeline.latest.status, opened)
 
@@ -585,18 +670,23 @@ class LiveCapture:
                 if tracked_pid is not None:
                     self.pipeline.reset()
                     tracked_pid = None
+                    self._precap.set_ports((), self._emit_held)
                 self.pipeline.set_status("waiting for game")
-                self._stop.wait(2.0)
+                self._ensure_early()  # already sniffing when the game starts and joins
+                self._stop.wait(1.0)
                 continue
             ports = owned_udp_ports(pid)
             if not ports:
                 self.pipeline.set_status("game running, no UDP socket yet")
-                self._stop.wait(1.0)
+                self._ensure_early()
+                self._stop.wait(0.5)
                 continue
             if pid != tracked_pid:
                 self.pipeline.reset()
                 tracked_pid = pid
-            self._ports = ports  # atomic replace; read by the sniffer callback
+                self._opened_at = time.monotonic()  # the 5 s "no UDP at all" check starts with the game
+                self._udp_at_open = self.pipeline.counts().get("udp_total", 0)
+            self._precap.set_ports(ports, self._emit_held)  # packets held for a newly owned port go first
             self._watchdog()
             self._ensure_capture()
             if self._sniffers and self.pipeline.latest.status not in ("capturing", "tracking"):
