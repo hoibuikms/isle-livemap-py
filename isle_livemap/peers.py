@@ -663,9 +663,14 @@ class GamePeerSource:
         placed around it were drawn on a false track (recorded session ``vv``, handle 223284)."""
         return self._own_position() if self.own_handle is not None else None
 
-    def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str) -> None:
+    def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str,
+              source: str = "") -> None:
+        """``source``: "" for a decoded position, "spawn" for the creation record's spawn position (a guess about where the
+        creature is now). A spawn position never replaces a position that was followed."""
         eid = str(handle)
         old = self.store.get(eid)
+        if source == "spawn" and old is not None and old.pos_source != "spawn":
+            return
         vit = self._vitals.get(handle)
         inferred = bool(species) and self.identity.is_inferred(handle)
         back = self._zombies.get(handle) if kind == "unknown" else None
@@ -677,7 +682,7 @@ class GamePeerSource:
             health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
             max_health=vit.max_health if vit else None,
             heading=self._heading(handle, x, y, old.heading if old else None), inferred=inferred,
-            vitals_t=self._vitals_t.get(handle)), at=self._last_t)
+            vitals_t=self._vitals_t.get(handle), pos_source=source), at=self._last_t)
 
     def _note_identity(self, handle: int, old: Entity | None, species: str, inferred: bool) -> None:
         """A species remembered from an earlier session that the server's tables later contradict (or that was dropped
@@ -793,7 +798,7 @@ class GamePeerSource:
             self.locator.note_creation(handle, creation.location, t)
             kind, species, name = self._identity(handle)
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
-                self._emit(handle, *creation.location, kind, species, name)  # the spawn position is a position
+                self._emit(handle, *creation.location, kind, species, name, "spawn")  # a guess until a decoded fix confirms it
         bits = Bits(d.payload)
         spawn_at = {c.net_ref_handle: c.location for c in created if c.location is not None}
         for batch in packet.batches:
@@ -816,7 +821,7 @@ class GamePeerSource:
                     # Its spawn position is drawn at once; waiting for a position update leaves a resting creature unseen.
                     if kind == sp.KIND_UNKNOWN and max_health is not None and handle in spawn_at \
                             and self.store.get(str(handle)) is None:
-                        self._emit(handle, *spawn_at[handle], kind, species, name)
+                        self._emit(handle, *spawn_at[handle], kind, species, name, "spawn")
                 continue
             if bkind != KIND_STATE:
                 continue

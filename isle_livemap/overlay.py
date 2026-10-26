@@ -395,13 +395,7 @@ class MapView(QWidget):
         if len(widths) > 2000:
             widths.clear()
         total = len(by_priority)
-        self._pen_key = None
-        for i, (n, pt) in enumerate(reversed(by_priority)):  # players on top, far before near
-            rank = total - i  # 1 = the most important peer
-            if rank > CROWD_GLYPHS:
-                self._draw_crowd_dot(p, n, pt)
-            else:
-                self._draw_entity_marker(p, n, pt, rank <= HALO_MAX)
+        label_ops: list = []  # label pills and text, drawn BEFORE the glyphs: an arrow is never covered by somebody's label
         # dots of players and dinosaurs that can compete with a label: kept clear when possible (a preference, so two
         # creatures standing next to each other still both get a label)
         dots = []
@@ -490,7 +484,8 @@ class MapView(QWidget):
             alpha = STALE_ALPHA if n.stale else 255
             tier = species_tier(sp, inferred)  # a species that is only remembered / unknown is drawn softer than a confirmed one
             head_alpha = int(alpha * (SOFT_INFERRED if tier == SPECIES_INFERRED else SOFT_UNKNOWN if tier == SPECIES_UNKNOWN else 1.0))
-            color = _qcolor(peer_style(n.entity).color, head_alpha)
+            label_ops.append((r, lines, alpha, _qcolor(peer_style(n.entity).color, head_alpha), head_alpha))
+        for r, lines, alpha, color, head_alpha in label_ops:
             p.setPen(Qt.PenStyle.NoPen)  # a soft dark pill behind the text: readable on forest, rock and water alike
             p.setBrush(LABEL_BG if alpha == 255 else LABEL_BG_STALE)
             p.drawRoundedRect(QRectF(r[0] - 2.0, r[1] - 0.5, r[2] + 2.0, r[3] + 1.0), 3.0, 3.0)
@@ -499,6 +494,15 @@ class MapView(QWidget):
                 a = head_alpha if i == 0 else alpha
                 p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
+        # the glyphs go on top of every pill and caption: the most important peer (players before dinosaurs before fish, the
+        # 250 m tier before the 500 m one) is painted last, so nothing covers an arrow that matters
+        self._pen_key = None
+        for i, (n, pt) in enumerate(reversed(by_priority)):  # players on top, far before near
+            rank = total - i  # 1 = the most important peer
+            if rank > CROWD_GLYPHS:
+                self._draw_crowd_dot(p, n, pt)
+            else:
+                self._draw_entity_marker(p, n, pt, rank <= HALO_MAX)
         self._label_slot = slots_now
         self._labelled = set(slots_now)
         if len(self._compact_until) > 400:

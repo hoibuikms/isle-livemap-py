@@ -18,6 +18,7 @@ from isle_livemap.capture import INBOUND, OUTBOUND, Datagram, TelemetryPipeline 
 from isle_livemap.peers import GamePeerSource  # noqa: E402
 from isle_livemap.recorder import PcapRecorder, build_record  # noqa: E402
 from isle_livemap.replay import pcap_datagrams  # noqa: E402
+from conftest import retimed  # noqa: E402
 from test_e2e_peers import build_pcap, ready, run_main, settings_dir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +116,8 @@ def test_write_error_midway_stops_recording_but_not_decoding(tmp_path, recorded)
     rec._fh = Boom()  # noqa: SLF001
     move = bytes.fromhex(recorded["StationaryPayload"])
     for i in range(160):
-        pipe.handle(Datagram(1.0 + i * 0.05 / 3, "192.168.0.10", 50000, "203.0.113.5", 7777, move, OUTBOUND))
+        pipe.handle(Datagram(1.0 + i * 0.05 / 3, "192.168.0.10", 50000, "203.0.113.5", 7777,
+                             retimed(move, i * 0.05 / 3), OUTBOUND))
     assert pipe.latest.position is not None  # own-player decoding unaffected
     assert not rec.active and "FAILED" in rec.status() and "disk full" in rec.error
 

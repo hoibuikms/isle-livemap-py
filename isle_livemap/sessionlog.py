@@ -163,6 +163,8 @@ class SessionLog:
         self._next_snapshot = 0.0
         self._labels_sig: frozenset | None = None
         self._labels_at = -1e9
+        self._jump_at = -1e9  # datagram time of the newest position jump already logged
+        self._align_seen = (0.0, 0.0)
         self._first_creation = False
         self._errors: dict[str, int] = {}
         self.creation = self.exports = self.destroyed = self.packets = 0
@@ -295,9 +297,28 @@ class SessionLog:
             if force_snapshot or now >= self._next_snapshot:
                 self._next_snapshot = now + self.interval
                 self.snapshot()
+            self._own_frame()
             self._labels(now)
         except Exception:  # noqa: BLE001
             self.on_error("session log tick")
+
+    def _own_frame(self) -> None:
+        """Position jumps of the own marker and manual alignments: what is needed to judge later whether the own position
+        and the other creatures were in the same frame (a jump at standstill with a continuous client clock is either a
+        teleport or a change of the client's frame; the capture alone cannot tell which)."""
+        pipe = self.pipeline
+        for at, metres in tuple(getattr(pipe, "jumps", ())):
+            if at > self._jump_at:
+                self._jump_at = at
+                self.event("own position jumped %.0f m while the client clock carried on (a teleport, or the frame the client "
+                           "reports in changed); other players are not corrected for it", metres)
+        align = getattr(pipe, "alignment_m", (0.0, 0.0))
+        if align != self._align_seen:
+            self._align_seen = align
+            if align == (0.0, 0.0):
+                self.event("own position alignment cleared")
+            else:
+                self.event("own position aligned by the user: %+.0f m east, %+.0f m south", align[0], align[1])
 
     def _labels(self, now: float) -> None:
         """Label corrections, and the compact "labels:" line (what the minimap says about each creature and how sure it

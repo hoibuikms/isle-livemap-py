@@ -93,3 +93,30 @@ def test_recorded_session_meets_the_stability_budgets(pcap):
     cache = ClassCache.load(None)  # the shipped seed only: what a fresh install knows
     r = sr.run(pcap, cache)
     assert sr.check_budgets(r) == []
+
+
+# ---- choppiness (how fluid the dots move at the frame rate)
+def _series(step, seconds=20.0, fps=60.0):
+    """A creature moving east at 5 m/s, positions every 0.5 s; ``step(t, true_x)`` is the displayed x at frame time t."""
+    sm = [(i * 0.5, i * 250.0, 0.0) for i in range(int(seconds / 0.5))]
+    frames = [(k / fps, step(k / fps, 500.0 * k / fps / 1.0 * 0.5), 0.0) for k in range(int(seconds * fps))]
+    return {"a": [(t, x * 1.0, y) for t, x, y in frames]}, {"a": sm}, {"a": "player"}
+
+
+def test_a_dot_that_moves_with_the_creature_is_not_choppy():
+    frames, samples, kinds = _series(lambda t, x: 500.0 * t)  # 500 cm/s: 5 m/s, continuous
+    r = sr.choppiness(frames, samples, kinds)["player"]
+    assert r["intervals"] >= 30 and r["stall_frac"] == 0.0 and r["spike_frac"] == 0.0
+
+
+def test_a_dot_that_waits_and_then_jumps_is_choppy():
+    frames, samples, kinds = _series(lambda t, x: 250.0 * int(t / 0.5))  # stands still, then jumps to the new sample
+    r = sr.choppiness(frames, samples, kinds)["player"]
+    assert r["stall_frac"] > 0.8 and r["spike_frac"] > 0.0 and r["max_stall_run_s"] > 0.2
+
+
+def test_choppiness_budgets_exist_and_a_few_intervals_say_nothing():
+    for key in ("choppy.player.stall_frac", "choppy.ai.spike_frac"):
+        assert any(b[0] == key for b in sr.BUDGETS)
+    frames, samples, kinds = _series(lambda t, x: 500.0 * t, seconds=5.0)  # 10 intervals
+    assert sr.choppiness(frames, samples, kinds)["player"]["stall_frac"] is None

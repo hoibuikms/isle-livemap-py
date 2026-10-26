@@ -7,6 +7,8 @@ import pytest
 from isle_livemap.decode import MovementCandidate, decode_movement
 from isle_livemap.tracking import MovementTracker
 
+from conftest import retimed
+
 T0 = 1_000_000.0
 
 
@@ -53,8 +55,8 @@ def test_tracker_locks_after_bootstrap_window(hexb):
     tr = MovementTracker()
     payload = hexb("StationaryPayload")
     for i in range(12):
-        assert tr.track(payload, T0 + i * 0.05) is None
-    s = tr.track(payload, T0 + 0.6)
+        assert tr.track(retimed(payload, i * 0.05), T0 + i * 0.05) is None
+    s = tr.track(retimed(payload, 0.6), T0 + 0.6)
     assert s is not None
     assert s.x == pytest.approx(442_020.33, abs=0.01)
     assert s.y == pytest.approx(-162_148.37, abs=0.01)
@@ -66,7 +68,7 @@ def test_tracker_locks_real_vector_from_live_payload(hexb):
     assert any(near(c.x, 137_939.16) and near(c.y, 285_822.42) for c in decode_movement(payload))
     tracked = None
     for i in range(13):
-        tracked = tr.track(payload, T0 + i * 0.05) or tracked
+        tracked = tr.track(retimed(payload, i * 0.05), T0 + i * 0.05) or tracked
     assert tracked is not None
     assert tracked.x == pytest.approx(137_939.16, abs=0.01)
     assert tracked.y == pytest.approx(285_822.42, abs=0.01)
@@ -134,10 +136,10 @@ def test_replaces_distant_stale_lock_after_sustained_canonical_chain():
     tr = MovementTracker()
     wrong = cand(34_079, -28_844, 4_085, 40.0, bits=23)
     rec = None
-    for i in range(24):
-        c = cand(111_344.3, -246_597.7, 30_289.4, 159.0 + i * 0.075)
-        rec = tr.recover_distant([c], wrong, T0, T0 + 2 + i * 0.075)
-        if i < 23:
+    for i in range(16):  # tracking._REQUIRED_DISTANT_HITS
+        c = cand(111_344.3, -246_597.7, 30_289.4, 159.0 + i * 0.1)
+        rec = tr.recover_distant([c], wrong, T0, T0 + 2 + i * 0.1)
+        if i < 15:
             assert rec is None
     assert rec is not None
     assert rec.x == pytest.approx(111_344.3, abs=0.1)
@@ -148,10 +150,10 @@ def test_reacquires_lower_bit_layout_after_respawn():
     tr = MovementTracker()
     old = cand(140_424.3, -210_803.2, 26_262.5, 900.0, bits=26)
     rec = None
-    for i in range(24):
+    for i in range(16):
         c = cand(53_330.12, -32_143.69, 38_831.91, 65.62 + i * 0.21, bits=24)
-        rec = tr.recover_distant([c], old, T0, T0 + 2 + i * 0.075)
-        if i < 23:
+        rec = tr.recover_distant([c], old, T0, T0 + 2 + i * 0.1)
+        if i < 15:
             assert rec is None
     assert rec is not None
     assert rec.component_bit_count == 24
@@ -179,3 +181,26 @@ def test_does_not_replace_distant_lock_from_short_or_low_bit_chain():
         bits = 26 if i < 16 else 20
         ov = cand(34_079, -28_844, 4_085, 160.0 + i * 0.075, bits=bits)
         assert tr.recover_distant([ov], cur, T0, T0 + 2 + i * 0.075) is None
+
+
+def test_distant_recovery_follows_a_chain_across_changing_layouts():
+    """The bit layout of a move changes from datagram to datagram (what else the datagram carries moves the vector): the
+    chain is what continues, not the layout. Recorded session ``m``: 13 s with the old place on the map after a 1.2 km jump."""
+    tr = MovementTracker()
+    old = cand(84_800, 295_900, 20_200, 49.0, bits=26)
+    rec = None
+    for i in range(30):
+        c = cand(170_300 + i * 20, 207_100, 20_300, 50.6 + i * 0.1, bits=26)
+        c = MovementCandidate(c.x, c.y, c.z, c.unreal_yaw_degrees, c.client_timestamp, 60 + (i % 5) * 4, 340 + (i % 7) * 11, 26)
+        rec = tr.recover_distant([c], old, T0, T0 + 2.0 + i * 0.1)
+        if rec is not None:
+            break
+    assert rec is not None and i <= 17 and rec.x == pytest.approx(170_300 + i * 20, abs=1)
+
+
+def test_a_chain_needs_the_client_clock_to_run_forward():
+    tr = MovementTracker()
+    old = cand(84_800, 295_900, 20_200, 49.0, bits=26)
+    for i in range(40):  # same timestamp over and over: a constant vector, not a move
+        c = cand(170_300, 207_100, 20_300, 50.6, bits=26)
+        assert tr.recover_distant([c], old, T0, T0 + 2.0 + i * 0.1) is None

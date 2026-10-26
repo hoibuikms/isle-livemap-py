@@ -27,6 +27,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from isle_livemap.decode import decode_actor_locations  # noqa: E402
 from isle_livemap.geo import Entity, project_unclamped  # noqa: E402
+from conftest import retimed  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 OWN_FIX = (442_020.33, -162_148.37)
@@ -46,7 +47,7 @@ def build_pcap(path: Path, inbound=("FirstHeartbeat", "SecondHeartbeat", "Period
     client, server, cport, sport = "192.168.0.10", "203.0.113.5", 50_000, 7777  # public server: pcap_datagrams infers the local side
     pkts, t = [], 0.0
     for i in range(160):
-        for up, payload in [(True, move)] + ([(False, inb[i // 10])] if i % 10 == 5 and i // 10 < len(inb) else []):
+        for up, payload in [(True, retimed(move, t))] + ([(False, inb[i // 10])] if i % 10 == 5 and i // 10 < len(inb) else []):
             a, b, sp, dp = (client, server, cport, sport) if up else (server, client, sport, cport)
             p = Ether() / IP(src=a, dst=b) / UDP(sport=sp, dport=dp) / payload
             p.time = 1_700_000_000 + t

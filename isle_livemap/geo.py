@@ -400,6 +400,7 @@ class Entity:
     inferred: bool = False  # the species comes from the saved class cache (the join tables were missed), not the server
     vitals_t: float | None = None  # source clock time of the newest health / stamina reading (None: no timestamp)
     max_health: float | None = None  # maximum health in points, when the creature's records gave it (health points = pct * max)
+    pos_source: str = ""  # "": a followed position (decoded fixes); "spawn": only the creation record's spawn position so far
 
     def __post_init__(self) -> None:
         h = self.heading
@@ -419,7 +420,9 @@ class Nearby:
 
     @property
     def stale(self) -> bool:
-        return self.age_s is not None and self.age_s >= self.stale_s
+        """Dimmed: nothing heard for a long time, or only the spawn position is known (the creature may have walked far
+        from it since: its position is a guess until a decoded fix confirms it)."""
+        return (self.age_s is not None and self.age_s >= self.stale_s) or self.entity.pos_source == "spawn"
 
 
 # ---- marker styles: the one place colours / sizes / glyphs of map entities live
@@ -653,7 +656,7 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
     species standing together ("Carnotaurus ×5 - 724 m", the nearest one's distance); it then has no vitals line.
     ``my_z`` is accepted for the callers that pass it; the label does not use it."""
     e = n.entity
-    dist = format_distance(n.distance_m)
+    dist = ("~" if e.pos_source == "spawn" else "") + format_distance(n.distance_m)  # "~": only its spawn position is known
     if e.kind == "ai":
         return f"AI - {species_text(e)} - {dist}", ""
     name = e.name or e.id
@@ -811,6 +814,13 @@ DR_PEER_HORIZON_FACTOR = 2.0
 DR_PEER_MAX_EXTRAP_S = 3.0
 DR_MAX_SPEED = 6_000.0  # cm/s (60 m/s); faster is a glitch or a respawn, not movement
 DR_CORR_TAU_S = 0.2  # a new sample is blended in over this long, so a late or off-course sample bends the path instead of jumping
+# A creature's server positions are quantised and arrive at irregular intervals, so the velocity of the last two samples
+# jitters (and is sometimes ~0 between two samples of a steady swim): a dot driven by it stops and starts. A new velocity that
+# points the same way as the old one (and is of the same order) is blended with it; a turn or a stop replaces it at once.
+DR_VEL_KEEP = 0.5  # weight of the previous velocity in that blend
+DR_VEL_MIN_COS = 0.5  # the new velocity must be within 60 degrees of the old one to be blended
+DR_VEL_MAX_RATIO = 3.0  # ... and not more than this many times faster / slower
+
 DR_FF_GRACE_S = 0.3  # the dot keeps its velocity this long past the horizon: a sample that is a little late must not stop it
 
 
@@ -861,6 +871,13 @@ class EntitySmoother:
             if dt >= DR_MIN_DT_S:
                 vx, vy = (e.x - s[0]) / dt, (e.y - s[1]) / dt
                 if dt <= DR_MAX_INTERVAL_S and math.hypot(vx, vy) <= DR_MAX_SPEED:
+                    old = self._vel.get(eid)
+                    if old is not None:
+                        ov, nv = math.hypot(old[0], old[1]), math.hypot(vx, vy)
+                        if ov > 1.0 and nv > 1.0 and (old[0] * vx + old[1] * vy) / (ov * nv) >= DR_VEL_MIN_COS \
+                                and 1.0 / DR_VEL_MAX_RATIO <= nv / ov <= DR_VEL_MAX_RATIO:
+                            vx = old[0] * DR_VEL_KEEP + vx * (1.0 - DR_VEL_KEEP)
+                            vy = old[1] * DR_VEL_KEEP + vy * (1.0 - DR_VEL_KEEP)
                     self._vel[eid] = (vx, vy, min(dt * DR_PEER_HORIZON_FACTOR, DR_PEER_MAX_EXTRAP_S))
                 else:
                     self._vel.pop(eid, None)

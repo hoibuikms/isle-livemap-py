@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import math
 import queue
 import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
 
 from .ifaces import (
@@ -144,6 +145,16 @@ class Telemetry:
     stats: dict = field(default_factory=dict)
 
 
+# A decoded own position that moves further than this between two accepted moves, faster than any creature, while the client's
+# own clock carries on, is a jump: a teleport, or the frame the client reports in changed. Recorded session ``m``: 1.2 km at
+# standstill, client clock continuous (see docs/PEERS.md, "Own position frame").
+JUMP_CM = 30_000.0
+JUMP_MIN_SPEED_CM_S = 10_000.0  # ... at more than 100 m/s: no creature moves like that
+JUMP_MAX_GAP_S = 10.0  # the tracker takes a new place over only after a couple of seconds of silence from the old one
+JUMP_CLOCK_TOL_S = 1.5  # the client clock advanced by the wall time between the two moves, give or take this
+JUMPS_KEPT = 20
+
+
 class TelemetryPipeline:
     """Routes datagrams to the decoders: outbound client moves -> position and
     heading, inbound server replication -> own vitals. Thread-safe."""
@@ -169,6 +180,13 @@ class TelemetryPipeline:
         # records the traceback); the exception itself is still swallowed so capture never stops.
         self.error_hook: Callable[[str], None] | None = None
         self.latest = Telemetry()
+        # Manual position alignment (see align_to): world cm added to every decoded own position. The raw position is kept so
+        # the alignment can be set, changed and cleared at any time; a jump of the raw position is counted (position_jumps).
+        self._align = (0.0, 0.0)
+        self._align_stale = False  # the raw position jumped since the alignment was set
+        self._raw: MovementCandidate | None = None
+        self._raw_at = 0.0
+        self.jumps: list[tuple[float, float]] = []  # (datagram time, metres) of the last JUMPS_KEPT position jumps
 
     def set_status(self, status: str) -> None:
         with self._lock:
@@ -227,6 +245,7 @@ class TelemetryPipeline:
             self._vitals.reset()
             self._server = None
             self._rival = None
+            self._align, self._align_stale, self._raw = (0.0, 0.0), False, None
             self.latest = Telemetry(status="waiting", stats=dict(self._counts))
             observers = list(self._reset_observers)
         self._notify_reset(observers)
@@ -251,7 +270,62 @@ class TelemetryPipeline:
 
     def status_text(self) -> str:
         cur = self.latest
-        return status_text(cur.status, self._counts, cur.position is not None)
+        text = status_text(cur.status, self._counts, cur.position is not None)
+        if cur.position is not None and (self._align[0] or self._align[1]):
+            dx, dy = self._align[0] / 100.0, self._align[1] / 100.0
+            text += f" · aligned {dx:+.0f}, {dy:+.0f} m" + (" (position jumped since: align again?)" if self._align_stale else "")
+        return text
+
+    # -- manual alignment of the own position ---------------------------------------------------------------------
+    def _aligned(self, sample: MovementCandidate) -> MovementCandidate:
+        dx, dy = self._align
+        return sample if not (dx or dy) else replace(sample, x=sample.x + dx, y=sample.y + dy)
+
+    def _note_jump(self, sample: MovementCandidate, at: float) -> None:
+        prev = self._raw
+        if prev is None or not 0.0 <= at - self._raw_at <= JUMP_MAX_GAP_S:
+            return
+        far = math.hypot(sample.x - prev.x, sample.y - prev.y)
+        gap = at - self._raw_at
+        dts = sample.client_timestamp - prev.client_timestamp
+        # the client clock carried on with the wall clock: not a respawn (that restarts it)
+        if far > JUMP_CM and far / max(gap, 0.05) > JUMP_MIN_SPEED_CM_S and abs(dts - gap) <= JUMP_CLOCK_TOL_S:
+            self.jumps.append((at, far / 100.0))
+            del self.jumps[:-JUMPS_KEPT]
+            self._counts["position_jumps"] = self._counts.get("position_jumps", 0) + 1
+            if self._align[0] or self._align[1]:
+                self._align_stale = True
+
+    def align_to(self, x: float, y: float) -> bool:
+        """The user stands at world (x, y) (cm), e.g. next to another player whose position is known: from now on every
+        decoded own position is shifted by the difference, so the own marker, the distances and the peers placed around it
+        agree with that spot. Cleared by ``clear_alignment``, a new server and ``reset``. False without a position yet."""
+        with self._lock:
+            raw = self._raw
+            if raw is None:
+                return False
+            self._align, self._align_stale = (x - raw.x, y - raw.y), False
+            cur = self.latest
+            if cur.position is not None:
+                self.latest = Telemetry(self._aligned(raw), cur.position_at, cur.vitals, cur.vitals_at, cur.status, dict(self._counts))
+            snap = self.latest
+        if self._on_update:
+            self._on_update(snap)
+        return True
+
+    def clear_alignment(self) -> None:
+        with self._lock:
+            self._align, self._align_stale = (0.0, 0.0), False
+            cur, raw = self.latest, self._raw
+            if cur.position is not None and raw is not None:
+                self.latest = Telemetry(raw, cur.position_at, cur.vitals, cur.vitals_at, cur.status, dict(self._counts))
+            snap = self.latest
+        if self._on_update:
+            self._on_update(snap)
+
+    @property
+    def alignment_m(self) -> tuple[float, float]:
+        return (self._align[0] / 100.0, self._align[1] / 100.0)
 
     def handle(self, d: Datagram) -> Telemetry | None:
         """Decode one datagram; returns the new snapshot if something changed."""
@@ -284,13 +358,16 @@ class TelemetryPipeline:
                         self._server, self._server_seen, self._rival = dest, d.observed_at, None
                         self._vitals.reset()
                         vit, vit_at = None, 0.0
+                        self._align, self._align_stale, self._raw = (0.0, 0.0), False, None
                         reset_taps = list(self._reset_observers)
                     else:
                         return None  # a stray datagram: not game traffic of the learned server
                 sample = self._movement.track(d.payload, d.observed_at)
                 if sample is not None:
                     self._counts["decoded"] += 1
-                    pos, pos_at, changed = sample, d.observed_at, True
+                    self._note_jump(sample, d.observed_at)
+                    self._raw, self._raw_at = sample, d.observed_at
+                    pos, pos_at, changed = self._aligned(sample), d.observed_at, True
             elif d.direction == INBOUND:
                 self._counts["inbound"] += 1
                 if f"{d.src_ip}:{d.src_port}" == self._server:

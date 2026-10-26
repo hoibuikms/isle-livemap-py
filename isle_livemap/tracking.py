@@ -18,6 +18,7 @@ _EPS = 1e-6  # float-seconds stand-in for C# tick resolution
 _MIN_BOOTSTRAP = 0.6
 _MAX_READY_AGE = 0.25
 _REQUIRED_HITS = 8
+_MIN_TS_RATE = 0.5  # a move's client timestamp must advance at least this fast (per wall second) over a hypothesis
 _TS_REGRESSION_TOL = to_f32(0.002)
 _TS_ADVANCE_ALLOWANCE = 2.0
 _TS_WALL_MULT = 4.0
@@ -34,7 +35,8 @@ _DISTANT_DELAY = 2.0
 _DISTANT_LIFETIME = 1.0
 _MIN_DISTANT_DURATION = 1.5
 _MAX_DISTANT_READY_AGE = 0.25
-_REQUIRED_DISTANT_HITS = 24
+_REQUIRED_DISTANT_HITS = 16
+_MAX_DISTANT_CHAINS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,7 @@ class _Hyp:
     first_seen: float
     last_seen: float
     hits: int
+    first_ts: float = 0.0  # client timestamp of the first hit: a real move's clock runs with the wall clock
 
 
 def distance(a: MovementCandidate, b: MovementCandidate) -> float:
@@ -78,6 +81,7 @@ class MovementTracker:
     def __init__(self) -> None:
         self._hyps: dict[tuple, _Hyp] = {}
         self._distant: dict[tuple, _Hyp] = {}
+        self._distant_serial = 0
         self._current: MovementCandidate | None = None
         self._recovery: _Hyp | None = None
         self._last_lock_update = 0.0
@@ -114,13 +118,19 @@ class MovementTracker:
         for lay in [k for k, h in self._hyps.items() if observed_at - h.last_seen > _HYPOTHESIS_LIFETIME]:
             del self._hyps[lay]
         for cand in candidates:
+            # A move carries the client's running clock. A vector with timestamp 0 (or none that is finite) is some other
+            # state that happens to look like a location: a constant one reaches 8 hits as easily as the player does and
+            # was locked as the own position for the first seconds of a join (recorded session ``m``).
+            if not math.isfinite(cand.client_timestamp) or cand.client_timestamp <= 0.0:
+                continue
             hyp = self._hyps.get(cand.layout)
             if (
                 hyp is None
                 or observed_at - hyp.last_seen > _HYPOTHESIS_LIFETIME
                 or not _is_continuous(hyp.candidate, hyp.last_seen, cand, observed_at)
+                or not _plausible_forward_ts(hyp.candidate, cand, max(0.0, observed_at - hyp.last_seen))
             ):
-                self._hyps[cand.layout] = _Hyp(cand, observed_at, observed_at, 1)
+                self._hyps[cand.layout] = _Hyp(cand, observed_at, observed_at, 1, cand.client_timestamp)
             else:
                 self._hyps[cand.layout] = replace(
                     hyp, candidate=cand, last_seen=observed_at, hits=hyp.hits + 1
@@ -131,6 +141,7 @@ class MovementTracker:
             if h.hits >= _REQUIRED_HITS
             and observed_at - h.first_seen >= _MIN_BOOTSTRAP - _EPS
             and observed_at - h.last_seen <= _MAX_READY_AGE
+            and h.candidate.client_timestamp - h.first_ts >= _MIN_TS_RATE * (h.last_seen - h.first_seen)
         ]
         if not ready:
             return None
@@ -213,18 +224,26 @@ class MovementTracker:
                 and distance(current, cand) > _MAX_RECOVERY_DELTA
             ):
                 continue
-            hyp = self._distant.get(cand.layout)
-            if (
-                hyp is None
-                or observed_at - hyp.last_seen > _DISTANT_LIFETIME
-                or not _is_continuous(hyp.candidate, hyp.last_seen, cand, observed_at)
-                or not _strictly_forward_ts(hyp.candidate, cand, max(0.0, observed_at - hyp.last_seen))
-            ):
-                self._distant[cand.layout] = _Hyp(cand, observed_at, observed_at, 1)
+            # A chain is a run of moves that continue each other (close in place, the client clock strictly forward). It is not
+            # keyed by the bit layout: the layout of a move changes from one datagram to the next with what else the datagram
+            # carries (recorded session ``m``: the own marker stood at the old place for 13 s after a 1.2 km jump because no
+            # layout repeated 24 times).
+            match = None
+            for key, hyp in self._distant.items():
+                if (
+                    _is_continuous(hyp.candidate, hyp.last_seen, cand, observed_at)
+                    and _strictly_forward_ts(hyp.candidate, cand, max(0.0, observed_at - hyp.last_seen))
+                    and (match is None or hyp.hits > self._distant[match].hits)
+                ):
+                    match = key
+            if match is None:
+                self._distant_serial += 1
+                self._distant[("chain", self._distant_serial)] = _Hyp(cand, observed_at, observed_at, 1)
+                if len(self._distant) > _MAX_DISTANT_CHAINS:
+                    del self._distant[min(self._distant, key=lambda k: self._distant[k].last_seen)]
             else:
-                self._distant[cand.layout] = replace(
-                    hyp, candidate=cand, last_seen=observed_at, hits=hyp.hits + 1
-                )
+                hyp = self._distant[match]
+                self._distant[match] = replace(hyp, candidate=cand, last_seen=observed_at, hits=hyp.hits + 1)
         ready = [
             h
             for h in self._distant.values()

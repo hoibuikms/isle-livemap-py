@@ -9,7 +9,7 @@ from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QCol
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QInputDialog,
     QAbstractItemView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QHBoxLayout,
 )
 
 from .capture import TelemetryPipeline
@@ -114,6 +114,13 @@ class NearbyPanel(QDialog):
         self.setWindowTitle("Nearby players")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.status = QLabel()
+        self._near: list = []
+        self.align_btn = QPushButton("I am standing next to the selected one")
+        self.align_btn.setToolTip("Moves your marker to the selected player's position. Use it when the minimap puts you far "
+                                  "from somebody who is right next to you in the game.")
+        self.align_btn.clicked.connect(self.align_to_selected)
+        self.clear_btn = QPushButton("Clear alignment")
+        self.clear_btn.clicked.connect(self.view.pipeline.clear_alignment)
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -122,7 +129,11 @@ class NearbyPanel(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(self.status)
         lay.addWidget(self.table)
-        self.resize(720, 340)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.align_btn)
+        buttons.addWidget(self.clear_btn)
+        lay.addLayout(buttons)
+        self.resize(720, 380)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
 
@@ -130,13 +141,24 @@ class NearbyPanel(QDialog):
         self.status.setText(self.view.peer_status or "no nearby-players source")
         pos = self.view.pipeline.latest.position
         my_z = pos.z if pos is not None else None
-        rows = [entity_row(n, my_z) for n in self.view.nearby()]
+        self._near = list(self.view.nearby())
+        rows = [entity_row(n, my_z) for n in self._near]
         if rows != self._rows:
             self._rows = rows
             self.table.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 for c, text in enumerate(row):
                     self.table.setItem(r, c, QTableWidgetItem(text))
+
+    def align_to_selected(self) -> None:
+        """Put the own marker where the selected creature is (the user knows it is right next to them)."""
+        row = self.table.currentRow()
+        if not 0 <= row < len(self._near):
+            self.status.setText("select a player in the list first")
+            return
+        n = self._near[row]
+        if not self.view.pipeline.align_to(n.x, n.y):
+            self.status.setText("no position of yours yet")
 
     def showEvent(self, e) -> None:  # noqa: N802
         self.refresh()

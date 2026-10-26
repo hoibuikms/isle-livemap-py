@@ -37,7 +37,6 @@ def build_join_pcap(path: Path, packets: list[dict]) -> Path:
     from scapy.utils import wrpcap
 
     client, server, cport, sport = "192.168.0.10", "203.0.113.5", 50_000, 7777
-    move = encode_move_payload(*OWN, 10.0, 41.0)
     pkts = []
     t = 1_700_000_000.0
     for i in range(10):  # learn the server and the own position before the first creature
@@ -50,6 +49,8 @@ def build_join_pcap(path: Path, packets: list[dict]) -> Path:
         p.time = t + k * 0.05
         pkts.append(p)
         if k % 2 == 0:
+            # the client's clock runs with the wall clock: a constant timestamp is not a move (tracking._MIN_TS_RATE)
+            move = encode_move_payload(*OWN, 10.0, 41.0 + 0.5 + k * 0.05 + 0.02)
             q = Ether() / IP(src=client, dst=server) / UDP(sport=cport, dport=sport) / move
             q.time = t + k * 0.05 + 0.02
             pkts.append(q)

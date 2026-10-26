@@ -53,6 +53,63 @@ def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def choppiness(frames: dict, samples: dict, kinds: dict) -> dict:
+    """How fluid the dots move at the rendered frame rate, per kind ("player" = every dinosaur of another person, "ai").
+
+    For every interval between two server positions over which the creature really moves (1.5 .. 40 m/s, samples at
+    most 2 s apart) the displacement of the dot in each rendered frame is compared with the interval's mean:
+      stall   frame moved less than 20 % of the mean (the dot stands still while the creature moves)
+      spike   frame moved more than 3 x the mean (the dot jumps)
+    ``frames``: id -> [(t, x, y)] per frame, ``samples``: id -> [(t, x, y)] distinct server positions."""
+    acc: dict = {}
+    for eid, d in frames.items():
+        sm = samples.get(eid, [])
+        kind = kinds.get(eid)
+        if len(sm) < 3 or len(d) < 30 or kind is None:
+            continue
+        group = "ai" if kind == "ai" else "player"
+        steps = [(b[0], math.hypot(b[1] - a[1], b[2] - a[2])) for a, b in zip(d, d[1:])]
+        a_ = acc.setdefault(group, {"intervals": 0, "frames": 0, "stall": 0, "spike": 0, "max_run": 0})
+        j = 0
+        for a, b in zip(sm, sm[1:]):
+            dt = b[0] - a[0]
+            if not 0.05 < dt <= 2.0:
+                continue
+            speed = math.hypot(b[1] - a[1], b[2] - a[2]) / dt / 100.0
+            if not 1.5 <= speed <= 40.0:
+                continue
+            while j < len(steps) and steps[j][0] < a[0] + 0.25:
+                j += 1
+            k = j
+            win = []
+            while k < len(steps) and steps[k][0] <= b[0] + 0.25:
+                win.append(steps[k][1])
+                k += 1
+            if len(win) < 5:
+                continue
+            mean = sum(win) / len(win)
+            run = 0
+            a_["intervals"] += 1
+            a_["frames"] += len(win)
+            for x in win:
+                if x < 0.2 * mean:
+                    a_["stall"] += 1
+                    run += 1
+                    a_["max_run"] = max(a_["max_run"], run)
+                else:
+                    run = 0
+                if x > 3.0 * mean:
+                    a_["spike"] += 1
+    out = {}
+    for group, a_ in acc.items():
+        ok = a_["intervals"] >= 30  # a handful of intervals says nothing
+        out[group] = {"intervals": a_["intervals"],
+                      "stall_frac": round(a_["stall"] / a_["frames"], 4) if ok else None,
+                      "spike_frac": round(a_["spike"] / a_["frames"], 4) if ok else None,
+                      "max_stall_run_s": round(a_["max_run"] / FPS, 2)}
+    return out
+
+
 def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | None = None,
         paint_hz: float = PAINT_HZ, debug: dict | None = None) -> dict:
     from unittest import mock
@@ -138,6 +195,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
         own_hist: list = []
         own_samples: list = []
         own_series: list = []
+        frame_pos: dict[str, list] = defaultdict(list)  # per rendered frame (60 Hz): (t, x, y) of every dot, for choppiness()
         own_frozen_s = 0.0
         headlines: list[tuple[float, str]] = []
         last_store_version = -1
@@ -158,6 +216,8 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
                 exceptions += 1
             t_tick.append(time.perf_counter() - s)
             now = clock.t
+            for eid_, p_ in view.ents.pos.items():
+                frame_pos[eid_].append((now, p_[0], p_[1]))
             if now >= next_sample:
                 next_sample = now + sample_dt
                 sample(now)
@@ -348,6 +408,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
                      "hold_p50": pct(holds, .5), "hold_p95": pct(holds, .95)}
     out["err_cm"] = {"p50": pct(errs, .5), "p95": pct(errs, .95), "hold_p50": pct(herrs, .5), "hold_p95": pct(herrs, .95)}
     out["jumps_per_min"] = round(jumps / minutes, 2)
+    out["choppy"] = choppiness(frame_pos, samples, {i: tl["kind"][0][1] for i, tl in timeline.items() if tl["kind"]})
     own_lag, own_hold, own_err, own_herr = path_lag(own_series, own_samples, 0.6) if own_samples else ([], [], [], [])
     out["own_lag_ms"] = {"n": len(own_lag), "p50": pct(own_lag, .5), "p95": pct(own_lag, .95), "max": max(own_lag, default=None),
                          "hold_p50": pct(own_hold, .5), "hold_p95": pct(own_hold, .95)}
@@ -459,6 +520,9 @@ BUDGETS = (
     ("stuck.frozen_dot_s", 1.0), ("stuck.drift_longest_run_s", 3.0), ("stuck.own_marker_frozen_s", 0.5),
     ("dot_after_destroy_s.max", 2.0), ("ghost_after_destroy_s.max", 13.0), ("vanished_then_back", 0),
     ("jumps_per_min", 10.0), ("own_jumps_per_min", 5.0),
+    # regression guards from the recorded sessions (worst: a late-join session with sparse updates, ai .14 / .04, players .06 / .03)
+    ("choppy.player.stall_frac", 0.09), ("choppy.player.spike_frac", 0.035),
+    ("choppy.ai.stall_frac", 0.16), ("choppy.ai.spike_frac", 0.05),
     ("label.slot_hops_per_min", 3.0), ("label.slot_flipflops_per_min", 0.0), ("label.text_reversals_per_min", 1.0), ("label.on_off_toggles_per_min", 1.0),
     ("lag_ms.p50", 150.0), ("time_to_first_dot_s.p50", 0.5), ("time_to_first_dot_s.p95", 5.0),
     ("worker.max_wait_ms", 250.0), ("worker.max_queue", 200), ("worker.busy_share", 0.05),
@@ -477,7 +541,8 @@ def check_budgets(r: dict) -> list[str]:
         bad.append(f"an actor changed kind/species/name more than once: {r['multi_change_examples'][0]}")
     if (r.get("headline_changes") or 0) > max(1.2 * r["duration_s"] / 60.0, 1.0):
         bad.append(f"headline changed {r['headline_changes']} times in {r['duration_s']} s")
-    for name, prefix, factor, count in (("dot error p50", "err_cm", 0.8, "lag_ms.n"), ("dot error p95", "err_cm", 1.0, "lag_ms.n"),
+    # p95 may be 10 % over the dot that stays on the newest sample: the velocity blend trades a little error at stops for fluid motion
+    for name, prefix, factor, count in (("dot error p50", "err_cm", 0.8, "lag_ms.n"), ("dot error p95", "err_cm", 1.1, "lag_ms.n"),
                                         ("own dot error p95", "own_err_cm", 0.8, "own_lag_ms.n")):
         key = "p50" if "p50" in name else "p95"
         mine, hold = _get(r, f"{prefix}.{key}"), _get(r, f"{prefix}.hold_{key}")

@@ -263,3 +263,17 @@ def test_target_lead_stays_inside_the_horizon():
     s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)
     assert s.target("a", 0.5, 0.09)[0] == pytest.approx(400.0 + 800.0 * 0.09)
     assert s.target("a", 9.0, 0.09)[0] == pytest.approx(1200.0)  # horizon (twice 0.5 s) still caps it
+
+
+# ---- fluid motion: velocity blending and a tail that slows down
+def test_a_jittery_velocity_is_blended_when_the_direction_agrees_and_replaced_by_a_turn():
+    from isle_livemap.geo import DR_VEL_KEEP
+
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
+    s.update([PeerEntity(E("a", 800.0), 1.0)], now=1.0)  # 800 cm/s
+    assert s._vel["a"][0] == pytest.approx(800.0)
+    s.update([PeerEntity(E("a", 800.0 + 500.0), 2.0)], now=2.0)  # a step that reads as 500 cm/s: the same direction
+    assert s._vel["a"][0] == pytest.approx(800.0 * DR_VEL_KEEP + 500.0 * (1 - DR_VEL_KEEP))
+    s.update([PeerEntity(E("a", 1300.0 - 700.0), 3.0)], now=3.0)  # a turn back: the new velocity replaces it at once
+    assert s._vel["a"][0] == pytest.approx(-700.0)
