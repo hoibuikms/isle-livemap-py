@@ -29,7 +29,7 @@ from typing import Callable, Iterable, Protocol
 
 from .geo import (
     GAME_PEER_STALE_S, GAME_PEER_TTL_S, PEER_STALE_S, PEER_TTL_S, Entity, bearing_deg, canonical_id, compass_label,
-    distance_m, is_self, vital_pct,
+    distance_m, hp_text, is_self, st_text, vital_pct, vitals_readings,
 )
 from .confidence import is_placeholder_name, species_tier, vitals_tier
 from .nearby import _cm
@@ -445,6 +445,7 @@ class GamePeerSource:
         self._clock = clock
         self._vitals: dict[int, object] = {}  # handle -> decode.PawnVitals (health / stamina percentages, see decode)
         self._vitals_t: dict[int, float] = {}  # handle -> source clock time of its newest health / stamina reading
+        self._max_t: dict[int, float] = {}  # handle -> source clock time of its health maximum (creation record or full block)
         self._corrected: set[int] = set()  # handles whose label was already corrected once (logged once)
         self._events: deque[str] = deque(maxlen=64)  # label corrections for the session log (see drain_events)
         self._conflicts_seen = 0  # class cache entries dropped so far that were already reported
@@ -508,6 +509,7 @@ class GamePeerSource:
         self.pawn_vitals.reset()
         self._vitals.clear()
         self._vitals_t.clear()
+        self._max_t.clear()
         self._corrected.clear()
         self._layouts.clear()
         self._anchors.clear()
@@ -676,13 +678,25 @@ class GamePeerSource:
         back = self._zombies.get(handle) if kind == "unknown" else None
         if back is not None and math.hypot(x - back[4], y - back[5]) / 100.0 <= self.ZOMBIE_NEAR_M + self.ZOMBIE_SPEED_MS * max(self._last_t - back[6], 0.0):
             kind, species, name, inferred = back[0], back[1], back[2] or name, back[3]  # the destroyed creature is back, still no creation record
+        if old is not None and not name and not is_placeholder_name(old.name):
+            name = old.name  # a name that was known stays until the server creates the handle again (see _on_inbound)
+            if old.kind == "player" and kind in ("dino", "unknown"):
+                kind = "player"  # the PlayerState link may be missing from a batch: a player does not turn back into a dinosaur
         self._note_identity(handle, old, species, inferred)
         self.store.update(Entity(
             eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
-            health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
-            max_health=vit.max_health if vit else None,
+            **self._vitals_fields(handle, vit),
             heading=self._heading(handle, x, y, old.heading if old else None), inferred=inferred,
             vitals_t=self._vitals_t.get(handle), pos_source=source), at=self._last_t)
+
+    def _vitals_fields(self, handle: int, vit) -> dict:
+        """The vitals of ``decode.PawnVitals`` as Entity fields: percentages (bars), the raw points the game sent, and where
+        the health maximum came from."""
+        if vit is None:
+            return {}
+        src = "block" if vit.verified else "creation" if vit.max_from_creation else ""
+        return dict(health_pct=vit.health_pct, stamina_pct=vit.stamina_pct, health=vit.health, max_health=vit.max_health,
+                    stamina=vit.stamina, max_stamina=vit.max_stamina, max_src=src, max_t=self._max_t.get(handle))
 
     def _note_identity(self, handle: int, old: Entity | None, species: str, inferred: bool) -> None:
         """A species remembered from an earlier session that the server's tables later contradict (or that was dropped
@@ -735,6 +749,7 @@ class GamePeerSource:
         self.pawn_vitals.forget(handle)
         self._vitals.pop(handle, None)
         self._vitals_t.pop(handle, None)
+        self._max_t.pop(handle, None)
         self._corrected.discard(handle)
         self._layouts.pop(handle, None)
         self._anchors.pop(handle, None)
@@ -785,10 +800,11 @@ class GamePeerSource:
                 self._past_own.discard(handle)
                 self._sync_owned()
             self.store.remove(str(handle))  # a reused handle is a new actor
-            self._zombies.pop(handle, None)
+            back = self._zombies.pop(handle, None)
             self.pawn_vitals.forget(handle)
             self._vitals.pop(handle, None)
             self._vitals_t.pop(handle, None)
+            self._max_t.pop(handle, None)
             self._corrected.discard(handle)
             self._layouts.pop(handle, None)
             self._anchors.pop(handle, None)
@@ -797,6 +813,7 @@ class GamePeerSource:
             self._shape.pop(handle, None)
             self.locator.note_creation(handle, creation.location, t)
             kind, species, name = self._identity(handle)
+            kind, species, name = self._revive(back, kind, species, name, creation.location, t)
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
                 self._emit(handle, *creation.location, kind, species, name, "spawn")  # a guess until a decoded fix confirms it
         bits = Bits(d.payload)
@@ -815,6 +832,7 @@ class GamePeerSource:
                     max_health = creation_max_health(bits, batch)
                     self.pawn_vitals.note_creation(handle, max_health)
                     if max_health is not None:
+                        self._max_t[handle] = self._clock()
                         self._creatures.add(handle)
                     # A creature whose class could not be named (the join tables were missed, the id is not in the cache)
                     # is still a creature when its creation record carries a maxHealth: plants, fruit and items have none.
@@ -830,10 +848,13 @@ class GamePeerSource:
             self._note_shape(handle, batch.data_bit_count)
             vit = None
             if kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS:
+                blocks = self.pawn_vitals.blocks
                 vit = self.pawn_vitals.update(bits, batch)
                 if vit is not None:
                     self._vitals[handle] = vit
                     self._vitals_t[handle] = self._clock()
+                    if self.pawn_vitals.blocks != blocks:
+                        self._max_t[handle] = self._vitals_t[handle]  # a full block carries the maxima as they are now
                     self.vitals_blocks = self.pawn_vitals.blocks
             creature = kind in (sp.KIND_DINO, sp.KIND_PLAYER) or (kind == sp.KIND_UNKNOWN and self._creature_like(handle))
             # An unclassified creature (join tables missed, id not remembered) learns its position layout like a classified one;
@@ -861,9 +882,20 @@ class GamePeerSource:
                     self._note_identity(handle, old, species, inferred)  # tables arrived later: the label gets the better species
                     upd = replace(upd, species=species, inferred=inferred)
                 if vit is not None:
-                    upd = replace(upd, health_pct=vit.health_pct, stamina_pct=vit.stamina_pct, max_health=vit.max_health,
-                                  vitals_t=self._vitals_t.get(handle))
+                    upd = replace(upd, **self._vitals_fields(handle, vit), vitals_t=self._vitals_t.get(handle))
                 self.store.update(upd)
+
+    def _revive(self, back, kind: str, species: str, name: str, location, t: float) -> tuple[str, str, str]:
+        """The server destroyed a player's creature and created it again on the same handle (relevancy flapping), near where
+        it was, and the new record's PlayerState reference does not resolve: it is the same player, with the same name.
+        ``back``: the ``_zombies`` entry of the handle (kind, species, name, inferred, x, y, t) or None."""
+        from . import species as sp
+
+        if name or back is None or not back[2] or location is None or kind not in (sp.KIND_DINO, sp.KIND_UNKNOWN):
+            return kind, species, name
+        if math.hypot(location[0] - back[4], location[1] - back[5]) / 100.0 > self.ZOMBIE_NEAR_M + self.ZOMBIE_SPEED_MS * max(t - back[6], 0.0):
+            return kind, species, name
+        return (sp.KIND_PLAYER if back[0] == sp.KIND_PLAYER else kind), species or back[1], back[2]
 
     def _upgrade_identity(self, ent: Entity, handle: int, kind: str, name: str) -> Entity:
         """A creature that was drawn as ``unknown`` (its creation record came later, or it just linked to a PlayerState)
@@ -963,7 +995,9 @@ class GamePeerSource:
                 "handle": handle, "kind": e.kind, "species": e.species, "species_tier": species_tier(e.species, e.inferred),
                 "source": source or "", "name": "" if is_placeholder_name(e.name) else e.name,
                 "hp": e.health_pct, "st": e.stamina_pct, "vitals_age_s": age,
-                "vitals": vitals_tier(e.health_pct, e.stamina_pct, age), "distance_m": dist, "bearing": bearing,
+                "health": e.health, "max_health": e.max_health, "max_src": e.max_src,
+                "stamina": e.stamina, "max_stamina": e.max_stamina, "hp_text": hp_text(e), "st_text": st_text(e),
+                "vitals": vitals_tier(*vitals_readings(e), age), "distance_m": dist, "bearing": bearing,
             })
         rows.sort(key=lambda r: (r["distance_m"] is None, r["distance_m"] or 0.0, r["handle"]))
         return rows
@@ -971,7 +1005,7 @@ class GamePeerSource:
     def labels_signature(self) -> frozenset:
         """What the labels claim, without the values that change all the time: the "labels:" log line is written when
         this changes (a species gets confirmed, a name is linked, the first health reading arrives)."""
-        return frozenset((r["handle"], r["kind"], r["species"], r["species_tier"], bool(r["name"]), r["hp"] is not None)
+        return frozenset((r["handle"], r["kind"], r["species"], r["species_tier"], bool(r["name"]), r["hp"] is not None or r["health"] is not None)
                          for r in self.label_rows() if r["kind"] != "ai")
 
     def labels_line(self) -> str:
@@ -988,12 +1022,12 @@ class GamePeerSource:
             bits = [str(r["handle"]), r["kind"], sp]
             if r["name"]:
                 bits.append(f'"{r["name"]}"')
-            if r["hp"] is None:
+            if r["hp"] is None and r["health"] is None:
                 bits.append("HP?")
             else:
-                bits.append(f"HP{r['hp']:.0f}")
-            if r["st"] is not None:
-                bits.append(f"ST{r['st']:.0f}")
+                bits.append(f"HP{r['hp_text']}")
+            if r["st"] is not None or r["stamina"] is not None:
+                bits.append(f"ST{r['st_text']}")
             if r["vitals"] == "stale" and r["vitals_age_s"] is not None:
                 bits.append(f"({r['vitals_age_s']:.0f}s old)")
             if r["distance_m"] is not None:

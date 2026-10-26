@@ -299,7 +299,7 @@ def test_a_peer_that_has_a_label_keeps_it_over_a_newcomer_at_almost_the_same_dis
 
     def at(i, metres, degrees):
         a = math.radians(degrees)
-        return peer(view, i, metres * math.cos(a), metres * math.sin(a), name=f"P{i}")
+        return peer(view, i, metres * math.cos(a), metres * math.sin(a), name="")  # nameless: named players have extra labels
 
     view, fp = view_with(tmp_path, clock)
     fp.set([at(1, 300.0, 0.0), at(2, 400.0, 120.0)])

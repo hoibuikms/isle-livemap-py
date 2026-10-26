@@ -184,9 +184,34 @@ def test_bootstrap_leaves_an_anchored_creature_alone():
 def test_label_tail_carries_health_and_stamina():
     e = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=86.0, stamina_pct=33.4)
     head, tail = entity_label_lines(Nearby(e, 0.0, 0.0, 100.0, 90.0))
-    assert head == "Allosaurus - 100 m" and tail == "86% - HP – - ST 33%"  # no maximum health known: the points are an en dash
-    sized = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=86.0, stamina_pct=33.4, max_health=1650.0)
-    assert entity_label_lines(Nearby(sized, 0.0, 0.0, 100.0, 90.0))[1] == "86% - HP 1419 - ST 33%"  # 86 % of 1650
+    assert head == "Player ? - Allosaurus - 100 m" and tail == "HP 86%  ST 33%"  # no raw value: the percentages
+    sized = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=86.0, stamina_pct=33.4, health=1419.0, max_health=1650.0,
+                   stamina=334.0, max_stamina=1000.0, max_src="block")
+    assert entity_label_lines(Nearby(sized, 0.0, 0.0, 100.0, 90.0))[1] == "HP 1419/1650  ST 334/1000"
     bare = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0)
     tail = entity_label_lines(Nearby(bare, 0.0, 0.0, 100.0, 90.0))[1]
     assert tail == ""  # never read: no second line, nothing guessed
+
+
+# ---------------------------------------------------------------- the entity carries the raw points and where the maximum came from
+def test_peer_entity_fields_say_where_the_health_maximum_came_from():
+    from isle_livemap.capture import TelemetryPipeline
+    from isle_livemap.decode import PawnVitals
+    from isle_livemap.peers import GamePeerSource
+
+    g = GamePeerSource(pipeline=TelemetryPipeline())
+    g._max_t[7] = 12.5
+    created = g._vitals_fields(7, PawnVitals(7, health=2300.0, max_health=2606.0, stamina=600.0, max_from_creation=True))
+    assert created["max_src"] == "creation" and created["max_t"] == 12.5
+    assert created["health"] == 2300.0 and created["max_health"] == 2606.0 and created["stamina"] == 600.0
+    assert created["max_stamina"] is None and created["stamina_pct"] is None  # no stamina maximum: a value, but no ratio
+    assert created["health_pct"] == pytest.approx(100.0 * 2300.0 / 2606.0)
+    block = g._vitals_fields(7, PawnVitals(7, health=2300.0, max_health=2620.0, stamina=600.0, max_stamina=900.0, verified=True))
+    assert block["max_src"] == "block" and block["stamina_pct"] == pytest.approx(100.0 * 600.0 / 900.0)
+    assert g._vitals_fields(7, None) == {}  # nothing read: the entity keeps what it had
+
+
+def test_label_shows_a_creation_maximum_with_a_tilde_and_a_missing_stamina_maximum_with_a_dash():
+    e = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=88.2, health=2300.0, max_health=2606.0, stamina=600.0,
+               max_src="creation")
+    assert entity_label_lines(Nearby(e, 0.0, 0.0, 100.0, 90.0))[1] == "HP 2300/~2606  ST 600/–"

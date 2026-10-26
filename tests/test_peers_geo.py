@@ -104,10 +104,10 @@ def test_entity_heading_normalised():
 def test_labels_omit_unknown_fields_and_fall_back_to_the_id():
     n = visible_entities(items(E("12", 25_000, name="", health_pct=40.0)), 0, 0)[0]
     head, tail = entity_label_lines(n)
-    assert head == "12 - Dino - 250 m" and tail == "40% - HP – - ST –"  # geo falls back to the id; the species is not known: "Dino"
+    assert head == "12 - Dino - 250 m" and tail == "HP 40%  ST –"  # geo falls back to the id; the species is not known: "Dino"
     assert peer_label_lines(n) == [head, tail]
     grown = visible_entities(items(E("12", 25_000, name="", health_pct=40.0, stamina_pct=30.0, growth_pct=75.0)), 0, 0)[0]
-    assert peer_label_lines(grown) == ["12 - Dino - 250 m", "40% - HP – - ST 30%"]  # growth of others is never printed
+    assert peer_label_lines(grown) == ["12 - Dino - 250 m", "HP 40%  ST 30%"]  # growth of others is never printed
     bare = visible_entities(items(E("1", 10)), 0, 0)[0]
     assert peer_label_lines(bare) == [line for line in entity_label_lines(bare) if line]
     long = visible_entities(items(E("1", 10, name="X" * 40)), 0, 0)[0]
@@ -248,7 +248,7 @@ def test_nearby_stale_threshold_follows_the_source():
 
 def test_peer_label_includes_known_vitals_only_in_order():
     n = visible_entities(items(E("1", 25_000, health_pct=92.4, growth_pct=40.0, z=13_000.0)), 0, 0)[0]
-    assert peer_label_lines(n, my_z=10_000.0) == ["P1 - Dino - 250 m", "92% - HP – - ST –"]  # growth is never printed
+    assert peer_label_lines(n, my_z=10_000.0) == ["P1 - Dino - 250 m", "HP 92%  ST –"]  # growth is never printed
     n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
     assert peer_label_lines(n) == ["P1 - Dino - 250 m"]  # a player whose health was never read has no second line
 

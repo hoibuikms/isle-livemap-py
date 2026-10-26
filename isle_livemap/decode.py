@@ -803,6 +803,7 @@ _PS_REF_MARKER_BITS = 8
 _PS_REF_MARKER_GAP = 36  # bits from the start of the marker to the byte-count field
 _PS_REF_MAX_BYTES = 4
 _UNLEARNED_MAX = 4096
+_RETIRED_NAMES_MAX = 512  # PlayerState names kept after the server destroyed their PlayerState (see IdentityTracker)
 
 
 def _plausible_name(text: str) -> bool:
@@ -865,6 +866,10 @@ class IdentityTracker:
         self.actors: dict[int, ActorInfo] = {}
         self._arch_votes: dict[int, Counter] = {}  # archetype handle -> {species folder: creations that named it}
         self.player_names: dict[int, str] = {}  # PlayerState handle -> name
+        # Names of PlayerStates the server destroyed (a player out of relevancy, a PlayerState re-created): a pawn that is
+        # created again keeps referencing the same PlayerState handle, so its name stays known for the whole connection.
+        # A re-created PlayerState on the same handle replaces the entry (the server's newest word wins).
+        self._retired_names: dict[int, str] = {}
         self._waiting: set[int] = set()  # pawns with reference candidates and no known PlayerState yet
         self.creations = 0
         self.exports_seen = 0  # object-export levels recorded
@@ -985,7 +990,7 @@ class IdentityTracker:
 
     def _resolve_player_state(self, info: ActorInfo) -> None:
         """Link ``info`` to the one known PlayerState among its reference candidates (none or several: no link)."""
-        known = {h for h in info.ref_candidates if h in self.player_names}
+        known = {h for h in info.ref_candidates if h in self.player_names or h in self._retired_names}
         if len(known) == 1:
             info.player_state = next(iter(known))
             self._waiting.discard(info.handle)
@@ -1022,7 +1027,11 @@ class IdentityTracker:
                 self.destroyed_known += 1
             else:
                 self.destroyed_unknown += 1
-            self.player_names.pop(handle, None)
+            gone_name = self.player_names.pop(handle, None)
+            if gone_name:
+                if len(self._retired_names) >= _RETIRED_NAMES_MAX:
+                    self._retired_names.clear()
+                self._retired_names[handle] = gone_name
         bits = Bits(payload)
         out: list[Creation] = []
         for b in packet.batches:
@@ -1043,6 +1052,7 @@ class IdentityTracker:
                 info.name = decode_player_name(bits, b)
                 if info.name:
                     self.player_names[info.handle] = info.name
+                    self._retired_names.pop(info.handle, None)
                     for waiting in [self.actors[h] for h in self._waiting if h in self.actors]:
                         self._resolve_player_state(waiting)
             elif folder_species(path) or info.asset_species or not path:
@@ -1058,7 +1068,9 @@ class IdentityTracker:
         info = self.actors.get(handle)
         if info is None:
             return None
-        return self.player_names.get(info.player_state) if info.player_state is not None else None
+        if info.player_state is None:
+            return None
+        return self.player_names.get(info.player_state) or self._retired_names.get(info.player_state)
 
 
 @dataclass(frozen=True, slots=True)

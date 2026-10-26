@@ -47,10 +47,10 @@ def test_placeholder_names_are_not_names():
 
 # ---------------------------------------------------------------- wording
 def test_confirmed_species_is_plain_inferred_has_a_tilde_unknown_is_just_dino():
-    assert entity_label_lines(nb(species="Allosaurus"))[0] == "Allosaurus - 100 m"
-    assert entity_label_lines(nb(species="Allosaurus", inferred=True))[0] == "Allosaurus~ - 100 m"
-    assert entity_label_lines(nb(species=""))[0] == "Dino - 100 m"
-    assert entity_label_lines(nb(kind="unknown", species=""))[0] == "Dino - 100 m"
+    assert entity_label_lines(nb(species="Allosaurus"))[0] == "Player ? - Allosaurus - 100 m"
+    assert entity_label_lines(nb(species="Allosaurus", inferred=True))[0] == "Player ? - Allosaurus~ - 100 m"
+    assert entity_label_lines(nb(species=""))[0] == "Player ? - Dino - 100 m"
+    assert entity_label_lines(nb(kind="unknown", species=""))[0] == "Player ? - Dino - 100 m"
     assert entity_label_lines(nb(kind="ai", species=""))[0] == "AI - Animal - 100 m"
     assert entity_label_lines(nb(kind="player", name="Rex Fan", species="Allosaurus"))[0] == "Rex Fan - Allosaurus - 100 m"
     assert entity_label_lines(nb(kind="player", name="Rex Fan", species="Allosaurus", inferred=True))[0] == "Rex Fan - Allosaurus~ - 100 m"
@@ -59,18 +59,18 @@ def test_confirmed_species_is_plain_inferred_has_a_tilde_unknown_is_just_dino():
 
 def test_a_name_is_never_invented_for_a_creature_without_a_player_state():
     head = entity_label_lines(nb(kind="dino", name="Actor #7", species="Allosaurus"))[0]
-    assert "Actor" not in head and head == "Allosaurus - 100 m"
+    assert "Actor" not in head and head == "Player ? - Allosaurus - 100 m"
 
 
 def test_health_is_known_stale_or_an_en_dash():
-    assert entity_label_lines(nb(hp=86.0, st=33.4, vage=2.0))[1] == "86% - HP – - ST 33%"  # the health points are not known: an en dash
-    assert entity_label_lines(nb(hp=86.0, st=33.4, vage=45.0))[1] == "86% - HP – - ST 33%"  # unchanged values are not re-sent
+    assert entity_label_lines(nb(hp=86.0, st=33.4, vage=2.0))[1] == "HP 86%  ST 33%"  # no raw values (lab feed): the percentages
+    assert entity_label_lines(nb(hp=86.0, st=33.4, vage=45.0))[1] == "HP 86%  ST 33%"  # unchanged values are not re-sent
     stale = entity_label_lines(nb(hp=86.0, st=33.4, vage=130.0))[1]
-    assert stale == "86% - HP – - ST 33% [2m+]"
-    assert entity_label_lines(nb(hp=86.0, vage=400.0))[1] == "86% - HP – - ST – [5m+]"
+    assert stale == "HP 86%  ST 33% [2m+]"
+    assert entity_label_lines(nb(hp=86.0, vage=400.0))[1] == "HP 86%  ST – [5m+]"
     assert entity_label_lines(nb())[1] == ""  # never read: no second line
     assert entity_label_lines(nb(kind="ai", species="Longear"))[1] == ""  # fish have no health line at all
-    assert entity_label_lines(nb(kind="player", name="Rex", hp=None, st=33.0))[1] == "– - HP – - ST 33%"
+    assert entity_label_lines(nb(kind="player", name="Rex", hp=None, st=33.0))[1] == "HP –  ST 33%"
 
 
 def test_the_vitals_argument_overrides_what_the_age_says():
@@ -158,7 +158,7 @@ def test_map_view_holds_a_flickering_species_instead_of_flapping_the_label(tmp_p
         view.peers.set([entry("" if i % 2 else "Allosaurus", hp=80.0)])
         tick_twice(view)
         view.grab()
-    assert texts and {t.split(" - ")[0] for t in texts} == {"Allosaurus"}  # the species word never changes
+    assert texts and {t.split(" - ")[1] for t in texts} == {"Allosaurus"}  # the species word never changes
 
 
 # ---------------------------------------------------------------- the labels: line and the correction log

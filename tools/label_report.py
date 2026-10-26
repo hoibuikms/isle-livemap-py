@@ -18,7 +18,8 @@ offscreen), so a row is what the minimap showed, not a second opinion. Columns o
   name     the player name (only creatures that reference their PlayerState have one)
   first/last  seconds into the capture (and wall-clock when it can be derived) of the first / last time it was on the map
   placed   whether it was ever drawn: "no" = replicated to us but its position was never received
-  HP/ST    last health / stamina percentage read, and how old that reading was when the creature left the map
+  HP/ST    last health / stamina read, as the label prints them (current/max in points; ~ before a maximum that is only the
+           creation record's), and how old that reading was when the creature left the map
            ("-" = never read: the label has no second line); growth, hunger and thirst of others are not replicated to us
   dist/brg distance and compass bearing from you when it first appeared
 
@@ -163,7 +164,8 @@ def collect(pcap: Path, cache=None, local_port: int | None = None, stop_s: float
                 row = seen[r["handle"]] = {"handle": r["handle"], "first_s": rel, "dist_first": r["distance_m"],
                                            "bearing_first": r["bearing"], "samples": 0}
             row.update(last_s=rel, kind=r["kind"], species=r["species"], species_tier=r["species_tier"], source=r["source"],
-                       hp=r["hp"], st=r["st"], vitals_age_s=r["vitals_age_s"], on_map=True)
+                       hp=r["hp"], st=r["st"], hp_text=r["hp_text"], st_text=r["st_text"], max_src=r["max_src"],
+                       vitals_age_s=r["vitals_age_s"], on_map=True)
             if r["name"]:
                 row["name"] = r["name"]
             row["samples"] += 1
@@ -221,9 +223,7 @@ def fmt_time(rel: float | None, first_epoch: float | None, offset_s: float) -> s
 
 
 def fmt_vitals(r: dict) -> tuple[str, str]:
-    hp = "-" if r["hp"] is None else f"{r['hp']:.0f}%"
-    st = "-" if r["st"] is None else f"{r['st']:.0f}%"
-    return hp, st
+    return r.get("hp_text") or "-", r.get("st_text") or "-"
 
 
 def render_table(result: dict, first_epoch: float | None, offset_s: float, include_ai: bool, hide_names: bool) -> list[str]:
@@ -232,7 +232,7 @@ def render_table(result: dict, first_epoch: float | None, offset_s: float, inclu
     table = [head]
     for r in rows:
         hp, st = fmt_vitals(r)
-        age = "-" if r["vitals_age_s"] is None or (r["hp"] is None and r["st"] is None) else f"{r['vitals_age_s']:.0f}s"
+        age = "-" if r["vitals_age_s"] is None or (hp in ("-", "\u2013") and st in ("-", "\u2013")) else f"{r['vitals_age_s']:.0f}s"
         dist = "-" if r["dist_first"] is None else f"{r['dist_first']:.0f} m"
         from isle_livemap.geo import compass_label
 
@@ -263,7 +263,7 @@ def render_table(result: dict, first_epoch: float | None, offset_s: float, inclu
 
 def write_csv(path: Path, result: dict, first_epoch: float | None, offset_s: float, hide_names: bool) -> None:
     cols = ("handle", "kind", "species", "species_tier", "source", "name", "first_s", "last_s", "first_clock", "last_clock",
-            "placed", "on_map_at_end", "hp_pct", "st_pct", "reading_age_s", "dist_m_first", "bearing_first")
+            "placed", "on_map_at_end", "hp", "st", "hp_pct", "st_pct", "reading_age_s", "dist_m_first", "bearing_first")
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(cols)
@@ -273,7 +273,8 @@ def write_csv(path: Path, result: dict, first_epoch: float | None, offset_s: flo
                         "" if r["first_s"] is None else f"{r['first_s']:.1f}", "" if r["last_s"] is None else f"{r['last_s']:.1f}",
                         "" if r["first_s"] is None or first_epoch is None else wall_clock(r["first_s"], first_epoch, offset_s),
                         "" if r["last_s"] is None or first_epoch is None else wall_clock(r["last_s"], first_epoch, offset_s),
-                        r["placed"], r["on_map"], "" if r["hp"] is None else f"{r['hp']:.1f}",
+                        r["placed"], r["on_map"], r.get("hp_text", ""), r.get("st_text", ""),
+                        "" if r["hp"] is None else f"{r['hp']:.1f}",
                         "" if r["st"] is None else f"{r['st']:.1f}",
                         "" if r["vitals_age_s"] is None else f"{r['vitals_age_s']:.1f}",
                         "" if r["dist_first"] is None else f"{r['dist_first']:.0f}",
@@ -313,8 +314,8 @@ def labels_at(pcap: Path, at_s: float, cache=None, local_port: int | None = None
         cur["id"], cur["lines"] = n.entity.id, lines
         return lines
 
-    def place(ax, ay, w, h, placed, bounds, accept=None, *more):
-        r = real_place(ax, ay, w, h, placed, bounds, accept, *more)
+    def place(ax, ay, w, h, placed, bounds, accept=None, *more, **kw):
+        r = real_place(ax, ay, w, h, placed, bounds, accept, *more, **kw)
         if recording["on"] and r is not None and cur["id"] is not None:
             shown[cur["id"]] = list(cur["lines"])
         return r

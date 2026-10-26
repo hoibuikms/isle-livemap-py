@@ -150,8 +150,8 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
         cur["id"], cur["text"] = n.entity.id, " / ".join(lines)
         return lines
 
-    def place(ax, ay, w, h, placed, bounds, accept=None, *more):
-        r = real_place(ax, ay, w, h, placed, bounds, accept, *more)
+    def place(ax, ay, w, h, placed, bounds, accept=None, *more, **kw):
+        r = real_place(ax, ay, w, h, placed, bounds, accept, *more, **kw)
         if r is not None and cur["id"] is not None:
             label_log.append((clock.t, cur["id"], cur["text"], (ax, ay), r))
         return r

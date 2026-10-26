@@ -14,7 +14,7 @@ import uuid
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .confidence import (
     SPECIES_INFERRED, VITALS_STALE, age_tag, is_placeholder_name, species_tier, vitals_tier,
@@ -399,7 +399,13 @@ class Entity:
     heading: float | None = None  # map heading, degrees clockwise from north (like the local arrow); None = unknown
     inferred: bool = False  # the species comes from the saved class cache (the join tables were missed), not the server
     vitals_t: float | None = None  # source clock time of the newest health / stamina reading (None: no timestamp)
-    max_health: float | None = None  # maximum health in points, when the creature's records gave it (health points = pct * max)
+    max_health: float | None = None  # maximum health in points, when the creature's records gave it
+    health: float | None = None  # the raw values the game sent, in points (health_pct / stamina_pct are these over the maxima)
+    stamina: float | None = None
+    max_stamina: float | None = None  # not in every block: the 8-slot form leaves it out, so a stamina value can be without it
+    max_src: str = ""  # where max_health came from: "block" (a full attribute block), "creation" (the creation record: may be a
+    #                    little low for a creature that has grown since) or "" (unknown)
+    max_t: float | None = None  # source clock time of that maximum
     pos_source: str = ""  # "": a followed position (decoded fixes); "spawn": only the creation record's spawn position so far
 
     def __post_init__(self) -> None:
@@ -622,19 +628,65 @@ def species_text(e: Entity) -> str:
 
 
 NO_VALUE = "\u2013"  # a field the game did not send us (yet): an en dash, not a question mark
+NO_NAME = "Player ?"  # the name of a player-owned creature whose player name the server never sent us
+
+
+def display_name(e: Entity) -> str:
+    """The name column / tooltip / label word for an entity: the player name when it is known, ``Player ?`` for a creature
+    whose name was never sent, ``AI - <species>`` for a server animal. Never a handle (``Actor #...``)."""
+    if e.kind == "ai":
+        return f"AI - {species_text(e)}"
+    return e.name if not is_placeholder_name(e.name) else NO_NAME
+
+
+def points_text(v: float) -> str:
+    """A health / stamina value in points: whole numbers, one decimal below 10 (a hatchling has 1.6 health, not 2)."""
+    return f"{v:.1f}" if round(v, 1) < 10.0 else f"{v:.0f}"
+
+
+def hp_text(e: Entity) -> str:
+    """Health as ``<current>/<max>`` in points (``1419/1650``). The maximum is ``~1650`` while it is only the creation
+    record's (a creature grows after it); ``–`` when no maximum is known. Without a raw value (the lab feed, the local
+    player) the percentage is all there is: ``86%``. Nothing read: ``–``."""
+    if e.health is not None:
+        mx = NO_VALUE if not e.max_health else ("~" if e.max_src == "creation" else "") + points_text(e.max_health)
+        return f"{points_text(e.health)}/{mx}"
+    return NO_VALUE if e.health_pct is None else f"{e.health_pct:.0f}%"
+
+
+def st_text(e: Entity) -> str:
+    """Stamina as ``<current>/<max>`` in points (``330/500``); the maximum is ``–`` when the block did not carry it
+    (about half of the readings). Without a raw value: the percentage, or ``–``."""
+    if e.stamina is not None:
+        mx = points_text(e.max_stamina) if e.max_stamina else NO_VALUE
+        return f"{points_text(e.stamina)}/{mx}"
+    return NO_VALUE if e.stamina_pct is None else f"{e.stamina_pct:.0f}%"
+
+
+def vitals_readings(e: Entity) -> tuple[tuple | None, tuple | None]:
+    """The health and stamina readings of an entity as two whole values (None: nothing read), so that a label that keeps
+    showing an older reading for a moment (``confidence.LabelConfidence``) keeps all of it: percentage, raw value, maximum."""
+    h = None if e.health_pct is None and e.health is None else (e.health_pct, e.health, e.max_health, e.max_src, e.max_t)
+    s = None if e.stamina_pct is None and e.stamina is None else (e.stamina_pct, e.stamina, e.max_stamina)
+    return h, s
+
+
+def with_vitals(e: Entity, h: tuple | None, s: tuple | None) -> Entity:
+    """``e`` with the readings of ``vitals_readings`` put back (the other way round)."""
+    return replace(
+        e, health_pct=h[0] if h else None, health=h[1] if h else None, max_health=h[2] if h else None,
+        max_src=h[3] if h else "", max_t=h[4] if h else None,
+        stamina_pct=s[0] if s else None, stamina=s[1] if s else None, max_stamina=s[2] if s else None)
 
 
 def vitals_line(e: Entity, tier: str, vitals_age_s: float | None) -> str:
-    """Second line of a creature's label: ``<health %> - HP <health points> - ST <stamina %>``. Only values that were
-    read are printed, a missing one is an en dash (never a guess), and a creature nothing was read for has no second
-    line. The health points are the percentage of the maximum health the creature's creation record carries. A reading
-    older than ``confidence.VITALS_FRESH_S`` gets a coarse age tag."""
-    if e.health_pct is None and e.stamina_pct is None:
+    """Second line of a creature's label: ``HP <current>/<max>  ST <current>/<max>`` (points, as the game sent them; the
+    bars under the arrow show the ratio). Only values that were read are printed, a missing one is an en dash (never a
+    guess), and a creature nothing was read for has no second line. A reading older than ``confidence.VITALS_FRESH_S``
+    gets a coarse age tag."""
+    if vitals_readings(e) == (None, None):
         return ""
-    pct = NO_VALUE if e.health_pct is None else f"{e.health_pct:.0f}%"
-    pts = NO_VALUE if e.health_pct is None or not e.max_health else f"{e.health_pct / 100.0 * e.max_health:.0f}"
-    st = NO_VALUE if e.stamina_pct is None else f"{e.stamina_pct:.0f}%"
-    text = f"{pct} - HP {pts} - ST {st}"
+    text = f"HP {hp_text(e)}  ST {st_text(e)}"
     if tier == VITALS_STALE:
         text += f" [{age_tag(vitals_age_s)}]"
     return text
@@ -662,11 +714,13 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
     name = e.name or e.id
     if not is_placeholder_name(name):
         head = f"{truncate(name, name_max)} - {species_text(e)} - {dist}"
-    else:  # no player name known: the species is the best name there is
-        head = f"{species_text(e)}{f' ×{group}' if group > 1 else ''} - {dist}"
+    elif group > 1:  # a pack of creatures whose names were never sent: one label for all of them
+        head = f"{species_text(e)} ×{group} - {dist}"
+    else:  # the name was never sent (the player joined before the app started): the same shape, with a fixed placeholder
+        head = f"{NO_NAME} - {species_text(e)} - {dist}"
     if group > 1:
         return head, ""
-    return head, vitals_line(e, vitals or vitals_tier(e.health_pct, e.stamina_pct, n.vitals_age_s), n.vitals_age_s)
+    return head, vitals_line(e, vitals or vitals_tier(*vitals_readings(e), n.vitals_age_s), n.vitals_age_s)
 
 
 # ------------------------------------------------------------ who gets glyph budget and label space first
@@ -717,8 +771,8 @@ def peer_label_lines(n: Nearby, my_z: float | None = None, vitals: str | None = 
 def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
     """Table cells: name, species, HP, growth, ST, hunger, water, distance, compass direction, 3D distance, height."""
     e, dz = n.entity, height_delta_m(n, my_z)
-    return (truncate(e.name or e.id, 24), (e.species + "~" if e.inferred and e.species else e.species) or "-", _pct(e.health_pct), _pct(e.growth_pct),
-            _pct(e.stamina_pct), _pct(e.hunger_pct), _pct(e.thirst_pct),
+    return (truncate(display_name(e), 24), (e.species + "~" if e.inferred and e.species else e.species) or "-", hp_text(e), _pct(e.growth_pct),
+            st_text(e), _pct(e.hunger_pct), _pct(e.thirst_pct),
             format_distance(n.distance_m), f"{compass_label(n.bearing)} ({n.bearing:.0f}°)", f"{distance_3d_m(n, my_z):.0f} m",
             "?" if dz is None else f"{format_height(dz)} {'higher' if dz >= 0.5 else 'lower' if dz <= -0.5 else ''}".strip())
 
@@ -728,12 +782,16 @@ def entity_summary(n: Nearby, my_z: float | None = None) -> str:
     e = n.entity
     sp = f" {e.species}" if e.species else ""
     vit = ""
-    for tag, v in (("HP", e.health_pct), ("ST", e.stamina_pct), ("G", e.growth_pct), ("HU", e.hunger_pct), ("TH", e.thirst_pct)):
+    if vitals_readings(e)[0] is not None:
+        vit += f" HP {hp_text(e)}"
+    if vitals_readings(e)[1] is not None:
+        vit += f" ST {st_text(e)}"
+    for tag, v in (("G", e.growth_pct), ("HU", e.hunger_pct), ("TH", e.thirst_pct)):
         if v is not None:
             vit += f" {tag} {v:.0f}%"
     dz = height_delta_m(n, my_z)
     height = "" if dz is None else f" {format_height(dz)}"
-    return (f"[{e.kind}] {truncate(e.name or e.id, 24)}{sp}{vit}  "
+    return (f"[{e.kind}] {truncate(display_name(e), 24)}{sp}{vit}  "
             f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°){height}")
 
 
@@ -744,15 +802,16 @@ def _overlaps(a: Rect, b: Rect, tol: float = 0.0) -> bool:
     return a[0] < b[0] + b[2] - tol and b[0] < a[0] + a[2] - tol and a[1] < b[1] + b[3] - tol and b[1] < a[1] + a[3] - tol
 
 
-def label_slots(ax: float, ay: float, w: float, h: float, bounds: Rect) -> list[Rect]:
+def label_slots(ax: float, ay: float, w: float, h: float, bounds: Rect, below: float = 0.0) -> list[Rect]:
     """Candidate rects for a label at anchor (ax, ay), best first: centred under the marker, then above (centred),
-    right, left, then hung to one side of the marker near the edge of a round view, then one row further out."""
+    right, left, then hung to one side of the marker near the edge of a round view, then one row further out.
+    ``below``: extra distance for the slots under the marker (the health and stamina bars hang there)."""
     bx, _by, bw, _bh = bounds
     cx = min(max(ax - w / 2, bx), bx + bw - w)  # centred under/above, clamped into the view
-    return [(cx, ay + 8, w, h), (cx, ay - 8 - h, w, h),
+    return [(cx, ay + 8 + below, w, h), (cx, ay - 8 - h, w, h),
             (ax + 8, ay - h / 2, w, h), (ax - 8 - w, ay - h / 2, w, h),
-            (ax - 8, ay + 8, w, h), (ax + 8 - w, ay + 8, w, h), (ax - 8, ay - 8 - h, w, h), (ax + 8 - w, ay - 8 - h, w, h),
-            (cx, ay + 9 + h, w, h), (cx, ay - 9 - 2 * h, w, h)]
+            (ax - 8, ay + 8 + below, w, h), (ax + 8 - w, ay + 8 + below, w, h), (ax - 8, ay - 8 - h, w, h), (ax + 8 - w, ay - 8 - h, w, h),
+            (cx, ay + 9 + below + h, w, h), (cx, ay - 9 - 2 * h, w, h)]
 
 
 SLOT_SLACK_PX = 3.0  # the slot a label already has may be this much worse than a new one would be allowed to be
@@ -761,7 +820,7 @@ SLOT_SLACK_PX = 3.0  # the slot a label already has may be this much worse than 
 def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect,
                 accept: Callable[[Rect], bool] | None = None, prefer: int | None = None,
                 slot: list[int] | None = None, prefer_accept: Callable[[Rect], bool] | None = None,
-                only_preferred: bool = False) -> Rect | None:
+                only_preferred: bool = False, extra: Sequence[Rect] = (), below: float = 0.0) -> Rect | None:
     """Pick a label rect for anchor (ax, ay): the first candidate of ``label_slots`` that lies inside ``bounds``,
     overlaps no already placed label and satisfies ``accept`` (e.g. lie inside the round minimap). ``prefer`` is the
     index chosen for this marker last time: it is tried first, and with ``SLOT_SLACK_PX`` of tolerance on the bounds,
@@ -771,7 +830,9 @@ def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bo
     bx, by, bw, bh = bounds
     if w > bw:
         return None
-    slots = label_slots(ax, ay, w, h, bounds)
+    slots = label_slots(ax, ay, w, h, bounds, below)
+    if extra:  # candidates of the caller (e.g. a label pulled in towards the centre of a round view), tried last
+        slots = [*slots, *extra]
     if only_preferred:  # keep the side it has, or say that it no longer fits (the caller then looks for another)
         order = [prefer] if prefer is not None and 0 <= prefer < len(slots) else []
     else:
