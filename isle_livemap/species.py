@@ -86,56 +86,6 @@ def species_of_path(path: str | None) -> str:
     return display_name(folder if folder else clean_class_name(path))
 
 
-# Relative adult body size per species, used only to scale the minimap dot. These are rough estimates (real-world
-# length / mass of the animal, not game data): the game does not send a size, and other creatures' growth is not
-# decodable. Species names are normalised by ``_size_key`` (case, spaces and a trailing "rex" ignored).
-SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE, SIZE_HUGE = "tiny", "small", "medium", "large", "huge"
-SIZE_ORDER = (SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE, SIZE_HUGE)
-SIZE_CLASSES: dict[str, tuple[str, ...]] = {
-    SIZE_TINY: ("Hypsilophodon", "Troodon", "Beipiaosaurus", "Dryosaurus", "Pteranodon", "Compsognathus", "Microraptor"),
-    SIZE_SMALL: ("Dilophosaurus", "Herrerasaurus", "Omniraptor", "Utahraptor", "Gallimimus", "Pachycephalosaurus",
-                 "Austroraptor", "Dromaeosaurus"),
-    SIZE_MEDIUM: ("Carnotaurus", "Ceratosaurus", "Allosaurus", "Maiasaura", "Tenontosaurus", "Diabloceratops",
-                  "Kentrosaurus", "Parasaurolophus", "Camptosaurus", "Oxalaia"),
-    SIZE_LARGE: ("Stegosaurus", "Deinosuchus", "Acrocanthosaurus", "Therizinosaurus", "Sarcosuchus"),
-    SIZE_HUGE: ("Tyrannosaurus", "Triceratops", "Giganotosaurus", "Spinosaurus", "Brachiosaurus"),
-}
-DEFAULT_SIZE = SIZE_MEDIUM  # a dinosaur whose species is not in the table (or not known at all)
-
-
-def _size_key(name: str) -> str:
-    key = "".join(c for c in name.lower() if c.isalnum())
-    return key[:-3] if key.endswith("rex") else key
-
-
-_SIZE_OF = {_size_key(sp): size for size, names in SIZE_CLASSES.items() for sp in names}
-
-
-def size_class(species: str | None) -> str:
-    """Size class of a species name (``Deinosuchus`` / ``deinosuchus~`` / ``TyrannosaurusRex``); unknown -> DEFAULT_SIZE."""
-    return _SIZE_OF.get(_size_key((species or "").rstrip("~")), DEFAULT_SIZE)
-
-
-# Diet per species, used only to colour the minimap dot (the game does not send it). Rough, from the animals' in-game
-# diet; a species that is not listed has no diet and gets the neutral dinosaur colour.
-DIET_CARNIVORE, DIET_HERBIVORE, DIET_OMNIVORE = "carnivore", "herbivore", "omnivore"
-DIET_SPECIES: dict[str, tuple[str, ...]] = {
-    DIET_CARNIVORE: ("Allosaurus", "Acrocanthosaurus", "Austroraptor", "Carnotaurus", "Ceratosaurus", "Compsognathus",
-                     "Deinosuchus", "Dilophosaurus", "Dromaeosaurus", "Giganotosaurus", "Herrerasaurus", "Microraptor",
-                     "Oxalaia", "Pteranodon", "Sarcosuchus", "Spinosaurus", "Troodon", "Tyrannosaurus", "Utahraptor"),
-    DIET_HERBIVORE: ("Beipiaosaurus", "Brachiosaurus", "Camptosaurus", "Diabloceratops", "Dryosaurus", "Hypsilophodon",
-                     "Kentrosaurus", "Maiasaura", "Parasaurolophus", "Stegosaurus", "Tenontosaurus", "Therizinosaurus",
-                     "Triceratops"),
-    DIET_OMNIVORE: ("Gallimimus", "Omniraptor", "Pachycephalosaurus"),
-}
-_DIET_OF = {_size_key(sp): diet for diet, names in DIET_SPECIES.items() for sp in names}
-
-
-def diet_of(species: str | None) -> str:
-    """"carnivore" / "herbivore" / "omnivore" for a species name (``Deinosuchus~`` and ``TyrannosaurusRex`` work), else ""."""
-    return _DIET_OF.get(_size_key((species or "").rstrip("~")), "")
-
-
 def describe(path: str | None, asset_species: str | None = None, has_player_state: bool = False) -> tuple[str, str]:
     """(kind, species) of an actor from its class path.
 

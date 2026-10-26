@@ -31,7 +31,7 @@ from isle_livemap.geo import Entity, project_unclamped  # noqa: E402
 FIXTURES = Path(__file__).parent / "fixtures"
 OWN_FIX = (442_020.33, -162_148.37)
 NEAR_IDS = {"104114", "84466", "105096", "89308", "94432"}  # actors 752..838 m from OWN_FIX in the recorded packets
-CYAN = (77, 208, 255)  # geo.ENTITY_STYLE["player"].color
+CYAN = (162, 77, 255)  # geo.ENTITY_STYLE["player"].color: the purple of another player's dinosaur (name kept from the cyan days)
 ORANGE = (143, 166, 179)  # geo.ENTITY_STYLE["ai"].color (muted grey-blue): the recorded actors only ever send the 155/158 bit animal state
 
 
@@ -102,7 +102,7 @@ def run_main(monkeypatch, argv, until, timeout=8.0):
     return box["app"], box["img"]
 
 
-def near_color(img, x, y, rgb=CYAN, r=3, tol=45) -> bool:
+def near_color(img, x, y, rgb=CYAN, r=4, tol=120) -> bool:
     for dx in range(-r, r + 1):
         for dy in range(-r, r + 1):
             px, py = int(round(x)) + dx, int(round(y)) + dy

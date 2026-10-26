@@ -4,7 +4,10 @@
 
 Replays every pcap through the same decoder the app uses and keeps each protocol id (the state-layout hash of a
 creation record) whose archetype path the export tables gave, and only when every capture agrees on one path.
-The seed holds asset paths only: no player names, account ids or addresses.
+A dinosaur id that no capture had the tables for is kept too when the dinosaur assets of its own creation records
+(the same evidence the app uses live, source "asset") name one species folder in every capture: its path is then
+the conventional /Characters/Dinosaurs/<Folder>/BP_<Folder> one. The seed holds asset paths only: no player names,
+account ids or addresses.
 """
 
 from __future__ import annotations
@@ -22,27 +25,41 @@ from isle_livemap.peers import GamePeerSource  # noqa: E402
 from isle_livemap.replay import pcap_datagrams  # noqa: E402
 
 
-def paths_of(pcap: Path) -> dict[int, set[str]]:
+def paths_of(pcap: Path) -> tuple[dict[int, set[str]], dict[int, set[str]]]:
+    """(protocol id -> paths the export tables gave, protocol id -> dinosaur paths derived from the creation assets)."""
     pipe = TelemetryPipeline()
     source = GamePeerSource(pipeline=pipe)
     source.start()
     for d in pcap_datagrams(pcap):
         pipe.handle(d)
     found: dict[int, set[str]] = {}
+    derived: dict[int, set[str]] = {}
     for info in source.identity.actors.values():
         if info.archetype_handle is None:
             continue
         path = source.identity.object_path(info.archetype_handle)  # the tables only: never the cache
         if path and path.startswith("/"):
             found.setdefault(info.protocol_id, set()).add(path)
-    return found
+            continue
+        folder = source.identity.archetype_species(info.archetype_handle)
+        if folder and folder.isalnum():
+            derived.setdefault(info.protocol_id, set()).add(
+                f"/Game/TheIsle/Core/Characters/Dinosaurs/{folder}/BP_{folder}.Default__BP_{folder}_C")
+    return found, derived
 
 
 def build(pcaps: list[Path]) -> tuple[dict[int, str], int]:
     merged: dict[int, set[str]] = {}
+    derived: dict[int, set[str]] = {}
     for pcap in pcaps:
-        for protocol, paths in paths_of(pcap).items():
+        found, guessed = paths_of(pcap)
+        for protocol, paths in found.items():
             merged.setdefault(protocol, set()).update(paths)
+        for protocol, paths in guessed.items():
+            derived.setdefault(protocol, set()).update(paths)
+    for protocol, paths in derived.items():
+        if protocol not in merged:  # a path the tables gave always wins over a derived one
+            merged[protocol] = paths
     seed = {p: next(iter(v)) for p, v in merged.items() if len(v) == 1}
     return seed, len(merged) - len(seed)
 

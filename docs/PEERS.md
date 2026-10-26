@@ -50,12 +50,12 @@ Tray menu items: "Show other players", "Nearby radius...", "Health / stamina bar
 - Self is excluded by identity, never by position. Lab: id 0 is the lab's "me". Game: the entity whose Iris handle equals the own handle (learned from the survival heartbeat) is dropped, and a provisional peer with that handle is purged when the lock arrives. `peer_self_ids` adds more.
 - Silence timeouts are a property of the source. Lab and synthetic peers are dimmed after 3 s without an update and removed after 5 s. Game peers are dimmed after 8 s (`GAME_PEER_STALE_S`) and, without a destruction record, removed after 180 s for creatures (`GamePeerSource.TTL_S`: captured resting pawns went silent for 100-300 s and came back) or 30 s for server animals (`TTL_AI_S`), because Iris replicates changes only: an actor that stands still sends nothing, so silence is not absence. The game source also removes a tracked handle when the packet carries a destruction record for it (the dot is gone 1.5 s later: `GamePeerSource.GONE_GRACE_S`, applied by `EntitySmoother.prune` every frame; it used to stay dimmed for 30 s) (431 records in the recorded capture, 431 of 431 handles seen in that capture, 430 with a creation record). The 8 s / 30 s values are a judgement call, not a measured number.
 - The game server is the destination of the first outbound datagram. A different destination only replaces it after 5 outbound datagrams in a row while the old server has been silent for 1 s (a real server change). A single datagram from the game's second socket to another host (a 1300-byte latency probe was seen once per session) is ignored: it used to count as a server change and wiped the identity tables, the peers and the own-vitals lock, twice within 30 ms (once for the probe, once when the real server was "learned" again).
-- A label never states a guess as a fact; see "Label confidence" below. Unknown is written as `?`, a species remembered from an earlier session carries `~` and is drawn softer, and growth, hunger and thirst of other creatures are never printed (not even as `?`): they are not replicated to us. The format is the same for everybody (`geo.entity_label_lines`, `geo.vitals_line`):
+- A label never states a guess as a fact; see "Label confidence" below. A value that was never read is an en dash (`–`), or the line is left out; a species remembered from an earlier session carries `~` and is drawn softer, and growth, hunger and thirst of other creatures are never printed (not even as `?`): they are not replicated to us. The format is the same for everybody (`geo.entity_label_lines`, `geo.vitals_line`):
   * a player: `<name> - <species> - <distance>` / `<health %> - HP <health points> - ST <stamina %>`, e.g. `P1 - Deinosuchus - 724 m` / `86% - HP 1419 - ST 33%`
-  * a dinosaur without a player name: `<species> - <distance>` / the same second line (`Dino ? - <distance>` while the species is not known, `Creature ? - ...` when even the kind is unknown)
-  * a server animal: `AI - <name> - <distance>`, one line (`AI - Catfish - 120 m`, `AI - Forktail - 1.5 km`, `AI - ? - 120 m` without a class)
+  * a dinosaur without a player name: `<species> - <distance>` / the same second line (`Dino - <distance>` while the species is not known; every creature that is not a server animal is a dinosaur)
+  * a server animal: `AI - <name> - <distance>`, one line (`AI - Catfish - 120 m`, `AI - Forktail - 1.5 km`, `AI - Animal - 120 m` without a class)
   * a pack of one species standing together beyond 250 m: `Carnotaurus ×5 - <distance of the nearest>`, one line.
-  The second line holds only what was read: the percentage, the health points (percentage of the maximum health of the creature's creation record, `?` without it) and the stamina percentage; unread values are `?`, an old reading gets a coarse age tag (`[2m+]`). Compass direction and height are not on the minimap label; they are in the Nearby table and the tooltip text (`geo.entity_summary`). The label keeps the side of the dot it had (even when a dot has moved under it) while it still fits. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet is a dot, one that has moved is an arrow.
+  The second line holds only what was read: the percentage, the health points (percentage of the maximum health of the creature's creation record, `–` without it) and the stamina percentage; unread values are `–`, a creature nothing was read for has no second line, and an old reading gets a coarse age tag (`[2m+]`). Compass direction and height are not on the minimap label; they are in the Nearby table and the tooltip text (`geo.entity_summary`). The label keeps the side of the dot it had (even when a dot has moved under it) while it still fits. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet points north, one that has moved points the way it went (and keeps that direction while it rests).
 - **Priority** (`geo.priority_key`, one number used for the dot budget, the label slots and collisions): creatures before server animals; then the distance tier **within 250 m, within 500 m, within 1000 m, further**; inside a tier players before dinosaurs before unidentified creatures; then the nearest. A peer that had a label last frame ranks as 15 % nearer, so two creatures at almost the same distance do not swap labels. Labels per tier on the minimap: 12 / 6 / 4 (a crowd of more than 20 creatures cuts the 500 m and 1000 m tiers to 3 and 2, **never the 250 m tier**); fish get at most 3 labels and none in a shoal of 20+. Every creature inside 250 m keeps its full two-line label: when no free spot is left it takes the best one over other labels instead of being dropped or shortened. Beyond the 1000 m view radius players and dinosaurs up to 2.5 km are pointers on the circle edge.
 - **Your own stats** (growth, hunger, thirst, health) are not drawn anywhere on the minimap: there is no panel and no text for the red arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
@@ -68,11 +68,11 @@ Tray menu items: "Show other players", "Nearby radius...", "Health / stamina bar
 |---|---|---|---|
 | species | confirmed | `Allosaurus` | this connection named it: the server's export tables (source `table`), or the dinosaur assets its own creation records reference (source `asset`) |
 | species | inferred | `Allosaurus~`, head drawn at 75 % opacity | remembered from an earlier session: the saved class cache (source `cache`) or the seed shipped with the app (source `seed`), matched by protocol id |
-| species | unknown | `Dino ? #186850`, `<name> (?)`, drawn at 60 % opacity | nothing is known |
+| species | unknown | `Dino` (`Animal` for a server animal), drawn at 60 % opacity | nothing is known |
 | player name | confirmed | `<name> (...)` | the creature references its PlayerState; there is no other source, so a creature without one has no name (never `Actor #id`) |
 | health, stamina | known | `HP 86% ST 33%` | a full attribute block was seen (so the maxima are real) and the reading is at most `VITALS_FRESH_S` = 120 s old (the server sends only what changed, so an unchanged value is still true) |
 | health, stamina | stale | `HP 86% ST 33% [1m+]` | the same reading, older; the age is coarse (`2m+`, `5m+`, `10m+`) so the text changes at most three times in a creature's life |
-| health | none | `HP ?` | never read for this creature (dinosaurs and players only; server animals have no health line) |
+| health | none | no second line (`–` for a part that is missing) | never read for this creature (dinosaurs and players only; server animals have no health line) |
 | growth, hunger, thirst | not replicated | nothing | never printed, not even `?`; the status line says "growth, hunger and thirst not available" |
 
 Hysteresis (`confidence.TierTracker`, `LabelConfidence`, one per map view): a label that becomes MORE sure (unknown to remembered to confirmed, a first or a fresh health reading) changes at once; one that would say LESS (a species that vanishes, a reading that goes stale) changes only after the weaker evidence has lasted `DWELL_S` = 3 s. A species or a reading that comes and goes inside that time never reaches the label. State is dropped when the creature leaves the map.
@@ -96,42 +96,27 @@ The session log has a compact `labels:` line, written every 30 s while creatures
 * `--at HH:MM:SS` (or `+SECONDS`) draws the real `MapView` offscreen at that moment and prints, for every creature on the map, what the label said, or why it had none: outside the minimap circle (an edge arrow only), or no room / over the label limit. It also prints the status line. `--png` saves the picture. Without PySide6 the labels are built by the same functions but not placed.
 * `--cache class_cache.json` uses your saved class cache (copy it from the data folder); by default only the shipped seed is used. `--no-seed` uses neither. `--hide-names` replaces player names before you share a report.
 
-## Dot size by species
+## Marker look (2D, one arrow for every dinosaur)
 
-A peer's dot (and its heading arrow) is scaled by the species' size class, so a Tyrannosaurus reads bigger than a
-Troodon. Growth of other creatures is not decoded, so only the species decides; a growth fraction, when an entity has
-one (`growth_pct`), scales the radius from 60 % (juvenile) up to 100 %. Inferred species (`Name~`) scale too. Fish stay a
-small fixed diamond.
-
-| Class | Dot radius | Species (rough estimates of real adult size, not game data) |
-|---|---|---|
-| tiny | 3.0 px | Hypsilophodon, Troodon, Beipiaosaurus, Dryosaurus, Pteranodon, Compsognathus, Microraptor |
-| small | 3.8 px | Dilophosaurus, Herrerasaurus, Omniraptor, Utahraptor, Gallimimus, Pachycephalosaurus, Austroraptor, Dromaeosaurus |
-| medium (default) | 4.6 px | Carnotaurus, Ceratosaurus, Allosaurus, Maiasaura, Tenontosaurus, Diabloceratops, Kentrosaurus, Parasaurolophus, Camptosaurus, Oxalaia |
-| large | 5.6 px | Stegosaurus, Deinosuchus, Acrocanthosaurus, Therizinosaurus, Sarcosuchus |
-| huge | 6.8 px | Tyrannosaurus, Triceratops, Giganotosaurus, Spinosaurus, Brachiosaurus |
-
-A species that is not in the table (or no species at all) uses the medium radius. Radii are clamped to 2.5-8 px. Tables:
-`species.SIZE_CLASSES`, `geo.SIZE_RADIUS_PX`; the label placement keeps clear of the larger dot (`geo.marker_extent`).
-
-## Marker look (2D, readable on any map colour)
+There are no species, diet or size categories on the marker: every dinosaur of another person (a creature that
+references a PlayerState, a dinosaur whose controller is not known, and a creature whose class is not known at all) is
+the **same purple arrow** as your own red one: the same polygon at 75 % of its size (`geo.PEER_ARROW_SCALE`), purple
+`#a24dff` (`geo.PEER_COLOR`) with a dark outline for the 40 most important peers. It points along the direction of travel
+(measured from successive positions; kept while the creature rests) and points north, slightly softer, until the creature
+has moved. The species, the name and the numbers are in the label text only. Your own arrow stays red.
 
 | Peer | Look |
 |---|---|
-| you | red arrow (unchanged) |
-| player (the creature references a PlayerState) | cyan dot with a white ring: a person reads at a glance |
-| carnivore / herbivore / omnivore dinosaur | pink / green / yellow dot (`species.DIET_SPECIES`, rough, from the in-game diet) |
-| dinosaur with no species yet | neutral grey-blue dot |
+| you | red arrow |
+| another player's dinosaur, any species or none | purple arrow, the same shape as yours |
 | server animal (fish) | small muted grey-blue diamond: background, not a target |
 
-Every dot of the 40 most important peers has a soft light halo, so it keeps its contrast over forest, rock and water. A dot
-becomes an **arrow only while the creature moves** (`EntitySmoother.is_moving`: measured speed of at least 0.3 m/s and the
-dot still being carried along that movement); a creature at rest is a plain dot, because the heading comes from movement
-and says nothing once it has stopped. Labels sit on a soft dark pill, so the white second line reads on any background.
-A thin **health bar** (green to red) and, when the stamina is known, a **stamina bar** (blue) hang under the dot of a
-creature whose health is known, with no text to read (`show_vitals_bars`, tray "Health / stamina bars"; not for fish).
-Tray "Marker colours..." shows the legend (`geo.LEGEND_ENTRIES`). Beyond the 150 most important peers of a huge crowd the
-rest are small plain squares (500 anti-aliased glyphs do not fit a 16 ms frame; the 500-peer paint test takes ~3 ms).
+Labels sit on a soft dark pill, so the second line reads on any background. A thin **health bar** (green to red) and, when
+the stamina is known, a **stamina bar** (blue) hang under the arrow of a creature whose health is known and that has no
+label (`show_vitals_bars`, tray "Health / stamina bars"; not for fish). Tray "Marker colours..." shows the legend
+(`geo.LEGEND_ENTRIES`). Beyond the 150 most important peers of a huge crowd the rest are tiny unrotated purple triangles
+(500 anti-aliased glyphs do not fit a 16 ms frame; the 500-peer paint test takes ~3.6 ms: the arrows are cached polygons
+moved by the painter, and only the 40 most important have an outline).
 
 ## Distance, direction, height and why a dot can be missing
 
@@ -186,7 +171,7 @@ Evidence and method: "Identity, species and positions" (section 13) of `docs/trd
 
 **Positions of other creatures** (`tools/position_audit.py`, no ground truth exists for another player, so the audit checks what must hold for any real creature): over the recorded sessions no dinosaur / player step is faster than 16 m/s (136 steps, budget 40 m/s); six silences of 4 to 146 s ended 0.0-3.8 m from where the creature had been, i.e. **the server sends a position only when it changed, and no position means "has not moved"** (the same delta rule as for health: a missing update is an unchanged value, not stale data); every fix is within 6.4 km of the own player. A search for a position around an anchor older than `ANCHOR_LIFETIME` (a creature that rested for minutes) was tried and dropped: it found vectors 2.5-4.9 km from the old anchor with 60-97 m/s between consecutive fixes, which are false locks (the same search on 10,795 batches of non-creature streams with the normal 1 km bootstrap radius found none). What a creature without a creation record in the capture and without a position since the app started cannot be given: a position.
 
-A creature whose creation record was missed has no anchor. `ActorLocationTracker.bootstrap` places it from two consecutive state batches: a canonical 22+ bit vector within 1 km of the local player in both, the second continuing one of the first batch's candidates at creature speed. A vector within 15 m (+20 m/s) of the last position is accepted at its first sighting (the layout still needs two sightings to be trusted). In the hhh captures this placed 4 more creatures and raised the fixes of walking dinosaurs from 33 to 42 of 89 batches (a resting creature sends only health and stamina, so it has no position to decode).
+A creature whose creation record was missed has no anchor. `ActorLocationTracker.bootstrap` places it from two consecutive state batches: a canonical 22+ bit vector within 1 km of the local player in both, the second continuing one of the first batch's candidates at creature speed. A match inside the tight radius (15 m + 20 m/s) stands on those two samples; a looser one (up to 20 m + 100 m/s) needs a **third** consistent sample in a row (`BOOT_SAMPLES`, the short-gap rule only: the long-silence rules are strict already). Candidates within 400 m of the world origin below 200 m height are dropped while the local player is more than 1 km from the origin (`ORIGIN_EXCLUDE_*`), and creatures are only searched for around the local player **after the own pawn is locked** (`GamePeerSource._bootstrap_origin`): before the lock the own position is a spawn transition (near the world origin, then a jump of kilometres), and in the vv capture handle 223284 was drawn on a false track of 10 fixes within 400 m of the origin, with steps of 63-91 m/s, while the player stood 2.8 km away. A vector within 15 m (+20 m/s) of the last position is accepted at its first sighting (the layout still needs two sightings to be trusted). In the hhh captures this placed 4 more creatures and raised the fixes of walking dinosaurs from 33 to 42 of 89 batches (a resting creature sends only health and stamina, so it has no position to decode).
 
 The overlay line (`GamePeerSource.headline`) keeps a headline for `HEADLINE_HOLD_S` = 12 s before it changes ("Started late" / "Rejoin server: 1 hidden" used to alternate every second or two). An unclassified actor becomes `ai` after four state batches of the animal size (155/158 bits), not eight.
 
@@ -197,11 +182,26 @@ Not all creatures in view are positioned: the capture shows creatures (Deinosuch
 The own marker follows the client's own outbound move packets (no network hop). Other actors can only be as fresh as the server's replication of them: one-way latency plus the server's send interval for that actor, which Iris decides per actor (priority, relevance, only when state changed). The recorded fixtures carry no packet timestamps, so that rate cannot be measured in seconds from them. What the code controls:
 
 - Every decoded location is written to the store immediately (no buffering, decode cost 0.04..3 ms per packet) and the overlay reads the store every frame (16 ms timer), the same tick that moves the own marker.
-- Between samples the dot is dead-reckoned (`geo.EntitySmoother`, `DR_*`): the target advances along the velocity of the last two distinct samples, for at most one measured interval and never more than 1 s; a position re-sent unchanged, a gap over 3 s, a teleport or an implausible speed (over 60 m/s) switches it off. Position only: it never produces a heading.
+- Between samples the dot is dead-reckoned (`geo.EntitySmoother`, `DR_*`): the target advances along the velocity of the last two distinct samples, for at most twice the measured interval and never more than 3 s (`DR_PEER_HORIZON_FACTOR`, `DR_PEER_MAX_EXTRAP_S`; the own marker keeps one interval / 1 s), then holds and is dimmed by its age (`PEER_STALE_S`); a position re-sent unchanged, a gap over 3 s, a teleport or an implausible speed (over 60 m/s) switches it off. Position only: it never produces a heading.
 - The dot is **feed-forward**: it moves at the measured velocity all the time and the error to the newest sample is blended in over `DR_CORR_TAU_S` (0.2 s). The earlier version chased the target with a 0.09 s lag filter; with samples 0.7-1 s apart it stood still at the end of each horizon and jumped when the next sample came (6-20 visible jumps a minute). A sample that is late by up to `DR_FF_GRACE_S` (0.3 s) no longer stops the dot. The own marker still uses the 0.09 s filter with the lead (its samples come every ~0.1 s).
 - A reused handle (`PeerEntity.born` changes) is a different creature: the dot starts at its position instead of gliding there from the old one.
 
 What stays inherent: the first sample after a silence, network latency and the server's send interval.
+
+## One position path for every player (own marker and others)
+
+| Step | Own marker | Other creatures |
+|---|---|---|
+| Source | outbound move packets (client-predicted) | inbound server state batches (sent when a position changed) |
+| Quantised integers -> world cm | `decode.vector_to_cm` | the same function (`_vector_at`, and `decode_creation` with `CREATION_LOCATION_SCALE` x16) |
+| Axes, origin, north | world cm, north = -Y | identical |
+| Sample time | `Datagram.observed_at` -> `Interpolator.set_target(at=...)` | the same packet time: `PeerEntity.sample_at` -> `EntitySmoother.update` (a refresh without a new position keeps the old sample time and no longer reads as "stopped") |
+| Smoothing / dead reckoning | `Interpolator`, `DR_*` | `EntitySmoother`, the same constants, peer horizon twice as long (see above) |
+| Map projection | `project_unclamped`, `to_screen` | the same maths (the entity loop in `overlay._draw_entities` is the same linear map written out per frame) |
+
+What cannot be the same: the lock criteria (8 hits over 0.6 s of monotonic client timestamps for the own pawn; a continuation test for others), and the ground-truth check. The server never replicates the own position back to the client (a bit scan of every state batch of the own handle for a vector within 100 m of the outbound position found 2 chance hits and no consistent offset), so "own replication against outbound packets" cannot test the decoder for other creatures. The indirect checks: creation positions x16 match the same actor's first state fix to 0-12 m (median), own heading against the bearing of own motion has a median error of 0 degrees, and the fastest dinosaur step is 15.7 m/s.
+
+**Latency match (not applied).** The own marker is the client-predicted position (ahead of the server by about half a round trip); others are server positions (behind by a one-way trip plus the send interval, minus what dead reckoning claws back). A round-trip offset would need an RTT measurement: the app records on the client and measures no round trip (the protocol's acknowledgements are not parsed), so there is none. Shifting the own marker back would make it trail the player's own movement, which is worse than the few metres of relative offset. Timing others by the packet (and the longer horizon) lowered the dot lag p50 by 1-11 ms in all eight recorded sessions; p95 is unchanged (it is the server's send interval).
 
 ## Why other players' data is less complete than yours
 
@@ -358,3 +358,21 @@ The pcap is a standard classic pcap (link type 101 = raw IPv4; open it in Wiresh
 ## What would still help
 
 The join capture settled class, species, names, destruction records and the position of fish and pteranodons. Open: land dinosaurs near you (none came into relevance in the session recorded), growth, hunger and thirst of others (the 9-slot attribute block is only sent at creation: none of the ~1800 state batches of the two players in a recorded session reaches its 593 bits), the replicated heading, and ground truth for names (the PlayerState -> pawn reference is structural, not confirmed by a player telling you who stood next to them). A session in which you stand still next to ONE known player of a known species for 60 s, with the character name and species written down, would confirm the name link and add a land dinosaur's position layout.
+
+
+## Nearby creatures that were missing (jj capture)
+
+In the jj capture most creatures had no class (the app started after the join) and nothing else was wrong with the
+tables, but many nearby creatures were drawn once and then stood still on the map, or never drawn:
+
+| Cause | Fix |
+|---|---|
+| A creature without a class never learned its position layout (`learn` was only for dinosaurs, players and animals): it was drawn at its spawn point or first bootstrap and then frozen (1-3 different positions in 12 minutes) | a creature that behaves like a creature (`GamePeerSource._creature_like`: its creation record carried a maxHealth, or its state batches have the size profile of a pawn and never the animal size, handle at least 1000) learns its layout like a classified one: positions that changed per near creature-second 64 -> 131, on the map within 500 m 318 -> 450 s |
+| An anchor older than `ANCHOR_LIFETIME` (120 s) was never replaced: a creature that rested for two minutes and then walked was stuck at its old position until the server destroyed it | `ActorLocationTracker.bootstrap` takes over from a stale anchor, also for a creature that is on the map |
+| The bootstrap needed two batches within 3 s | a longer silence (up to `BOOT_LONG_GAP` 45 s) is bridged when the same vector offset of the same state header continues twice in a row, or when each batch has at most two candidates and one of each pair continues the other at walking speed (16 m/s) |
+| The game's static singletons (handles under 1000, e.g. the game state with 8000 batches) looked like "creatures without a position" and kept the headline at "1 creature: no position yet" | `MIN_DYNAMIC_HANDLE` |
+| Species `?` on 83 % of the creature-seconds | the seed now holds 61 protocol ids: dinosaur ids that no capture had the tables for but whose own creation assets name one species (Stegosaurus, Dilophosaurus, Tenontosaurus, Omniraptor, Pteranodon) are derived by `tools/build_class_seed.py` (the tables win over a derived path). 44 % remain: 1042 creature-seconds belong to creatures created before the app started (no creation record, so no id) and 963 to ids no capture has seen with tables. The class cache learns them over sessions in which the app was started before the join |
+| A remembered class that this connection's own assets agree with was marked `~` | `species_source` reports `asset` (confirmed) when the cache path and the assets name the same species |
+
+Still impossible: a creature that existed before the app started, has no class and never moves sends state batches but
+no position the decoder can use; its first candidate vectors change by hundreds of metres between batches.

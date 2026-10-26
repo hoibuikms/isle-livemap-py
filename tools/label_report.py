@@ -8,7 +8,7 @@
 The capture is replayed through the same code as the live app (GamePeerSource, and with --at the real MapView drawn
 offscreen), so a row is what the minimap showed, not a second opinion. Columns of the table:
 
-  handle   the game's net handle (the minimap shows it for creatures whose species is unknown: "Dino ? #186850")
+  handle   the game's net handle (the minimap shows only "Dino" for a creature whose species is unknown)
   kind     player / dino / ai (server animal, fish) / unknown
   species  what the label says; "~" = remembered from an earlier session (saved class cache or shipped seed), "?" = unknown
   source   table  the server's export tables of this connection named it (confirmed)
@@ -19,7 +19,7 @@ offscreen), so a row is what the minimap showed, not a second opinion. Columns o
   first/last  seconds into the capture (and wall-clock when it can be derived) of the first / last time it was on the map
   placed   whether it was ever drawn: "no" = replicated to us but its position was never received
   HP/ST    last health / stamina percentage read, and how old that reading was when the creature left the map
-           ("-" = never read: the label says "HP ?"); growth, hunger and thirst of others are not replicated to us
+           ("-" = never read: the label has no second line); growth, hunger and thirst of others are not replicated to us
   dist/brg distance and compass bearing from you when it first appeared
 
 Player names are the game's, shown so you can find the player; --hide-names removes them before you share a report.

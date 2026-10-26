@@ -89,10 +89,10 @@ def test_a_class_known_dinosaur_needs_fewer_batches():
     from isle_livemap.decode import ActorInfo
 
     g = source()
-    g.identity.actors[77] = ActorInfo(77, 5, None, 0x1234)
+    g.identity.actors[100077] = ActorInfo(100077, 5, None, 0x1234)
     g.identity.objects = {}
     g.class_cache = g.identity.class_cache = ClassCache(None, seed={0x1234: DEINOSUCHUS})
-    feed(g, 77, [120] * 12)
+    feed(g, 100077, [120] * 12)
     assert g.hidden_creatures() == 1
 
 

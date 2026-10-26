@@ -53,6 +53,7 @@ class PeerEntity:
     entity: Entity
     last_seen: float  # monotonic seconds of the source clock
     born: int = 0  # serial of the store entry: a removed and re-added id (a reused game handle) gets a new one
+    sample_at: float | None = None  # when the newest position was observed (packet time, like the own marker's); None: last_seen
 
     @property
     def id(self) -> str:
@@ -128,8 +129,9 @@ class PeerStore:
         self._snap: PeerSnapshot | None = None
         self.dropped_self = 0
 
-    def update(self, entity: Entity) -> bool:
-        """Insert/refresh one entity. False if it is a self id (dropped)."""
+    def update(self, entity: Entity, at: float | None = None) -> bool:
+        """Insert/refresh one entity. False if it is a self id (dropped). ``at``: the packet time of the position it
+        carries; an update without one (a state batch with no position) keeps the previous sample time."""
         now = self.clock()
         with self._lock:
             if is_self(entity.id, self_ids=self._self):
@@ -138,7 +140,8 @@ class PeerStore:
             old = self._seen.get(entity.id)
             if old is None:
                 self._serial += 1
-            self._seen[entity.id] = PeerEntity(entity, now, old.born if old is not None else self._serial)
+            sample_at = at if at is not None else (old.sample_at if old is not None else None)
+            self._seen[entity.id] = PeerEntity(entity, now, old.born if old is not None else self._serial, sample_at)
             self._cached = self._snap = None
             if old is None or old.entity != entity:
                 self._version += 1
@@ -448,6 +451,8 @@ class GamePeerSource:
         self._layouts: dict[int, list] = {}  # unclassified handle -> [state batches of the animal size, all state batches, latched]
         self._anchors: dict[int, tuple[float, float]] = {}  # handle -> position the travel direction is measured from
         self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
+        self._creatures: set[int] = set()  # handles whose creation record carried a maxHealth: a creature, whatever its class
+        self._shape: dict[int, list] = {}  # handle -> [state batches, in the pawn size band, animal sized]: kept after it is placed
         self._past_own: set[int] = set()  # earlier own pawns (respawn): the old body is not "another creature"
         self._last_t = 0.0  # datagram time of the newest inbound packet
         # handle -> (kind, species, name, inferred, x, y, t) of a player / dinosaur the server destroyed. The same handle
@@ -507,6 +512,8 @@ class GamePeerSource:
         self._layouts.clear()
         self._anchors.clear()
         self._profile.clear()
+        self._creatures.clear()
+        self._shape.clear()
         self._past_own.clear()
         self._hidden_cache = (-1e9, 0)
         self._headline = (-1e9, "")
@@ -557,6 +564,31 @@ class GamePeerSource:
             seen[2] = True
         return seen[2]
 
+    MIN_DYNAMIC_HANDLE = 1000  # lower handles are the game's static singletons (game state, world actors), never creatures
+    SHAPE_MIN_BATCHES = 12
+    SHAPE_MAX = 20_000
+
+    def _note_shape(self, handle: int, nbits: int) -> None:
+        row = self._shape.get(handle)
+        if row is None:
+            if len(self._shape) >= self.SHAPE_MAX:
+                self._shape.clear()
+            row = self._shape[handle] = [0, 0, 0]
+        row[0] += 1
+        row[1] += self.CREATURE_BAND[0] <= nbits <= self.CREATURE_BAND[1]
+        row[2] += nbits in self.AI_LAYOUT_BITS
+
+    def _creature_like(self, handle: int) -> bool:
+        """An actor without a class that behaves like a creature: its creation record carried a maxHealth (plants, fruit and
+        items have none), or its state batches have the size profile of a pawn (never the animal size)."""
+        if handle < self.MIN_DYNAMIC_HANDLE:
+            return False
+        if handle in self._creatures:
+            return True
+        row = self._shape.get(handle)
+        return row is not None and row[0] >= self.SHAPE_MIN_BATCHES and row[1] >= row[0] * self.CREATURE_BAND_SHARE \
+            and row[2] < row[0] * self.CREATURE_FISH_SHARE
+
     def _note_unplaced(self, handle: int, nbits: int, t: float) -> None:
         """Profile of a creature-like actor that sent a state batch but has no position on the map."""
         row = self._profile.get(handle)
@@ -579,6 +611,7 @@ class GamePeerSource:
         count = 0
         for handle, (n, band, fish, last) in list(self._profile.items()):  # decoder thread inserts: iterate a copy
             if (n < self.HIDDEN_KNOWN_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
+                    or handle < self.MIN_DYNAMIC_HANDLE
                     or handle in self._past_own or self.store.get(str(handle)) is not None):
                 continue
             kind = self._identity(handle)[0]
@@ -624,6 +657,12 @@ class GamePeerSource:
         pos = getattr(latest, "position", None)
         return None if pos is None else (pos.x, pos.y, pos.z)
 
+    def _bootstrap_origin(self) -> tuple[float, float, float] | None:
+        """Where an unanchored creature is searched for: around the local player, but only once the own pawn is locked.
+        Before that the position is a spawn transition (near the world origin, then a jump of kilometres): creatures
+        placed around it were drawn on a false track (recorded session ``vv``, handle 223284)."""
+        return self._own_position() if self.own_handle is not None else None
+
     def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str) -> None:
         eid = str(handle)
         old = self.store.get(eid)
@@ -638,7 +677,7 @@ class GamePeerSource:
             health_pct=vit.health_pct if vit else None, stamina_pct=vit.stamina_pct if vit else None,
             max_health=vit.max_health if vit else None,
             heading=self._heading(handle, x, y, old.heading if old else None), inferred=inferred,
-            vitals_t=self._vitals_t.get(handle)))
+            vitals_t=self._vitals_t.get(handle)), at=self._last_t)
 
     def _note_identity(self, handle: int, old: Entity | None, species: str, inferred: bool) -> None:
         """A species remembered from an earlier session that the server's tables later contradict (or that was dropped
@@ -695,6 +734,8 @@ class GamePeerSource:
         self._layouts.pop(handle, None)
         self._anchors.pop(handle, None)
         self._profile.pop(handle, None)
+        self._creatures.discard(handle)
+        self._shape.pop(handle, None)
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
         """Decode one inbound datagram. A failure costs that datagram only, but it is counted and shown (status line,
@@ -747,6 +788,8 @@ class GamePeerSource:
             self._layouts.pop(handle, None)
             self._anchors.pop(handle, None)
             self._profile.pop(handle, None)
+            self._creatures.discard(handle)
+            self._shape.pop(handle, None)
             self.locator.note_creation(handle, creation.location, t)
             kind, species, name = self._identity(handle)
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
@@ -766,6 +809,8 @@ class GamePeerSource:
                 if kind != sp.KIND_AI:
                     max_health = creation_max_health(bits, batch)
                     self.pawn_vitals.note_creation(handle, max_health)
+                    if max_health is not None:
+                        self._creatures.add(handle)
                     # A creature whose class could not be named (the join tables were missed, the id is not in the cache)
                     # is still a creature when its creation record carries a maxHealth: plants, fruit and items have none.
                     # Its spawn position is drawn at once; waiting for a position update leaves a resting creature unseen.
@@ -777,6 +822,7 @@ class GamePeerSource:
                 continue
             if kind == sp.KIND_UNKNOWN and self._animal_layout(handle, batch.data_bit_count):
                 kind = sp.KIND_AI
+            self._note_shape(handle, batch.data_bit_count)
             vit = None
             if kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS:
                 vit = self.pawn_vitals.update(bits, batch)
@@ -784,10 +830,15 @@ class GamePeerSource:
                     self._vitals[handle] = vit
                     self._vitals_t[handle] = self._clock()
                     self.vitals_blocks = self.pawn_vitals.blocks
-            loc = self.locator.update(bits, batch, t, learn=kind in (sp.KIND_DINO, sp.KIND_PLAYER, sp.KIND_AI))
-            if (loc is None and kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS
-                    and self.store.get(str(handle)) is None):
-                loc = self.locator.bootstrap(bits, batch, t, self._own_position())
+            creature = kind in (sp.KIND_DINO, sp.KIND_PLAYER) or (kind == sp.KIND_UNKNOWN and self._creature_like(handle))
+            # An unclassified creature (join tables missed, id not remembered) learns its position layout like a classified one;
+            # before, it was drawn once at its spawn point or first bootstrap and never followed.
+            loc = self.locator.update(bits, batch, t, learn=creature or kind == sp.KIND_AI)
+            if loc is None and kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS:
+                # also for a creature that is on the map but whose anchor went stale while it rested: it is followed again
+                # as soon as the same vector offset continues twice (ActorLocationTracker.bootstrap)
+                if self.store.get(str(handle)) is None or creature:
+                    loc = self.locator.bootstrap(bits, batch, t, self._bootstrap_origin())
             if loc is not None:
                 self.locations += 1
                 self._profile.pop(handle, None)

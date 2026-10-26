@@ -14,14 +14,12 @@ import uuid
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from functools import lru_cache
 from typing import Callable
 
 from .confidence import (
     SPECIES_INFERRED, VITALS_STALE, age_tag, is_placeholder_name, species_tier, vitals_tier,
 )
 from .decode import normalize_degrees
-from .species import diet_of, size_class
 
 # ----------------------------------------------------------------- projection
 # Gateway map projection, identical to GatewayMapProjection.cs.
@@ -433,9 +431,10 @@ class EntityStyle:
     glyph: str  # "arrow" (self), "dot" (+ arrow when heading is known), "diamond"
 
 
+PEER_COLOR = "#a24dff"  # every dinosaur / player of another person: one purple arrow, whatever the species
 ENTITY_STYLE = {
-    "self": EntityStyle("#ff4040", "#000000", 10.0, "arrow"),  # local player: red, biggest, drawn last
-    "player": EntityStyle("#4dd0ff", "#00141c", 4.0, "dot"),  # other players: cyan, smaller, outlined
+    "self": EntityStyle("#ff4040", "#000000", 10.0, "arrow"),  # local player: red arrow, biggest, drawn last
+    "player": EntityStyle(PEER_COLOR, "#12002b", 4.0, "arrow"),  # another person's dinosaur: the same arrow, purple, smaller
     "ai": EntityStyle("#8fa6b3", "#0b1318", 5.0, "diamond"),  # server animals (fish): muted, they are background
 }
 # Entity kinds from the game source (species.py): "player" (a creature that references a PlayerState), "dino" (a
@@ -443,71 +442,33 @@ ENTITY_STYLE = {
 # the style; "ai" is a server controlled animal. World objects ("other") never become entities.
 PLAYER_KINDS = ("player", "dino", "unknown")
 ENTITY_STYLE.update({k: ENTITY_STYLE["player"] for k in PLAYER_KINDS if k not in ENTITY_STYLE})
-# Dinosaurs (no PlayerState) are coloured by diet when the species is known; players stay cyan with a white ring, so
-# "a person" reads at a glance; a dinosaur whose species is not known is a neutral grey-blue.
-DIET_STYLE = {
-    "carnivore": EntityStyle("#ff7eb6", "#2a0a1a", 4.0, "dot"),
-    "herbivore": EntityStyle("#7bd88f", "#08200f", 4.0, "dot"),
-    "omnivore": EntityStyle("#ffd166", "#2a1c00", 4.0, "dot"),
-}
-NEUTRAL_DINO_STYLE = EntityStyle("#b8c4d6", "#10141a", 4.0, "dot")
 LEGEND_ENTRIES = (
     ("You", ENTITY_STYLE["self"].color, "red arrow"),
-    ("Player", ENTITY_STYLE["player"].color, "cyan dot with a white ring"),
-    ("Carnivore", DIET_STYLE["carnivore"].color, "pink dot"),
-    ("Herbivore", DIET_STYLE["herbivore"].color, "green dot"),
-    ("Omnivore", DIET_STYLE["omnivore"].color, "yellow dot"),
-    ("Dinosaur, species not known", NEUTRAL_DINO_STYLE.color, "grey dot"),
+    ("Another player's dinosaur", ENTITY_STYLE["player"].color, "purple arrow (same shape as yours)"),
     ("Animal / fish", ENTITY_STYLE["ai"].color, "small grey diamond"),
 )
 
 
-@lru_cache(maxsize=256)
-def _peer_style(kind: str, species: str) -> EntityStyle:
-    if kind == "player" or kind == "ai":
-        return ENTITY_STYLE[kind]
-    return DIET_STYLE.get(diet_of(species)) or NEUTRAL_DINO_STYLE
-
-
 def peer_style(e: "Entity") -> EntityStyle:
-    """Colours of a peer: players cyan, other dinosaurs by diet (neutral without a species), server animals muted."""
-    return _peer_style(e.kind, e.species)
+    """One style for every dinosaur / player (no species, diet or size categories); server animals are muted."""
+    return ENTITY_STYLE["ai"] if e.kind == "ai" else ENTITY_STYLE["player"]
 
 
 STALE_ALPHA = 105  # 0-255 opacity of a stale (> PEER_STALE_S) peer
-PEER_ARROW_SCALE = 0.6  # peer arrow size relative to the local arrow
-
-# Dot radius (px) by species size class (species.size_class). Every radius is clamped to [DOT_MIN_PX, DOT_MAX_PX] so a
-# dot stays readable and never hides its neighbours. Server animals (fish) stay small whatever they are.
-SIZE_RADIUS_PX = {"tiny": 3.0, "small": 3.8, "medium": 4.6, "large": 5.6, "huge": 6.8}
+PEER_ARROW_SCALE = 0.75  # peer arrow size relative to the local arrow (same polygon, so it reads as the same marker)
+UNKNOWN_HEADING_ALPHA = 190  # an arrow whose direction of travel is not known yet points north, a little softer
 AI_RADIUS_PX = 3.5
-DOT_MIN_PX, DOT_MAX_PX = 2.5, 8.0
-JUVENILE_SCALE = 0.6  # a growth fraction (when known) scales the radius from this up to 1.0
-_BASE_ARROW_RADIUS_PX = 4.0  # the radius the PEER_ARROW_SCALE arrow was designed for
-
-
-@lru_cache(maxsize=512)
-def _radius(kind: str, species: str, growth_q: int | None) -> float:
-    if kind == "ai":
-        return AI_RADIUS_PX
-    r = SIZE_RADIUS_PX[size_class(species)]
-    if growth_q is not None:
-        r *= JUVENILE_SCALE + (1.0 - JUVENILE_SCALE) * growth_q / 20
-    return min(DOT_MAX_PX, max(DOT_MIN_PX, r))
+_OWN_ARROW_FRONT_PX = 10.0  # the local arrow reaches 10 px ahead of its centre
 
 
 def marker_radius(e: Entity) -> float:
-    """Dot radius in px of a peer: from its species size class (fish: fixed small), scaled by growth when known."""
-    g = e.growth_pct
-    return _radius(e.kind, e.species, None if g is None or not math.isfinite(g) else round(min(100.0, max(0.0, g)) / 5))
+    """Radius in px of a peer glyph (the same for every dinosaur and player; fish are a smaller diamond)."""
+    return AI_RADIUS_PX if e.kind == "ai" else _OWN_ARROW_FRONT_PX * PEER_ARROW_SCALE
 
 
 def marker_extent(e: Entity) -> float:
-    """How far from its centre a peer glyph reaches, px (an arrow is longer than its dot radius)."""
-    r = marker_radius(e)
-    if e.heading is not None:
-        return 10 * PEER_ARROW_SCALE * r / _BASE_ARROW_RADIUS_PX
-    return r + 1 if e.kind == "ai" else r
+    """How far from its centre a peer glyph reaches, px (an arrow is longer than a diamond)."""
+    return AI_RADIUS_PX + 1 if e.kind == "ai" else _OWN_ARROW_FRONT_PX * PEER_ARROW_SCALE
 
 
 def canonical_id(raw) -> str:
@@ -650,21 +611,28 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
 
 
 def species_text(e: Entity) -> str:
-    """The species as a label says it: plain when confirmed, "Name~" when remembered from an earlier session, "?" when unknown."""
+    """The species as a label says it: plain when confirmed, "Name~" when remembered from an earlier session. A creature
+    whose class is not known is just a "Dino" (an "Animal" for a server animal): every non-AI creature is a dinosaur."""
     if not e.species:
-        return "?"
+        return "Animal" if e.kind == "ai" else "Dino"
     return truncate(e.species, 14) + ("~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else "")
+
+
+NO_VALUE = "\u2013"  # a field the game did not send us (yet): an en dash, not a question mark
 
 
 def vitals_line(e: Entity, tier: str, vitals_age_s: float | None) -> str:
     """Second line of a creature's label: ``<health %> - HP <health points> - ST <stamina %>``. Only values that were
-    read are printed, the rest is "?" (never a guess). The health points are the percentage of the maximum health the
-    creature's creation record carries. A reading older than ``confidence.VITALS_FRESH_S`` gets a coarse age tag."""
-    pct = "?" if e.health_pct is None else f"{e.health_pct:.0f}%"
-    pts = "?" if e.health_pct is None or not e.max_health else f"{e.health_pct / 100.0 * e.max_health:.0f}"
-    st = "?" if e.stamina_pct is None else f"{e.stamina_pct:.0f}%"
+    read are printed, a missing one is an en dash (never a guess), and a creature nothing was read for has no second
+    line. The health points are the percentage of the maximum health the creature's creation record carries. A reading
+    older than ``confidence.VITALS_FRESH_S`` gets a coarse age tag."""
+    if e.health_pct is None and e.stamina_pct is None:
+        return ""
+    pct = NO_VALUE if e.health_pct is None else f"{e.health_pct:.0f}%"
+    pts = NO_VALUE if e.health_pct is None or not e.max_health else f"{e.health_pct / 100.0 * e.max_health:.0f}"
+    st = NO_VALUE if e.stamina_pct is None else f"{e.stamina_pct:.0f}%"
     text = f"{pct} - HP {pts} - ST {st}"
-    if tier == VITALS_STALE and (e.health_pct is not None or e.stamina_pct is not None):
+    if tier == VITALS_STALE:
         text += f" [{age_tag(vitals_age_s)}]"
     return text
 
@@ -674,8 +642,8 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
     """(head, tail) of the minimap label, worded by how sure each field is (``confidence``).
 
     head:  a player          ``Name - Species - 724 m``
-           a dinosaur        ``Species - 724 m``       (``Dino ? - 724 m`` while the species is not known)
-           a server animal   ``AI - Catfish - 120 m``  (``AI - ? - 120 m`` without a class)
+           a dinosaur        ``Species - 724 m``       (``Dino - 724 m`` while the species is not known)
+           a server animal   ``AI - Catfish - 120 m``  (``AI - Animal - 120 m`` without a class)
     tail:  ``vitals_line`` for players and dinosaurs; "" for a server animal and for a pack.
 
     A player name is only printed when the creature referenced its PlayerState. Compass direction and height are not
@@ -692,8 +660,7 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
     if not is_placeholder_name(name):
         head = f"{truncate(name, name_max)} - {species_text(e)} - {dist}"
     else:  # no player name known: the species is the best name there is
-        who = species_text(e) if e.species else ("Dino ?" if e.kind in ("dino", "player") else "Creature ?")
-        head = f"{who}{f' ×{group}' if group > 1 else ''} - {dist}"
+        head = f"{species_text(e)}{f' ×{group}' if group > 1 else ''} - {dist}"
     if group > 1:
         return head, ""
     return head, vitals_line(e, vitals or vitals_tier(e.health_pct, e.stamina_pct, n.vitals_age_s), n.vitals_age_s)
@@ -837,6 +804,11 @@ MOVING_HOLD_S = 0.7  # the arrow outlives the dead-reckoning horizon a little, s
 DR_MIN_DT_S = 0.05  # samples closer than this give a noisy velocity; the old velocity is kept
 DR_MAX_INTERVAL_S = 3.0  # samples further apart are not one continuous movement: no velocity
 DR_MAX_EXTRAP_S = 1.0
+# Other creatures are sent only when they change, so a moving one that goes quiet is usually just between two sparse
+# updates: its dot is carried on for twice the interval its speed was measured over, but never beyond this, and then
+# held (and dimmed by age, see PEER_STALE_S). The own marker keeps the one-interval horizon: its samples come every packet.
+DR_PEER_HORIZON_FACTOR = 2.0
+DR_PEER_MAX_EXTRAP_S = 3.0
 DR_MAX_SPEED = 6_000.0  # cm/s (60 m/s); faster is a glitch or a respawn, not movement
 DR_CORR_TAU_S = 0.2  # a new sample is blended in over this long, so a late or off-course sample bends the path instead of jumping
 DR_FF_GRACE_S = 0.3  # the dot keeps its velocity this long past the horizon: a sample that is a little late must not stop it
@@ -873,6 +845,7 @@ class EntitySmoother:
         self.heading: dict[str, float] = {}
         self.last_seen: dict[str, float] = {}
         self._sample: dict[str, tuple[float, float, float]] = {}  # newest distinct (x, y, time)
+        self._sample_seen: dict[str, float] = {}  # newest sample time reported per id (distinct or not)
         self._vel: dict[str, tuple[float, float, float]] = {}  # (vx, vy in cm/s, extrapolation horizon s)
 
     def _note_sample(self, eid: str, e: Entity, t: float, refreshed: bool) -> None:
@@ -888,7 +861,7 @@ class EntitySmoother:
             if dt >= DR_MIN_DT_S:
                 vx, vy = (e.x - s[0]) / dt, (e.y - s[1]) / dt
                 if dt <= DR_MAX_INTERVAL_S and math.hypot(vx, vy) <= DR_MAX_SPEED:
-                    self._vel[eid] = (vx, vy, min(dt, DR_MAX_EXTRAP_S))
+                    self._vel[eid] = (vx, vy, min(dt * DR_PEER_HORIZON_FACTOR, DR_PEER_MAX_EXTRAP_S))
                 else:
                     self._vel.pop(eid, None)
             self._sample[eid] = (e.x, e.y, t)
@@ -896,6 +869,7 @@ class EntitySmoother:
     def update(self, entities, now: float | None = None) -> None:
         new: dict[str, Entity] = {}
         seen: dict[str, float] = {}
+        sample_at: dict[str, float] = {}
         born_of: dict[str, int] = {}
         for item in entities:
             e = getattr(item, "entity", item)
@@ -903,11 +877,16 @@ class EntitySmoother:
             born_of[e.id] = getattr(item, "born", 0)
             ls = getattr(item, "last_seen", None)
             seen[e.id] = ls if ls is not None else (now if now is not None else 0.0)
+            # The time of the sample is the packet's, as for the own marker (Interpolator.set_target(at=...)); a source that
+            # does not give one (the lab feed) is timed by when it was last reported.
+            at = getattr(item, "sample_at", None)
+            sample_at[e.id] = at if at is not None else seen[e.id]
         for eid, e in new.items():
             born = born_of.get(eid, 0)
             if born and self._born.get(eid, born) != born:  # the id was reused: not the creature the dot was following
                 self.pos.pop(eid, None)
                 self._sample.pop(eid, None)
+                self._sample_seen.pop(eid, None)
                 self._vel.pop(eid, None)
                 self.heading.pop(eid, None)
             self._born[eid] = born
@@ -916,7 +895,10 @@ class EntitySmoother:
                 self.pos[eid] = [e.x, e.y]
                 if e.heading is not None:
                     self.heading[eid] = e.heading
-            self._note_sample(eid, e, seen[eid], seen[eid] > self.last_seen.get(eid, -math.inf))
+            # "re-sent at the same spot" means a newer sample, not just a refreshed last_seen: a state batch without a position
+            # refreshes last_seen but does not say the creature stopped
+            self._note_sample(eid, e, sample_at[eid], sample_at[eid] > self._sample_seen.get(eid, -math.inf))
+            self._sample_seen[eid] = max(sample_at[eid], self._sample_seen.get(eid, -math.inf))
             if e.heading is None:
                 self.heading.pop(eid, None)
             elif eid not in self.heading:
@@ -964,6 +946,7 @@ class EntitySmoother:
             self.last_seen.pop(eid, None)
             self.entities.pop(eid, None)
             self._sample.pop(eid, None)
+            self._sample_seen.pop(eid, None)
             self._vel.pop(eid, None)
             self._missing.pop(eid, None)
             self._born.pop(eid, None)

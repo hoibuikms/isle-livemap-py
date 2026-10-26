@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 import time
 from dataclasses import replace
 
@@ -15,9 +16,9 @@ from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, is_p
 from .geo import (
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
-    ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
+    ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, UNKNOWN_HEADING_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
     PEER_STALE_S, PEER_TTL_S, SLOT_SLACK_PX, label_limits, place_label, priority_key, priority_tier, visible_entities,
-    marker_extent, marker_radius, peer_style, truncate, _overlaps,
+    marker_extent, marker_radius, peer_style, species_text, truncate, _overlaps,
 )
 from .peers import status_is_warning
 
@@ -28,8 +29,6 @@ KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠
 EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
 DOT_CLEARANCE_PX = 7.0  # no label may cover the dot of a player or dinosaur
 SOFT_INFERRED, SOFT_UNKNOWN = 0.75, 0.6  # label head opacity of a remembered / unknown species (confirmed: 1.0)
-HALO = QColor(255, 255, 255, 70)  # soft light disc under a dinosaur dot: contrast on dark and light map areas
-HALO_PLAYER = QColor(255, 255, 255, 105)
 LABEL_BG, LABEL_BG_STALE = QColor(8, 12, 16, 125), QColor(8, 12, 16, 60)
 BAR_TRACK, BAR_ST_FILL = QColor(0, 0, 0, 170), QColor(90, 170, 255)
 BAR_HP_H, BAR_ST_H = 3.0, 2.0  # px
@@ -38,8 +37,20 @@ EDGE_CAPTIONS = 6  # the nearest this many edge pointers also say who / what the
 COMPACT_HOLD_S = 4.0  # a label that had to be shortened stays short this long (no flipping between one and two lines)
 CLUSTER_PX = 12.0  # creatures of one species whose dots are closer than this share one label ("Carnotaurus ×5")
 HALO_MAX = 40  # halos and bars for the most important this many peers (labels are limited in the same way)
-CROWD_GLYPHS = 150  # full glyphs for the most important this many peers; the rest of a crowd are small squares
+CROWD_GLYPHS = 150  # full glyphs for the most important this many peers; the rest of a crowd are tiny triangles
 LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
+
+
+@lru_cache(maxsize=128)
+def _arrow_polygon(step: int) -> QPolygonF:
+    """The local arrow's polygon (see MapView._draw_player) scaled to a peer, turned ``step`` * 3 degrees clockwise."""
+    a = math.radians(step * 3.0)
+    c, s = math.cos(a), math.sin(a)
+    k = PEER_ARROW_SCALE
+    return QPolygonF([QPointF(vx * c - vy * s, vx * s + vy * c) for vx, vy in ((0, -10 * k), (7 * k, 8 * k), (0, 4 * k), (-7 * k, 8 * k))])
+
+
+_CROWD_ARROW = QPolygonF([QPointF(0, -3.2), QPointF(2.4, 2.6), QPointF(-2.4, 2.6)])
 
 
 def _qcolor(hex_color: str, alpha: int = 255) -> QColor:
@@ -59,7 +70,7 @@ class MapView(QWidget):
         self._peers_version = -1
         self.peer_status = ""
         self.record_status = ""  # set by App once a second while --record is active
-        self._marker_tools: dict[tuple[str, bool], tuple[QPen, QColor]] = {}
+        self._marker_tools: dict[tuple, tuple[QPen, QColor]] = {}
         self._bar_colors: dict[int, QColor] = {}  # health bar fill by 5 % step (no QColor built per frame)
         self._pen_key = None  # (colour, stale, player) of the pen / brush currently set on the painter
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
@@ -178,7 +189,7 @@ class MapView(QWidget):
                 self.ents.ghost_grace_s = getattr(self.peers, "ghost_grace_s", None)
                 self.ents.ghost_kinds = getattr(self.peers, "ghost_kinds", frozenset())
                 self.ents.ghost_age_s = self._stale_s  # a ghost is drawn dimmed from its first frame
-                self.ents.heading_only_when_moving = bool(getattr(self.peers, "heading_from_movement", False))
+                self.ents.heading_only_when_moving = False  # the arrow keeps its last direction of travel while the creature rests
                 # an unchanged store returns the same snapshot object; a refreshed last_seen is a new one
                 if snap is not self._peers_snap or snap.version != self._peers_version:
                     self._peers_snap, self._peers_version = snap, snap.version
@@ -540,42 +551,40 @@ class MapView(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(c)
             self._pen_key = key
-        p.drawRect(QRectF(pt.x() - 1.8, pt.y() - 1.8, 3.6, 3.6))
+        if n.entity.kind == "ai":
+            p.drawRect(QRectF(pt.x() - 1.8, pt.y() - 1.8, 3.6, 3.6))
+        else:  # a far peer beyond the glyph budget is still an arrow, only tiny and unrotated
+            x, y = pt.x(), pt.y()
+            p.translate(x, y)
+            p.drawPolygon(_CROWD_ARROW)
+            p.translate(-x, -y)
 
     def _draw_entity_marker(self, p: QPainter, n: Nearby, pt: QPointF, decorate: bool = True) -> None:
-        """Peer glyph: a dot with a soft halo (so it reads on any map colour); an arrow only while the creature moves;
-        a diamond for server animals. Players have a white ring, dinosaurs are coloured by diet. Dim when stale."""
+        """Peer glyph: every dinosaur / player is the same purple arrow as the local one (no species, diet or size
+        categories, no dots); it points along the direction of travel, north until that is known. Server animals are a
+        small muted diamond. Dim when stale."""
         e = n.entity
         st = peer_style(e)
-        player = e.kind == "player"
-        key = (st.color, n.stale, player)
+        known = e.heading is not None
+        outline = decorate or e.kind == "ai"  # the outline (the costly part of an arrow) is for the creatures that matter
+        key = (st.color, n.stale, known, outline)
         pb = self._marker_tools.get(key)
-        if pb is None:  # one pen/brush per (colour, stale, player): creating them per marker dominated the layer
-            alpha = STALE_ALPHA if n.stale else 255
-            ring = QPen(QColor(255, 255, 255, min(235, alpha)), 1.6) if player else QPen(_qcolor(st.outline, min(230, alpha)), 1.5)
-            pb = self._marker_tools[key] = (ring, _qcolor(st.color, alpha))
-        rad = marker_radius(e)  # species size class (fish: fixed small), see geo.marker_radius
-        if decorate and e.kind != "ai":  # the halo is for the creatures that matter; a crowd of 500 does not get 500 discs
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(HALO_PLAYER if player else HALO)
-            p.drawEllipse(pt, rad + 2.6, rad + 2.6)
-            self._pen_key = None
+        if pb is None:  # one pen/brush per (colour, stale, heading known, outline): creating them per marker dominated the layer
+            alpha = STALE_ALPHA if n.stale else (255 if known or e.kind == "ai" else UNKNOWN_HEADING_ALPHA)
+            pen = QPen(_qcolor(st.outline, min(230, alpha)), 1.5) if outline else QPen(Qt.PenStyle.NoPen)
+            pb = self._marker_tools[key] = (pen, _qcolor(st.color, alpha))
         if self._pen_key != key:  # a run of equal markers (a crowd) sets pen and brush once
             p.setPen(pb[0])
             p.setBrush(pb[1])
             self._pen_key = key
-        if e.heading is not None:  # the source only gives a heading while the creature is moving (EntitySmoother.is_moving)
-            p.save()
-            p.translate(pt)
-            p.rotate(e.heading)
-            k = PEER_ARROW_SCALE * rad / 4.0
-            p.drawPolygon(QPolygonF([QPointF(0, -10 * k), QPointF(7 * k, 8 * k), QPointF(0, 4 * k), QPointF(-7 * k, 8 * k)]))
-            p.restore()
-        elif st.glyph == "diamond":
-            r = rad + 1
+        if e.kind == "ai":
+            r = marker_radius(e) + 1
             p.drawPolygon(QPolygonF([pt + QPointF(0, -r), pt + QPointF(r, 0), pt + QPointF(0, r), pt + QPointF(-r, 0)]))
-        else:
-            p.drawEllipse(pt, rad, rad)
+            return
+        x, y = pt.x(), pt.y()
+        p.translate(x, y)  # a cached polygon moved by the painter: cheaper than building 4 points per arrow and frame
+        p.drawPolygon(_arrow_polygon(round(e.heading / 3.0) % 120 if known else 0))
+        p.translate(-x, -y)
 
     def _draw_edge_indicators(self, p: QPainter, offscreen: list[tuple[Nearby, QPointF]],
                               far: list[tuple[Nearby, QPointF]] = ()) -> None:
@@ -614,7 +623,7 @@ class MapView(QWidget):
             if a is None:
                 continue
             e = n.entity
-            who = e.name if e.name and not is_placeholder_name(e.name) else (e.species or "?")
+            who = e.name if e.name and not is_placeholder_name(e.name) else species_text(e)
             text = f"{truncate(who, 12)} {format_distance(n.distance_m)}"
             w, h = fm.horizontalAdvance(text) + 6, fm.height()
             ux, uy = (a[0] - cx) / r, (a[1] - cy) / r  # unit vector outward

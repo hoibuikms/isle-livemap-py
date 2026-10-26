@@ -62,7 +62,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
     import isle_livemap.decode as decode
     import isle_livemap.overlay as overlay
     from isle_livemap.capture import Datagram, TelemetryPipeline
-    from isle_livemap.geo import DR_MAX_EXTRAP_S, MarkerStore, Settings
+    from isle_livemap.geo import MarkerStore, Settings
     from isle_livemap.overlay import MapView
     from isle_livemap.peers import GamePeerSource
     from isle_livemap.replay import pcap_datagrams
@@ -190,7 +190,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
                     continue
                 srv = (p.entity.x, p.entity.y)
                 v = view.ents._vel.get(e.id)
-                allowed = (math.hypot(v[0], v[1]) * DR_MAX_EXTRAP_S if v else 0.0) + 300.0
+                allowed = (math.hypot(v[0], v[1]) * v[2] if v else 0.0) + 300.0
                 d = dist((n.x, n.y), srv)
                 if d > allowed:
                     drift_s += sample_dt

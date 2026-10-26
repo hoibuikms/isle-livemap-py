@@ -18,9 +18,8 @@ import pytest
 from isle_livemap.decode import (
     ACTOR_STATE_HEADER_BITS, Bits, IrisBatch, PawnVitalsTracker, creation_max_health,
 )
-from isle_livemap.geo import DIET_STYLE, ENTITY_STYLE, NEUTRAL_DINO_STYLE, Entity, EntitySmoother, peer_style
+from isle_livemap.geo import ENTITY_STYLE, Entity, EntitySmoother, peer_style
 from isle_livemap.replay import BitWriter
-from isle_livemap.species import diet_of
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
@@ -223,20 +222,13 @@ def test_a_creature_that_never_moved_has_no_arrow():
 
 
 # ---------------------------------------------------------------- colours
-def test_diet_by_species_ignores_case_marks_and_rex():
-    assert diet_of("Deinosuchus") == "carnivore" and diet_of("deinosuchus~") == "carnivore"
-    assert diet_of("TyrannosaurusRex") == "carnivore" and diet_of("Stegosaurus") == "herbivore"
-    assert diet_of("Gallimimus") == "omnivore" and diet_of("Zzzsaurus") == "" and diet_of(None) == ""
-
-
-def test_players_are_cyan_dinosaurs_by_diet_unknown_neutral_animals_muted():
+def test_every_dinosaur_and_player_is_one_purple_style_animals_muted():
     assert peer_style(entity(kind="player", species="Deinosuchus")) is ENTITY_STYLE["player"]
-    assert peer_style(entity(species="Allosaurus")) is DIET_STYLE["carnivore"]
-    assert peer_style(entity(species="Triceratops~")) is DIET_STYLE["herbivore"]
-    assert peer_style(entity(species="")) is NEUTRAL_DINO_STYLE and peer_style(entity(kind="unknown", species="")) is NEUTRAL_DINO_STYLE
+    assert peer_style(entity(species="Allosaurus")) is peer_style(entity(species="Triceratops~")) is ENTITY_STYLE["player"]
+    assert peer_style(entity(species="")) is peer_style(entity(kind="unknown", species="")) is ENTITY_STYLE["player"]
     assert peer_style(entity(kind="ai", species="Longear")) is ENTITY_STYLE["ai"]
-    colours = {s.color for s in (*DIET_STYLE.values(), NEUTRAL_DINO_STYLE, ENTITY_STYLE["player"], ENTITY_STYLE["ai"], ENTITY_STYLE["self"])}
-    assert len(colours) == 7  # every meaning has its own colour
+    colours = {s.color for s in (ENTITY_STYLE["player"], ENTITY_STYLE["ai"], ENTITY_STYLE["self"])}
+    assert len(colours) == 3  # yours, another player's dinosaur, an animal
 
 
 # ---------------------------------------------------------------- drawn: bars under the dot, halo
@@ -269,10 +261,10 @@ def one_dino(health):
     return lambda view: [Entity("1", "dino", "", "Allosaurus", view.interp.x + 15_000.0, view.interp.y, 30_000.0, health_pct=health)]
 
 
-def test_a_dinosaur_is_drawn_in_its_diet_colour(tmp_path):
+def test_a_dinosaur_is_drawn_in_the_one_peer_colour_whatever_its_species(tmp_path):
     view, img = render(tmp_path, one_dino(None))
     sx, sy = _screen(view, 15_000.0)
-    assert colour_near(img, sx, sy, (255, 126, 182), r=7)  # carnivore pink
+    assert colour_near(img, sx, sy, (162, 77, 255), r=7, tol=70)  # purple, not the diet pink it used to be
 
 
 def _screen(view, dx_cm):

@@ -6,7 +6,7 @@ import math
 import pytest
 
 from isle_livemap.geo import (
-    ENTITY_STYLE, PEER_STALE_S, PEER_TTL_S, Entity, EntitySmoother, Settings, canonical_id, edge_anchor,
+    ENTITY_STYLE, PEER_STALE_S, PEER_TTL_S, Entity, EntitySmoother, Interpolator, Settings, canonical_id, edge_anchor,
     entity_label_lines, is_self, local_entity, nearby_3d, nearby_entities, peer_label_lines, shortest_arc,
     visible_entities,
 )
@@ -104,14 +104,14 @@ def test_entity_heading_normalised():
 def test_labels_omit_unknown_fields_and_fall_back_to_the_id():
     n = visible_entities(items(E("12", 25_000, name="", health_pct=40.0)), 0, 0)[0]
     head, tail = entity_label_lines(n)
-    assert head == "12 - ? - 250 m" and tail == "40% - HP ? - ST ?"  # geo falls back to the id; the species is not known: "?"
+    assert head == "12 - Dino - 250 m" and tail == "40% - HP – - ST –"  # geo falls back to the id; the species is not known: "Dino"
     assert peer_label_lines(n) == [head, tail]
     grown = visible_entities(items(E("12", 25_000, name="", health_pct=40.0, stamina_pct=30.0, growth_pct=75.0)), 0, 0)[0]
-    assert peer_label_lines(grown) == ["12 - ? - 250 m", "40% - HP ? - ST 30%"]  # growth of others is never printed
+    assert peer_label_lines(grown) == ["12 - Dino - 250 m", "40% - HP – - ST 30%"]  # growth of others is never printed
     bare = visible_entities(items(E("1", 10)), 0, 0)[0]
-    assert peer_label_lines(bare) == list(entity_label_lines(bare))
+    assert peer_label_lines(bare) == [line for line in entity_label_lines(bare) if line]
     long = visible_entities(items(E("1", 10, name="X" * 40)), 0, 0)[0]
-    assert entity_label_lines(long)[0] == "X" * 15 + "… - ? - 0 m"  # the name is cut to 16 characters; the species follows
+    assert entity_label_lines(long)[0] == "X" * 15 + "… - Dino - 0 m"  # the name is cut to 16 characters; the species follows
 
 
 # ---- T10
@@ -175,14 +175,43 @@ def test_dead_reckoning_cuts_the_lag_behind_a_walking_actor():
     assert dr < plain / 3 and dr < 90.0  # what is left is the filter lag tau * speed (~72 cm)
 
 
-def test_dead_reckoning_is_bounded_so_a_stop_is_not_overshot_by_more_than_one_interval():
+def test_dead_reckoning_is_bounded_so_a_stop_is_not_overshot_by_more_than_two_intervals():
     s = EntitySmoother(tau_s=0.09)
     s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
     s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)  # 800 cm/s, then silence (the actor stopped, nothing more is sent)
     for i in range(1, 600):
         s.step(0.016, 0.5 + i * 0.016)
-    assert s.pos["a"][0] == pytest.approx(400.0 + 800.0 * 0.5, abs=1.0)  # horizon = the measured 0.5 s interval
-    assert s.target("a", 1000.0)[0] == pytest.approx(800.0)  # and it never grows after that
+    assert s.pos["a"][0] == pytest.approx(400.0 + 800.0 * 1.0, abs=1.0)  # horizon = twice the measured 0.5 s interval
+    assert s.target("a", 1000.0)[0] == pytest.approx(1200.0)  # and it never grows after that
+
+
+def test_peer_horizon_is_capped_at_three_seconds_and_the_own_marker_keeps_one_interval():
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
+    s.update([PeerEntity(E("a", 1600.0), 2.0)], now=2.0)  # 800 cm/s measured over 2 s: twice that would be 4 s
+    assert s.target("a", 1000.0)[0] == pytest.approx(1600.0 + 800.0 * 3.0)
+    i = Interpolator(tau_s=0.09)
+    i.set_target(0.0, 0.0, None, at=0.0)
+    i.set_target(400.0, 0.0, None, at=0.5)
+    assert i._vel is not None and i._vel[2] == pytest.approx(0.5)  # the own marker: one interval, as before
+
+
+def test_samples_are_timed_by_the_packet_not_by_when_the_store_was_refreshed():
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 1.0, sample_at=0.0)], now=1.0)
+    s.update([PeerEntity(E("a", 400.0), 1.6, sample_at=0.5)], now=1.6)  # decoded 0.6 s late: still a 0.5 s interval
+    assert s._vel["a"][0] == pytest.approx(800.0)
+    assert s.target("a", 0.7)[0] == pytest.approx(560.0)  # the sample is as old as its packet says, not as the refresh
+
+
+def test_a_refresh_without_a_new_position_does_not_say_the_creature_stopped():
+    s = EntitySmoother(tau_s=0.09)
+    s.update([PeerEntity(E("a", 0.0), 0.0, sample_at=0.0)], now=0.0)
+    s.update([PeerEntity(E("a", 400.0), 0.5, sample_at=0.5)], now=0.5)
+    s.update([PeerEntity(E("a", 400.0), 0.9, sample_at=0.5)], now=0.9)  # a state batch without a position: same sample
+    assert "a" in s._vel
+    s.update([PeerEntity(E("a", 400.0), 1.4, sample_at=1.4)], now=1.4)  # a new sample at the same spot: it stopped
+    assert "a" not in s._vel
 
 
 def test_dead_reckoning_is_off_without_a_clock_for_gaps_teleports_and_a_resend_at_the_same_spot():
@@ -219,9 +248,9 @@ def test_nearby_stale_threshold_follows_the_source():
 
 def test_peer_label_includes_known_vitals_only_in_order():
     n = visible_entities(items(E("1", 25_000, health_pct=92.4, growth_pct=40.0, z=13_000.0)), 0, 0)[0]
-    assert peer_label_lines(n, my_z=10_000.0) == ["P1 - ? - 250 m", "92% - HP ? - ST ?"]  # growth is never printed
+    assert peer_label_lines(n, my_z=10_000.0) == ["P1 - Dino - 250 m", "92% - HP – - ST –"]  # growth is never printed
     n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
-    assert peer_label_lines(n) == ["P1 - ? - 250 m", "? - HP ? - ST ?"]  # a player whose health was never read says so
+    assert peer_label_lines(n) == ["P1 - Dino - 250 m"]  # a player whose health was never read has no second line
 
 
 def test_lead_cancels_the_filter_lag_behind_a_walking_actor():
@@ -233,4 +262,4 @@ def test_target_lead_stays_inside_the_horizon():
     s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
     s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)
     assert s.target("a", 0.5, 0.09)[0] == pytest.approx(400.0 + 800.0 * 0.09)
-    assert s.target("a", 9.0, 0.09)[0] == pytest.approx(800.0)  # horizon (0.5 s) still caps it
+    assert s.target("a", 9.0, 0.09)[0] == pytest.approx(1200.0)  # horizon (twice 0.5 s) still caps it

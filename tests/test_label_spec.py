@@ -32,23 +32,23 @@ def test_a_dinosaur_without_a_player_name_has_the_same_two_line_shape():
     assert peer_label_lines(Nearby(e, 0.0, 0.0, 120.0, 0.0)) == ["Carnotaurus - 120 m", "100% - HP 900 - ST 50%"]
 
 
-def test_unknown_values_are_question_marks_never_guesses():
+def test_unknown_values_are_dino_and_dashes_never_guesses():
     e = E("3", "player", name="Rex Fan", species="")
-    assert peer_label_lines(Nearby(e, 0.0, 0.0, 724.0, 0.0)) == ["Rex Fan - ? - 724 m", "? - HP ? - ST ?"]
+    assert peer_label_lines(Nearby(e, 0.0, 0.0, 724.0, 0.0)) == ["Rex Fan - Dino - 724 m"]  # nothing was read: no second line
     only_pct = E("3", "player", name="Rex Fan", species="Allosaurus", health_pct=40.0)  # no maximum: the points are not known
-    assert peer_label_lines(Nearby(only_pct, 0.0, 0.0, 10.0, 0.0))[1] == "40% - HP ? - ST ?"
+    assert peer_label_lines(Nearby(only_pct, 0.0, 0.0, 10.0, 0.0))[1] == "40% - HP – - ST –"
 
 
 def test_an_old_reading_keeps_its_values_and_gets_an_age_tag():
     e = E("4", health_pct=70.0, stamina_pct=20.0, max_health=1000.0)
     assert vitals_line(e, VITALS_STALE, 130.0) == "70% - HP 700 - ST 20% [2m+]"
-    assert vitals_line(E("4"), VITALS_STALE, 130.0) == "? - HP ? - ST ?"  # nothing was ever read: no age tag
+    assert vitals_line(E("4"), VITALS_STALE, 130.0) == ""  # nothing was ever read: no line at all
 
 
 def test_server_animals_say_ai_and_their_name_in_one_line():
     assert peer_label_lines(Nearby(E("5", "ai", species="Catfish"), 0.0, 0.0, 120.0, 0.0)) == ["AI - Catfish - 120 m"]
     assert peer_label_lines(Nearby(E("5", "ai", species="Forktail"), 0.0, 0.0, 1500.0, 0.0)) == ["AI - Forktail - 1.5 km"]
-    assert peer_label_lines(Nearby(E("5", "ai", species=""), 0.0, 0.0, 120.0, 0.0)) == ["AI - ? - 120 m"]
+    assert peer_label_lines(Nearby(E("5", "ai", species=""), 0.0, 0.0, 120.0, 0.0)) == ["AI - Animal - 120 m"]
 
 
 def test_the_label_has_no_compass_or_height_they_are_in_the_table_and_the_summary():

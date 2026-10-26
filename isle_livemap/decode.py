@@ -115,6 +115,11 @@ def _read_signed(bits: Bits, offset: int, count: int) -> int:
     return (value ^ sign) - sign
 
 
+def vector_to_cm(raw, scale: float = 1.0) -> tuple[float, float, float]:
+    """FVector_NetQuantize100 integers -> Unreal cm: the single place for the /100 (and the creation-record scale)."""
+    return (raw[0] / 100.0 * scale, raw[1] / 100.0 * scale, raw[2] / 100.0 * scale)
+
+
 def _bits_needed(value: int) -> int:
     # value ^ (value >> 63) in the 64-bit original: ~value for negatives.
     massaged = ~value if value < 0 else value
@@ -206,7 +211,7 @@ def decode_movement(payload: bytes) -> list[MovementCandidate]:
         rz = _read_signed(bits, base + comp * 2, comp)
         if not _canonical(rx, ry, rz, comp):
             continue
-        x, y, z = rx / 100.0, ry / 100.0, rz / 100.0
+        x, y, z = vector_to_cm((rx, ry, rz))
         if not _plausible_world(x, y, z):
             continue
         ts = _read_move_prefix(bits, off)
@@ -766,7 +771,7 @@ def decode_creation(bits: Bits, batch: IrisBatch) -> Creation | None:
         comp = None if header is None else header & 63
         if header is not None and header & 64 and _MIN_COMP_BITS <= comp <= _MAX_COMP_BITS and r.pos + 3 * comp <= r.limit:
             raw = [_read_signed(bits, r.pos + comp * i, comp) for i in range(3)]
-            x, y, z = (v / 100.0 * CREATION_LOCATION_SCALE for v in raw)
+            x, y, z = vector_to_cm(raw, CREATION_LOCATION_SCALE)
             if _canonical(*raw, comp) and _plausible_world(x, y, z):
                 location = (x, y, z)
                 r.pos += 3 * comp
@@ -912,6 +917,9 @@ class IdentityTracker:
         if self.class_cache is not None:
             source = self.class_cache.source(info.protocol_id)
             if source is not None:
+                folder = self.archetype_species(info.archetype_handle)
+                if folder and folder_species(self.class_cache.lookup(info.protocol_id)) == folder:
+                    return "asset"  # the remembered class is the one this connection's own creation assets name: confirmed
                 return source
         return "asset" if self.archetype_species(info.archetype_handle) or info.asset_species else None
 
@@ -1149,7 +1157,7 @@ def _vector_at(bits: Bits, base: int, n: int, offset: int, min_comp: int,
     raw = [_read_signed(bits, start + comp * i, comp) for i in range(3)]
     if not _canonical(raw[0], raw[1], raw[2], comp):
         return None
-    x, y, z = raw[0] / 100.0, raw[1] / 100.0, raw[2] / 100.0
+    x, y, z = vector_to_cm(raw)
     return (comp, x, y, z) if _plausible_world(x, y, z if check_z else 0.0) else None
 
 
@@ -1208,6 +1216,22 @@ class ActorLocationTracker:
     # moving like a creature between two batches. Both must hold in two consecutive batches of the same actor.
     BOOT_RADIUS = 100_000.0  # cm around the local player
     MAX_BOOT = 5_000
+    # A creature that rested sends its next state many seconds later: the same vector offset of the same state header must
+    # continue (within walking speed) twice in a row before the position is believed.
+    BOOT_LONG_GAP = 45.0  # s
+    BOOT_LONG_SPEED = 1_600.0  # cm/s, 16 m/s: a running dinosaur
+    BOOT_LONG_HITS = 2
+    BOOT_SPARSE = 2  # candidates per batch at most for the offset-free rule
+    # The short-gap rule accepts any vector within 20 m + 100 m/s of the previous batch's candidates: loose enough that one
+    # coincidence among the many offsets of many creatures is not impossible, so the first dot of a creature with no anchor
+    # needs this many consistent samples in a row. The long-silence rules are strict already (the same offset twice, or one
+    # or two candidates per batch continuing at walking speed over seconds) and keep their own count.
+    BOOT_SAMPLES = 3
+    # The world origin (0, 0) is where a not yet spawned or just teleported pawn is reported and where unrelated state
+    # (offsets, defaults) decodes to: a bootstrap result there is only believed when the local player is there too.
+    ORIGIN_EXCLUDE_CM = 40_000.0  # 400 m around the world origin ...
+    ORIGIN_EXCLUDE_Z_CM = 20_000.0  # ... below 200 m ...
+    ORIGIN_FAR_CM = 100_000.0  # ... while the local player is further than 1 km from it
 
     def __init__(self) -> None:
         self.reset()
@@ -1216,7 +1240,8 @@ class ActorLocationTracker:
         self._last: dict[int, tuple[float, float, float, float]] = {}  # handle -> (t, x, y, z)
         self._votes: Counter = Counter()
         self._trusted: dict[int, set[int]] = {}  # header -> trusted vector offsets
-        self._boot: dict[int, tuple[float, list[tuple[int, float, float, float]]]] = {}  # handle -> (t, candidates)
+        self._boot: dict[int, tuple[float, list, int, dict]] = {}  # handle -> (t, [(offset, vector)], state header, hits per offset)
+        self._boot_run: dict[int, int] = {}  # handle -> consecutive consistent samples of the short / sparse rules
         self.fixed = self.learned = self.rejected = self.bootstrapped = 0
 
     @property
@@ -1236,35 +1261,82 @@ class ActorLocationTracker:
     def forget(self, handle: int) -> None:
         self._last.pop(handle, None)
         self._boot.pop(handle, None)
+        self._boot_run.pop(handle, None)
+
+    def _near_world_origin(self, vec, ox: float, oy: float) -> bool:
+        """``vec`` (comp, x, y, z) is in the world-origin dead zone while the local player (ox, oy) is far from it."""
+        return (math.hypot(vec[1], vec[2]) <= self.ORIGIN_EXCLUDE_CM and vec[3] < self.ORIGIN_EXCLUDE_Z_CM
+                and math.hypot(ox, oy) > self.ORIGIN_FAR_CM)
 
     def bootstrap(self, bits: Bits, batch: IrisBatch, t: float,
                   origin: tuple[float, float, float] | None) -> ActorLocation | None:
-        """Position of an actor without an anchor: a vector of its state batch near ``origin`` (the local player) that
-        continues one of the previous batch's candidates at creature speed. The accepted position anchors the actor."""
+        """Position of an actor without a usable anchor (none, or older than ``ANCHOR_LIFETIME``): a vector of its state
+        batch near ``origin`` (the local player) that continues one of the previous batch's candidates at creature speed.
+        Two consecutive batches within ``MAX_GAP`` s are enough; a longer silence (a creature that rested) needs the same
+        vector offset of the same state header to continue twice in a row. The accepted position anchors the actor."""
         handle, n = batch.net_ref_handle, batch.data_bit_count
-        if origin is None or handle in self._last or n < self.SCAN_FROM + self.SCAN_TAIL:
+        if origin is None or n < self.SCAN_FROM + self.SCAN_TAIL:
             return None
+        last = self._last.get(handle)
+        if last is not None and 0.0 <= t - last[0] <= self.ANCHOR_LIFETIME:
+            return None  # anchored: ``update`` follows it
         base, ox, oy, oz = batch.data_bit_offset, *origin
+        header = bits.read(base, ACTOR_STATE_HEADER_BITS)
         cands = []
         for off in range(self.SCAN_FROM, n - self.SCAN_TAIL):
             vec = _vector_at(bits, base, n, off, self.MIN_COMP)
             if vec is not None and math.hypot(vec[1] - ox, vec[2] - oy) <= self.BOOT_RADIUS \
-                    and abs(vec[3] - oz) <= self.BOOT_RADIUS / 2:
-                cands.append(vec)
+                    and abs(vec[3] - oz) <= self.BOOT_RADIUS / 2 and not self._near_world_origin(vec, ox, oy):
+                cands.append((off, vec))
         prev = self._boot.get(handle)
         if len(self._boot) >= self.MAX_BOOT:
             self._boot.clear()
         if not cands:
             return None
-        self._boot[handle] = (t, cands)
-        if prev is None or not 0.0 <= t - prev[0] <= self.MAX_GAP:
+        hits: dict[int, int] = {}
+        found = None
+        chained = False  # found by the loose short-gap rule: it needs BOOT_SAMPLES consistent samples in a row
+        if prev is not None and 0.0 <= t - prev[0] <= self.BOOT_LONG_GAP:
+            dt = t - prev[0]
+            if dt <= self.MAX_GAP:
+                radius = self._radius(dt)
+                found = min(((math.dist(c[1][1:], q[1][1:]), c[1]) for c in cands for q in prev[1]
+                             if math.dist(c[1][1:], q[1][1:]) <= radius and c is not q), key=lambda r: r[0], default=None)
+                # a match inside the tight radius (walking pace: chance about 10^-7 per offset) stands on two samples;
+                # a loose one (up to 20 m + 100 m/s) needs a third
+                chained = found is not None and found[0] > self.TIGHT_SLACK + self.TIGHT_SPEED * dt
+            if found is None and prev[2] == header:
+                tight = self.TIGHT_SLACK + self.BOOT_LONG_SPEED * dt
+                before = {off: vec for off, vec in prev[1]}
+                for off, vec in cands:
+                    q = before.get(off)
+                    if q is not None and math.dist(vec[1:], q[1:]) <= tight:
+                        hits[off] = prev[3].get(off, 0) + 1
+                        if hits[off] >= self.BOOT_LONG_HITS and (found is None or hits[off] > found[0]):
+                            found = (hits[off], vec)
+            if found is None and dt > self.MAX_GAP and len(cands) <= self.BOOT_SPARSE and len(prev[1]) <= self.BOOT_SPARSE:
+                # The fields before the position change size from batch to batch, so its offset moves; but a batch with
+                # one or two vectors within 1 km of the player is nearly always a creature's position, and two such
+                # batches that continue each other at walking speed are the same creature.
+                tight = self.TIGHT_SLACK + self.BOOT_LONG_SPEED * dt
+                pairs = [(math.dist(c[1][1:], q[1][1:]), c[1]) for c in cands for q in prev[1]
+                         if math.dist(c[1][1:], q[1][1:]) <= tight]
+                if pairs:
+                    found = min(pairs, key=lambda r: r[0])  # strict already (walking speed over seconds, one or two candidates)
+        if found is None:
+            self._boot_run.pop(handle, None)  # the chain is broken: start counting again
+            self._boot[handle] = (t, cands, header, hits)
             return None
-        radius = self._radius(t - prev[0])
-        best = min(((math.dist(c[1:], q[1:]), c) for c in cands for q in prev[1]
-                    if math.dist(c[1:], q[1:]) <= radius and c is not q), key=lambda r: r[0], default=None)
-        if best is None:
-            return None
-        vec = best[1]
+        vec = found[1]
+        if chained:
+            run = self._boot_run.get(handle, 0) + 1
+            if run < self.BOOT_SAMPLES - 1:
+                # Two samples agree; the third must continue this very vector, so the next round only compares with it.
+                off = next((o for o, v in cands if v is vec), self.SCAN_FROM)
+                self._boot_run[handle] = run
+                self._boot[handle] = (t, [(off, vec)], header, {})
+                return None
+        self._boot_run.pop(handle, None)
         self._boot.pop(handle, None)
         self._last[handle] = (t, vec[1], vec[2], vec[3])
         self.bootstrapped += 1

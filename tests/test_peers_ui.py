@@ -78,10 +78,10 @@ def test_peers_in_view_are_listed_and_rendered(tmp_path):
     assert [n.entity.id for n in got] == ["1", "2"] and view.peer_status == "fake: ok"
     img = view.grab().toImage()
     assert not img.isNull()
-    # the marker is cyan: blue and green clearly above red at the peer's pixel
+    # the marker is the purple peer arrow: blue clearly above red, green low at the peer's pixel
     x, y = px(view, got[0].x, got[0].y)
     c = img.pixelColor(x, y)
-    assert c.blue() > 150 and c.green() > 120 and c.red() < 120
+    assert c.blue() > 150 and c.red() > 100 and c.green() < 120
 
 
 def test_local_arrow_is_drawn_over_a_peer_at_the_same_spot(tmp_path):
@@ -119,13 +119,13 @@ def test_off_view_peer_gets_edge_indicator_and_beyond_radius_gets_nothing(tmp_pa
     pt = px(view, n.x, n.y)
     assert ((pt[0] - view.width() / 2) ** 2 + (pt[1] - view.height() / 2) ** 2) ** 0.5 > view.width() / 2  # off view
     # indicator sits straight north of the centre, on the circle edge: compare with the same frame without peers
-    def cyan_near_top(view):
+    def purple_near_top(view):
         img = view.grab().toImage()
         return sum(1 for xx in range(view.width() // 2 - 10, view.width() // 2 + 10) for yy in range(0, 20)
-                   if (c := img.pixelColor(xx, yy)).blue() > 200 and c.green() > 170 and c.red() < 110)
+                   if (c := img.pixelColor(xx, yy)).blue() > 200 and c.green() < 120 and c.red() > 110)
 
-    with_peer = cyan_near_top(view)
-    without = cyan_near_top(make_view(tmp_path, settings=Settings(zoom=4.0)))
+    with_peer = purple_near_top(view)
+    without = purple_near_top(make_view(tmp_path, settings=Settings(zoom=4.0)))
     assert with_peer >= without + 8, (with_peer, without)
 
 

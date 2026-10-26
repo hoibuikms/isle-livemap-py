@@ -5,11 +5,11 @@ Species   confirmed  this connection named it: the server's export tables, or th
                      records reference (the report says which: species source "table" / "asset")
           inferred   a class remembered from earlier sessions (saved class cache / shipped seed): shown with "~" and
                      drawn softer
-          unknown    nothing is known: shown as "?"
+          unknown    nothing is known: shown as "Dino" ("Animal" for a server animal), drawn softer
 Name      a player name is only ever shown when the creature references its PlayerState; otherwise there is none
 Vitals    known      a full attribute block was seen (so the maxima are real) and the value is younger than VITALS_FRESH_S
           stale      the same value, older: shown with how old it is
-          none       never seen for this creature: "HP ?"
+          none       never seen for this creature: the second line is left out; a part of it that is missing shows an en dash
 Growth, hunger and thirst of other creatures are not replicated to us: they are never shown, not even as "?".
 
 Pure functions only (no Qt, no geo import), so the minimap, the Nearby table, the session log and tools/label_report.py

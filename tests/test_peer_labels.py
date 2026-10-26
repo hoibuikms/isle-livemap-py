@@ -26,21 +26,21 @@ def test_creature_without_a_player_name_is_labelled_by_species_not_by_handle():
 def test_server_animals_are_labelled_ai_and_their_name():
     assert entity_label_lines(near("ai", "Actor #5", "Catfish", dist=120.0)) == ("AI - Catfish - 120 m", "")
     assert entity_label_lines(near("ai", "Actor #5", "Forktail"))[0] == "AI - Forktail - 100 m"
-    assert entity_label_lines(near("ai", "Actor #5", ""))[0] == "AI - ? - 100 m"  # no class known
+    assert entity_label_lines(near("ai", "Actor #5", ""))[0] == "AI - Animal - 100 m"  # no class known
 
 
 def test_named_player_label_is_name_species_distance():
     assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus", dist=724.0))[0] == "Rex Fan - Deinosuchus - 724 m"
     assert entity_label_lines(near("player", "Rex Fan", "Deinosuchus", inferred=True))[0] == "Rex Fan - Deinosuchus~ - 100 m"
-    assert entity_label_lines(near("player", "Some Name", ""))[0] == "Some Name - ? - 100 m"  # a name, but no species yet
+    assert entity_label_lines(near("player", "Some Name", ""))[0] == "Some Name - Dino - 100 m"  # a name, but no species yet
 
 
 def test_unidentified_creature_says_unknown():
     def nearby(kind, eid, name):
         return Nearby(Entity(eid, kind, name, "", 0.0, 0.0), 0.0, 0.0, 100.0, 0.0)
 
-    assert entity_label_lines(nearby("unknown", "9", "Unknown #9"))[0] == "Creature ? - 100 m"
-    assert entity_label_lines(nearby("dino", "9", "Actor #9"))[0] == "Dino ? - 100 m"
+    assert entity_label_lines(nearby("unknown", "9", "Unknown #9"))[0] == "Dino - 100 m"
+    assert entity_label_lines(nearby("dino", "9", "Actor #9"))[0] == "Dino - 100 m"
 
 
 # ---------------------------------------------------------------- who gets a label
