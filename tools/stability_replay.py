@@ -454,6 +454,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
     for t, eid, text, anchor, rect in label_log:
         by_id[eid].append((t, text, anchor, rect))
     hops = reversals = toggles = n_labels = flipflops = 0
+    hops_by: dict[str, int] = defaultdict(int)  # which labels hop (the budget is a rate over all of them)
     flip_examples: list = []
     paint_ts = sorted({t for t, *_ in label_log})
     painted_by = defaultdict(set)
@@ -468,6 +469,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
             slot = "below" if ry >= ay else "above" if ry + rh <= ay else ("right" if rx >= ax else "left")
             if "slot" in last and last["slot"] != slot and t - last["t"] < 1.0:
                 hops += 1
+                hops_by[eid] += 1
             last = {"slot": slot, "t": t}
             recent = (recent + [(t, slot)])[-3:]
             if len(recent) == 3 and recent[0][1] == recent[2][1] != recent[1][1] and recent[2][0] - recent[0][0] < 2.0:
@@ -488,7 +490,8 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
     out["label"] = {"placed": n_labels, "slot_hops_per_min": round(hops / minutes, 2),
                     "slot_flipflops_per_min": round(flipflops / minutes, 2),
                     "text_reversals_per_min": round(reversals / minutes, 2), "on_off_toggles_per_min": round(toggles / minutes, 2),
-                    "flipflop_examples": flip_examples}
+                    "flipflop_examples": flip_examples,
+                    "hops_by_actor": dict(sorted(hops_by.items(), key=lambda kv: -kv[1])[:5])}
 
     # ---- decode time and the backlog a single worker would have
     ms = [m for _, m, _ in decode_ms]

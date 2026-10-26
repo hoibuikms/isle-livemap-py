@@ -622,3 +622,61 @@ What it showed, on the recorded connections that have creatures:
 Positions that are only the creation record's spawn point stay marked (`~` before the distance, dimmed): 13 % of the
 creature-seconds within 500 m in `C4`, 56 % in the first connection of `C5`. Most of them are creatures that have not moved,
 for which the spawn point is right, but nothing in the stream says which.
+
+## Are other creatures' positions exact? (capture `C6`, and a check on eight connections)
+
+The user reported other players' positions as wrong. Checked three independent ways; the decoder, the x16 creation scale and
+the frame are exact, and two follow defects (a creature not followed for 30-70 s, then 47-160 m away) are fixed.
+
+**1. A full-precision copy of another creature's position does not exist in the stream.** The server's own copy of the *own*
+location (three doubles, `decode.find_server_locations`) was found 35 times in `C6`, every one within 5 m of the own position.
+A scan of every inbound packet at all eight bit alignments for any double within 3 m of a decoded x or y of another creature
+finds 1066 coincidences, and none has a y and z beside it: the neighbouring doubles are constant garbage bytes (they are
+time-like fields that happen to be near 1350 m). So there is nothing to calibrate other creatures against except the next
+check.
+
+**2. The creation record is a second, independent measurement of the same position.** An actor that has not moved is where its
+creation record (x16 scale) says it is, so its first decoded state position within 6 s of the record must agree. 171 creatures in
+eight recorded connections (`C6` and seven older ones): median difference 0.6 m, 75th percentile 3.2 m, 90th 8.9 m,
+and many exactly 0.0 m (the rest moved during the 1-6 s). Regressing the live position on the creation position gives a scale of
+1.0003 (x) and 0.9997 (y) and an offset of -0.66 m and -0.41 m: no scale, offset, axis or origin error, over positions from
+0.7 to 6.1 km east of the world origin. In `C6` alone: 0.0-0.9 m for five of nine creatures, 6.6-36.8 m for the four that walked in
+the 1.4-2.9 s between the record and the first position update. A creature that sent no position for 53-56 s after its creation
+record was still within 0.1-0.5 m of its spawn point, so a spawn-only position is right for a creature that has not moved
+(`pos_source == "spawn"` stays marked `~`: the stream cannot say who moved).
+
+**3. Where the app was wrong: a creature it stopped following.** Two cases in `C6`, both a creature that was on the map and then
+frozen for 30-40 s while every batch of it carried a clean 26 bit position vector (a smooth track of 5-6 m per 1.5 s):
+
+* **A destroyed handle that goes on sending state.** The server destroyed the creature of a named player (P1, handle 400358) at 77.0 s (it left the
+  relevancy range) and the same handle sent a state batch every 0.3 s again from 115.6 s, with no creation record. The
+  destruction forgot the class and the PlayerState link, so the handle read as an unknown actor that is not creature-like until
+  its pawn-sized batches have been counted (12 batches, 80 % in the band): about 70 batches, 30 s. Until then no position was
+  followed (`learn=False`), the creature was absent from the map, and it came back 119 m away without its name. Now
+  `GamePeerSource._resume` restores the destroyed creature's kind, species and name from the `_zombies` entry made at the
+  destruction, marks the handle as a creature and anchors it at its last position (the `_zombies` entry now keeps z);
+  batches within 2 s of the destruction record (late packets) and after 600 s are not taken back, and a creation record that
+  comes later replaces all of it. Position fixes of that handle 152 -> 219; the first fix after the return is at 118.7 s
+  instead of 148.2 s; the batches with a continuing vector that were never used fell from 68 to 1.
+* **A creature the bootstrap placed once.** An actor without a creation record (it was created before the app started) is placed
+  by `ActorLocationTracker.bootstrap` after consecutive consistent batches, but the next batches were not followed (`learn` was
+  False for an unclassified actor until it counted as creature-like): placed at 88 s, next seen at 127 s, 162 m away. A creature
+  the bootstrap placed is now added to `_creatures` and followed from the next batch (fixes 37 -> 62, every 1.4-1.5 s).
+
+Measured on `C6` (`tools/stability_replay.py`): the largest distance between a dot and the newest position the server sent fell
+from 92 m to 9.4 m, the time beyond what dead reckoning allows from 2.0 s to 1.35 s; creature fixes 594 -> 689. On the other
+seven connections the fixes of dinosaurs and players are unchanged; unclassified creatures are followed more (one connection
++263 fixes) with plausible speeds (the fastest 37 m/s, a flyer). `tests/test_resume_follow.py` drives the real `_on_inbound` loop.
+
+**What is not an error but looks like one.** A network stall: at 92-96 s every creature of `C6` went silent for 3.7-3.9 s and the
+packets arrived as one burst, so five creatures show two position samples 0.07-0.09 s apart that are 3.5-14 m apart (50-180 m/s
+by arrival time). The positions are smooth; the arrival times are not. The smoother ignores samples closer than `DR_MIN_DT_S` and
+velocities above `DR_MAX_SPEED`, so no dot overshoots on it. Nothing in the stream carries the server's own time to fix this.
+
+**Remaining limits.** A creature that existed before the app started, never moved and has no class cannot be placed; a position
+that is only the spawn point is right only until the creature moves. In `C6` the 6 creature-record handles without a live fix
+are resting dinosaurs sending vitals batches (179 bit) and one pawn at the world origin (a spawning player, z rising 16 m/s).
+Absolute accuracy of another creature's position is the creation-record agreement above (0.6 m median); a pixel on the map is
+3.6 m, so a 50-80 m wide river is 14-22 pixels and an arrow on the bank can be a creature in the river within the update interval
+(0.3-1.5 s at 10-15 m/s) plus the map image's own error. To settle a case: stand next to a named player, note the clock time and
+both in-game map coordinates.

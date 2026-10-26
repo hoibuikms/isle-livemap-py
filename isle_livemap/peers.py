@@ -464,6 +464,7 @@ class GamePeerSource:
         # often keeps sending state afterwards without a new creation record (relevancy flapping): if it shows up near
         # where it was, it is that creature, not an unknown one.
         self._zombies: dict[int, tuple] = {}
+        self._resumed: set[int] = set()  # destroyed handles that went on sending state and were taken back (see ``_resume``)
         self._hidden_cache: tuple[float, list] = (-1e9, [])
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
         self.packets = 0  # inbound datagrams seen
@@ -521,6 +522,8 @@ class GamePeerSource:
         self._creatures.clear()
         self._shape.clear()
         self._past_own.clear()
+        self._zombies.clear()  # the handles of the old connection mean nothing now
+        self._resumed.clear()
         self._hidden_cache = (-1e9, [])
         self._headline = (-1e9, "")
 
@@ -756,12 +759,13 @@ class GamePeerSource:
             if len(self._zombies) >= self.ZOMBIE_MAX:
                 self._zombies.clear()
             self._zombies[handle] = (gone.kind, gone.species, "" if is_placeholder_name(gone.name) else gone.name, gone.inferred,
-                                     gone.x, gone.y, self._last_t)
+                                     gone.x, gone.y, self._last_t, gone.z or 0.0)
         if handle in self._past_own:  # the server removed the old body; the handle may be reused
             self._past_own.discard(handle)
             self._sync_owned()
         if self.store.remove(str(handle)):
             self.destroyed += 1
+        self._resumed.discard(handle)
         self.locator.forget(handle)
         self.pawn_vitals.forget(handle)
         self._vitals.pop(handle, None)
@@ -818,6 +822,7 @@ class GamePeerSource:
                 self._sync_owned()
             self.store.remove(str(handle))  # a reused handle is a new actor
             back = self._zombies.pop(handle, None)
+            self._resumed.discard(handle)
             self.pawn_vitals.forget(handle)
             self._vitals.pop(handle, None)
             self._vitals_t.pop(handle, None)
@@ -840,6 +845,8 @@ class GamePeerSource:
             if handle == self.own_handle:
                 continue
             kind, species, name = self._identity(handle)
+            if kind == sp.KIND_UNKNOWN and handle in self._zombies:
+                kind, species, name = self._resume(handle, t)
             if kind == sp.KIND_OTHER:
                 self.filtered_world_objects += 1
                 continue
@@ -882,6 +889,11 @@ class GamePeerSource:
                 # as soon as the same vector offset continues twice (ActorLocationTracker.bootstrap)
                 if self.store.get(str(handle)) is None or creature:
                     loc = self.locator.bootstrap(bits, batch, t, self._bootstrap_origin())
+                    if loc is not None and kind == sp.KIND_UNKNOWN:
+                        # It moved like a creature near the player in consecutive batches: it is followed from now on. Without
+                        # this an actor of the pawn size band (no creation record seen) was placed once and then ignored for
+                        # the ~40 s its batches needed to count as creature-like (recorded: 161 m behind when it was next seen).
+                        self._creatures.add(handle)
             if loc is not None:
                 self.locations += 1
                 self._profile.pop(handle, None)
@@ -901,6 +913,35 @@ class GamePeerSource:
                 if vit is not None:
                     upd = replace(upd, **self._vitals_fields(handle, vit), vitals_t=self._vitals_t.get(handle))
                 self.store.update(upd)
+
+    RESUME_MIN_S = 2.0  # a state batch this soon after the destruction record is a late packet, not a creature coming back
+    RESUME_MAX_S = 600.0
+
+    def _resume(self, handle: int, t: float) -> tuple[str, str, str]:
+        """(kind, species, name) of a handle the server destroyed that goes on sending state batches with no creation record.
+
+        Recorded: a named player's creature was destroyed (it left the relevancy range) and 38 s later the same handle sent a
+        state batch every 0.3 s again, each with a clean position vector continuing the old track, but never a creation
+        record. The class and the PlayerState link were gone with the destruction, so the handle read as an unknown actor
+        that is not creature-like until about 70 of its batches had been counted: no position was followed for 70 s and the
+        creature was missing from the map, then reappeared far from where it had been, without its name. The destroyed
+        creature's identity is restored and its last position anchors the search again; a creation record that comes later
+        replaces all of it (``_on_inbound``)."""
+        from . import species as sp
+
+        back = self._zombies.get(handle)
+        unknown = (sp.KIND_UNKNOWN, "", "")
+        if back is None or handle in self.identity.actors:
+            return unknown
+        age = t - back[6]
+        if not self.RESUME_MIN_S <= age <= self.RESUME_MAX_S:
+            return unknown
+        self._creatures.add(handle)  # a creature-like handle: its position layout is learned like a classified one
+        if handle not in self._resumed:
+            self._resumed.add(handle)
+            if age <= self.locator.ANCHOR_LIFETIME:
+                self.locator.note_creation(handle, (back[4], back[5], back[7] if len(back) > 7 else 0.0), back[6])
+        return back[0], back[1], back[2]
 
     def _revive(self, back, kind: str, species: str, name: str, location, t: float) -> tuple[str, str, str]:
         """The server destroyed a player's creature and created it again on the same handle (relevancy flapping), near where
