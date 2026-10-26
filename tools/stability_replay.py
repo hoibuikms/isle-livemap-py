@@ -28,6 +28,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from isle_livemap.peers import GamePeerSource  # noqa: E402
+
 FPS = 60.0
 SAMPLE_HZ = 20.0
 PAINT_HZ = 5.0
@@ -452,6 +454,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
     for t, eid, text, anchor, rect in label_log:
         by_id[eid].append((t, text, anchor, rect))
     hops = reversals = toggles = n_labels = flipflops = 0
+    flip_examples: list = []
     paint_ts = sorted({t for t, *_ in label_log})
     painted_by = defaultdict(set)
     for t, eid, *_ in label_log:
@@ -469,6 +472,8 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
             recent = (recent + [(t, slot)])[-3:]
             if len(recent) == 3 and recent[0][1] == recent[2][1] != recent[1][1] and recent[2][0] - recent[0][0] < 2.0:
                 flipflops += 1  # A -> B -> A within two seconds: the label flickered between two sides
+                if len(flip_examples) < 4:
+                    flip_examples.append((eid, round(t, 1), recent[0][1], recent[1][1], text))
             nums = tuple(int(x) for x in __import__("re").findall(r"(\d+)%", text))  # the percentages of the vitals line
             vals.append(nums)
         for a, b, c in zip(vals, vals[1:], vals[2:]):
@@ -482,7 +487,8 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
                 toggles += 1  # labelled, skipped exactly one paint, labelled again
     out["label"] = {"placed": n_labels, "slot_hops_per_min": round(hops / minutes, 2),
                     "slot_flipflops_per_min": round(flipflops / minutes, 2),
-                    "text_reversals_per_min": round(reversals / minutes, 2), "on_off_toggles_per_min": round(toggles / minutes, 2)}
+                    "text_reversals_per_min": round(reversals / minutes, 2), "on_off_toggles_per_min": round(toggles / minutes, 2),
+                    "flipflop_examples": flip_examples}
 
     # ---- decode time and the backlog a single worker would have
     ms = [m for _, m, _ in decode_ms]
@@ -513,12 +519,14 @@ def _get(r: dict, path: str):
     return r
 
 
+GHOST_BUDGET_S = GamePeerSource.GHOST_GRACE_S + 1.0  # a destroyed player / dinosaur may stay as a dimmed, labelled ghost this long
+
 # (path, limit, "max" = must not exceed the limit). Limits are relative to the dot that stays on the newest sample
 # ("hold") where the server's send interval sets the floor.
 BUDGETS = (
     ("tick_exceptions", 0), ("errors.decode", 0), ("errors.pipeline", 0), ("errors.view", 0),
     ("stuck.frozen_dot_s", 1.0), ("stuck.drift_longest_run_s", 3.0), ("stuck.own_marker_frozen_s", 0.5),
-    ("dot_after_destroy_s.max", 2.0), ("ghost_after_destroy_s.max", 13.0), ("vanished_then_back", 0),
+    ("dot_after_destroy_s.max", 2.0), ("ghost_after_destroy_s.max", GHOST_BUDGET_S), ("vanished_then_back", 0),
     ("jumps_per_min", 10.0), ("own_jumps_per_min", 5.0),
     # regression guards from the recorded sessions (worst: a late-join session with sparse updates, ai .14 / .04, players .06 / .03)
     ("choppy.player.stall_frac", 0.09), ("choppy.player.spike_frac", 0.035),

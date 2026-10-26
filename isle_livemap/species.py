@@ -18,6 +18,8 @@ Examples (taken from a live capture)::
 
 from __future__ import annotations
 
+import re
+
 KIND_DINO = "dino"  # a dinosaur pawn: player controlled or not, the path cannot say
 KIND_PLAYER = "player"  # a dinosaur pawn whose creation record references a PlayerState (structural proof)
 KIND_AI = "ai"  # server controlled animal (fish)
@@ -102,3 +104,76 @@ def describe(path: str | None, asset_species: str | None = None, has_player_stat
     if has_player_state and kind in (KIND_DINO, KIND_UNKNOWN):
         kind = KIND_PLAYER
     return kind, species
+
+
+# -- dinosaur species named by an asset, whichever asset it is --------------------------------------------------
+# A pawn's animation montages, sounds and mesh live under /Characters/Dinosaurs/<Species>/ (the folder), and the asset
+# names repeat the species: AM_Tyrannosaurus_Adult_Swallow, MS_TyrannosaurusRex_Call_Broadcast. Both name the species
+# even when the class itself was never exported (the join tables were missed).
+GROWTH_STAGES = ("Hatchling", "Juvenile", "Subadult", "Adult")
+_ASSET_NAME = re.compile(r"(?:^|/)(?:AM|MS|SK|SM|ABP|BP)_([A-Z][A-Za-z]+?)(?:Rex)?_(?:" + "|".join(GROWTH_STAGES) + r"|Call|Anim|Sound)")
+_STAGE = re.compile(r"_(" + "|".join(GROWTH_STAGES) + r")_")
+
+# Names that are species folders of the game; an asset NAME (no folder in its path) only counts when it starts with one of them,
+# so that "AM_Fish_Swim" or "MS_Ambient_Wind" are never read as a dinosaur.
+KNOWN_SPECIES = frozenset({
+    "Allosaurus", "Austroraptor", "Beipiaosaurus", "Brachiosaurus", "Camptosaurus", "Carnotaurus", "Ceratosaurus",
+    "Compsognathus", "Deinosuchus", "Diabloceratops", "Dilophosaurus", "Dromaeosaurus", "Dryosaurus", "Gallimimus",
+    "Giganotosaurus", "Herrerasaurus", "Hypsilophodon", "Kentrosaurus", "Maiasaura", "Microraptor", "Omniraptor",
+    "Oxalaia", "Pachycephalosaurus", "Parasaurolophus", "Pteranodon", "Sarcosuchus", "Spinosaurus", "Stegosaurus",
+    "Tenontosaurus", "Therizinosaurus", "Triceratops", "Troodon", "Tyrannosaurus", "Utahraptor", "Acrocanthosaurus",
+})
+
+
+def asset_species(path: str | None) -> str | None:
+    """Species a dinosaur asset belongs to: its ``/Characters/Dinosaurs/<Species>/`` folder, else the species in an
+    animation / sound asset name (``AM_Tyrannosaurus_Adult_Swallow``, ``MS_TyrannosaurusRex_Call_Danger``), when that name
+    is a species of the game. None for anything else."""
+    folder = folder_species(path)
+    if folder:
+        return folder
+    if not path:
+        return None
+    m = _ASSET_NAME.search(path.rsplit(".", 1)[0])
+    if m is None:
+        return None
+    name = m.group(1)
+    return name if name in KNOWN_SPECIES else None
+
+
+def stage_of_path(path: str | None) -> str:
+    """Growth stage an animation asset states (``AM_Tyrannosaurus_Subadult_Swallow`` -> "Subadult"); "" when it says none."""
+    if not path:
+        return ""
+    m = _STAGE.search(path.rsplit("/", 1)[-1])
+    return m.group(1) if m else ""
+
+
+def conventional_class_path(folder: str) -> str:
+    """The class path the game uses for every species seen so far (``.../Dinosaurs/<Folder>/BP_<Folder>``)."""
+    return f"/Game/TheIsle/Core/Characters/Dinosaurs/{folder}/BP_{folder}.Default__BP_{folder}_C"
+
+
+# -- short names for crowded labels -------------------------------------------------------------------------------
+# The full name stays in the tables and tooltips. A minimap label whose first line would be long uses these instead of
+# cutting a name in the middle ("Pachycephalosa…"): the name people say, not an ellipsis.
+SHORT_NAMES: dict[str, str] = {
+    "Tyrannosaurus": "T-Rex",
+    "Pachycephalosaurus": "Pachy",
+    "Parasaurolophus": "Parasaur",
+    "Therizinosaurus": "Therizino",
+    "Acrocanthosaurus": "Acro",
+    "Giganotosaurus": "Giga",
+    "Brachiosaurus": "Brachio",
+    "Beipiaosaurus": "Beipiao",
+    "Compsognathus": "Compy",
+    "Diabloceratops": "Diablo",
+    "Herrerasaurus": "Herrera",
+    "Hypsilophodon": "Hypsi",
+    "Tenontosaurus": "Tenonto",
+}
+
+
+def short_species(name: str) -> str:
+    """Short form of a species name for a crowded label; the name itself when it has none."""
+    return SHORT_NAMES.get(name, name)

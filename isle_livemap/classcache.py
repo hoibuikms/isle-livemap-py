@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .species import folder_species
+
 log = logging.getLogger("isle_livemap.classcache")
 
 SCHEMA = 1
@@ -42,6 +44,12 @@ def load_seed(path: Path | None = SEED_PATH) -> dict[int, str]:
                 if isinstance(v, str) and v.startswith("/") and 0 <= int(k, 16) < 1 << 32}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def _same_species(a: str, b: str) -> bool:
+    """Two class paths under the same /Characters/Dinosaurs/<Species>/ folder name the same species."""
+    fa = folder_species(a)
+    return fa is not None and fa == folder_species(b)
 
 
 class ClassCache:
@@ -76,6 +84,11 @@ class ClassCache:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def items(self) -> list[tuple[int, str]]:
+        """(protocol id, class path) of every entry learned on this machine (not the seed), for tools."""
+        with self._lock:
+            return [(k, v["path"]) for k, v in self._entries.items()]
+
     # -- learning ------------------------------------------------------------
     def learn(self, protocol_id: int, path: str) -> None:
         """Record what the export tables of the current connection say. Only complete paths ("/Game/...")."""
@@ -85,7 +98,7 @@ class ClassCache:
         with self._lock:
             entry = self._entries.get(protocol_id)
             seeded = self._seed.get(protocol_id)
-            if entry is None and seeded is not None and seeded != path:  # a game update reused the id: trust no one
+            if entry is None and seeded is not None and seeded != path and not _same_species(seeded, path):  # a game update reused the id: trust no one
                 self._blocked.add(protocol_id)
                 self.conflicts += 1
                 log.warning("class cache: protocol %#x now names %s, the shipped seed has %s; dropped", protocol_id, path, seeded)
@@ -99,6 +112,12 @@ class ClassCache:
                     entry["seen"] = now
                     self._dirty = True
                 entry["n"] = min(entry["n"] + 1, 1_000_000)
+            elif _same_species(entry["path"], path):
+                # the same dinosaur under another class path: the entry was derived from the creature's assets (the conventional
+                # BP_<Species> path) and the tables now give the real one; no disagreement about the species
+                entry["path"], entry["seen"] = path, now
+                entry["n"] = min(entry["n"] + 1, 1_000_000)
+                self._dirty = True
             else:
                 del self._entries[protocol_id]
                 self._blocked.add(protocol_id)

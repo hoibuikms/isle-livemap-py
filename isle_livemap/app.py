@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 
 from .capture import TelemetryPipeline
 from .geo import (
-    LEGEND_ENTRIES, MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance,
+    LEGEND_ENTRIES, MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance, unplaced_row,
     parse_radii,
 )
 from .overlay import MapView
@@ -143,6 +143,9 @@ class NearbyPanel(QDialog):
         my_z = pos.z if pos is not None else None
         self._near = list(self.view.nearby())
         rows = [entity_row(n, my_z) for n in self._near]
+        unplaced = getattr(getattr(self.view, "peers", None), "unplaced_creatures", None)
+        if callable(unplaced):  # replicated to us, no position yet: listed below the located ones, so that nobody is silently missing
+            rows += [unplaced_row(info) for info in unplaced()]
         if rows != self._rows:
             self._rows = rows
             self.table.setRowCount(len(rows))

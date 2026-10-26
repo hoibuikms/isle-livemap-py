@@ -68,6 +68,7 @@ class PeerSnapshot:
     version: int = 0
     status: str = ""
     enabled: bool = False
+    unplaced: int = 0  # creatures the server replicates to us but that have no position yet (they may be close)
 
 
 class PeerSource(Protocol):
@@ -223,14 +224,14 @@ class PeerStore:
         with self._lock:
             return self._version
 
-    def snapshot(self, status: str = "", enabled: bool = True) -> PeerSnapshot:
+    def snapshot(self, status: str = "", enabled: bool = True, unplaced: int = 0) -> PeerSnapshot:
         with self._lock:
             self._expire(self.clock())
             if self._cached is None:
                 self._cached = tuple(sorted(self._seen.values(), key=lambda p: p.entity.id))
             sn = self._snap
-            if sn is None or sn.status != status or sn.enabled != enabled:
-                sn = self._snap = PeerSnapshot(self._cached, self._version, status, enabled)
+            if sn is None or sn.status != status or sn.enabled != enabled or sn.unplaced != unplaced:
+                sn = self._snap = PeerSnapshot(self._cached, self._version, status, enabled, unplaced)
             return sn
 
 
@@ -381,7 +382,7 @@ class GamePeerSource:
     # Silence limit before a peer is dropped when no destruction record came. Creatures rest for minutes without
     # a single report (captured gaps of 100-300 s), so they stay until the server destroys them; the limit only
     # guards against a missed destruction record. Server animals (fish) are numerous and uninteresting: shorter.
-    TTL_S = 180.0
+    TTL_S = 600.0  # players and dinosaurs: the server's destruction record removes them; this only guards against a missed one
     TTL_AI_S = GAME_PEER_TTL_S
     stale_s, ttl_s = STALE_S, TTL_S
     # A creature the server destroyed leaves the map this long afterwards (not 30 s: a dot of something that is gone
@@ -391,7 +392,10 @@ class GamePeerSource:
     # The server destroys an actor that leaves its relevancy range and sends a new creation record when it comes back
     # (captured: the same handle returns 6-8 s later at about the same spot). Players and dinosaurs are therefore kept
     # as dimmed ghosts at their last position for this long, instead of vanishing and reappearing.
-    GHOST_GRACE_S = 12.0
+    # Measured (three recordings): a player-sized creature stays relevant for a median of 31-43 s before the server destroys
+    # it, and of 131 handles that came back, 18 % did so within 12 s and 34 % within 30 s. A ghost is dimmed more with
+    # every second and says on its label how long ago the server destroyed it ("gone 23s").
+    GHOST_GRACE_S = 45.0
     ghost_grace_s = GHOST_GRACE_S
     ghost_kinds = frozenset(("player", "dino", "unknown"))
 
@@ -418,11 +422,11 @@ class GamePeerSource:
     # cannot place it. Its batches still look like a pawn's (mostly 60-400 bits, never the 155/158 bit animal state):
     # that profile counts it as "hidden" so the overlay can say so instead of showing nothing.
     CREATURE_BAND = (60, 400)  # recorded pawns: >= 89 % of their state batches; game state 59 %, sky actor 24 %
-    CREATURE_MIN_BATCHES = 30  # an actor with a known dinosaur class needs only HIDDEN_KNOWN_BATCHES
     HIDDEN_KNOWN_BATCHES = 10
+    HIDDEN_CREATION_BATCHES = 3  # a creature whose creation record carried a maxHealth is certain: a few batches are enough
     CREATURE_BAND_SHARE = 0.8
     CREATURE_FISH_SHARE = 0.1
-    HIDDEN_RECENT_S = 30.0  # a hidden creature must have sent state this recently (datagram time)
+    HIDDEN_RECENT_S = 240.0  # a hidden creature must have sent state this recently (datagram time): a resting one is quiet for minutes
     PROFILE_MAX = 20_000
 
     HEADLINE_HOLD_S = 12.0  # a new headline replaces the shown one only after this long (datagram time): no flapping
@@ -460,7 +464,7 @@ class GamePeerSource:
         # often keeps sending state afterwards without a new creation record (relevancy flapping): if it shows up near
         # where it was, it is that creature, not an unknown one.
         self._zombies: dict[int, tuple] = {}
-        self._hidden_cache: tuple[float, int] = (-1e9, 0)
+        self._hidden_cache: tuple[float, list] = (-1e9, [])
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
         self.packets = 0  # inbound datagrams seen
         self.decode_errors = 0  # datagrams whose decoding raised (the rest of the stream is still decoded)
@@ -517,7 +521,7 @@ class GamePeerSource:
         self._creatures.clear()
         self._shape.clear()
         self._past_own.clear()
-        self._hidden_cache = (-1e9, 0)
+        self._hidden_cache = (-1e9, [])
         self._headline = (-1e9, "")
 
     def _sync_owned(self) -> None:
@@ -546,7 +550,8 @@ class GamePeerSource:
 
         info = self.identity.actors.get(handle)
         if info is None:
-            return sp.KIND_UNKNOWN, "", ""
+            hint = self.identity.species_hint(handle)  # no creation record: only the dinosaur assets of its own batches
+            return (sp.KIND_DINO, sp.display_name(hint), "") if hint else (sp.KIND_UNKNOWN, "", "")
         path = self.identity.class_path(handle)
         kind, species = sp.describe(path, self.identity.species_hint(handle), info.player_state is not None)
         if kind == sp.KIND_DINO and not species and info.asset_species:
@@ -603,27 +608,38 @@ class GamePeerSource:
         row[2] += nbits in self.AI_LAYOUT_BITS
         row[3] = t
 
-    def hidden_creatures(self) -> int:
-        """Creatures that are replicated to us (recent state batches) but that the map cannot place: their creation
-        record, and with it their position, was never seen and they have not moved since. Recomputed once a second."""
+    def unplaced_creatures(self) -> list[dict]:
+        """Creatures that are replicated to us (state batches until recently, no destruction record) but that the map cannot
+        place: their creation record, and with it their position, was never seen and they have not moved since (or the
+        position layout could not be learned). One dict per creature, most state batches first: handle, kind, species,
+        name, batches, silent_s. Recomputed once a second; safe to call from the UI thread."""
         if self._last_t - self._hidden_cache[0] < 1.0:
             return self._hidden_cache[1]
         from . import species as sp
 
-        count = 0
+        rows = []
         for handle, (n, band, fish, last) in list(self._profile.items()):  # decoder thread inserts: iterate a copy
-            if (n < self.HIDDEN_KNOWN_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
+            if (n < self.HIDDEN_CREATION_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
                     or handle < self.MIN_DYNAMIC_HANDLE
                     or handle in self._past_own or self.store.get(str(handle)) is not None):
                 continue
-            kind = self._identity(handle)[0]
-            if kind in (sp.KIND_DINO, sp.KIND_PLAYER):
-                count += 1
-            elif kind == sp.KIND_UNKNOWN and n >= self.CREATURE_MIN_BATCHES and band >= n * self.CREATURE_BAND_SHARE \
-                    and fish < n * self.CREATURE_FISH_SHARE:
-                count += 1
-        self._hidden_cache = (self._last_t, count)
-        return count
+            kind, species, name = self._identity(handle)
+            if handle in self._creatures:  # its creation record carried a maxHealth: a creature whatever the class says
+                ok = kind != sp.KIND_AI and kind != sp.KIND_OTHER
+            elif kind in (sp.KIND_DINO, sp.KIND_PLAYER):
+                ok = n >= self.HIDDEN_KNOWN_BATCHES
+            else:  # no class: it must behave like a creature (the size profile of a pawn's state batches, see ``_creature_like``)
+                ok = kind == sp.KIND_UNKNOWN and self._creature_like(handle)
+            if ok:
+                rows.append({"handle": handle, "kind": kind, "species": species, "name": "" if is_placeholder_name(name) else name,
+                             "batches": n, "silent_s": max(self._last_t - last, 0.0)})
+        rows.sort(key=lambda r: (-r["batches"], r["handle"]))
+        self._hidden_cache = (self._last_t, rows)
+        return rows
+
+    def hidden_creatures(self) -> int:
+        """How many creatures ``unplaced_creatures`` lists."""
+        return len(self.unplaced_creatures())
 
     def headline(self) -> str:
         """The few words the overlay can show (its status line is elided to about 30 characters): what the user
@@ -687,7 +703,8 @@ class GamePeerSource:
             eid, kind, name or (f"Unknown #{eid}" if kind == "unknown" else f"Actor #{eid}"), species, x, y, z,
             **self._vitals_fields(handle, vit),
             heading=self._heading(handle, x, y, old.heading if old else None), inferred=inferred,
-            vitals_t=self._vitals_t.get(handle), pos_source=source), at=self._last_t)
+            vitals_t=self._vitals_t.get(handle), pos_source=source,
+            stage=self.identity.handle_stage(handle) or (old.stage if old is not None else "")), at=self._last_t)
 
     def _vitals_fields(self, handle: int, vit) -> dict:
         """The vitals of ``decode.PawnVitals`` as Entity fields: percentages (bars), the raw points the game sent, and where
@@ -994,7 +1011,7 @@ class GamePeerSource:
             rows.append({
                 "handle": handle, "kind": e.kind, "species": e.species, "species_tier": species_tier(e.species, e.inferred),
                 "source": source or "", "name": "" if is_placeholder_name(e.name) else e.name,
-                "hp": e.health_pct, "st": e.stamina_pct, "vitals_age_s": age,
+                "stage": e.stage, "hp": e.health_pct, "st": e.stamina_pct, "vitals_age_s": age,
                 "health": e.health, "max_health": e.max_health, "max_src": e.max_src,
                 "stamina": e.stamina, "max_stamina": e.max_stamina, "hp_text": hp_text(e), "st_text": st_text(e),
                 "vitals": vitals_tier(*vitals_readings(e), age), "distance_m": dist, "bearing": bearing,
@@ -1037,7 +1054,7 @@ class GamePeerSource:
         return f"labels: creatures={len(shown)} fish={fish} | " + (" | ".join(parts) or "none") + more
 
     def snapshot(self) -> PeerSnapshot:
-        return self.store.snapshot(self.status(), True)
+        return self.store.snapshot(self.status(), True, self.hidden_creatures())
 
 
 # ----------------------------------------------------------------- factory

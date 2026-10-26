@@ -29,6 +29,8 @@ from .peers import status_is_warning
 BASE_SIZE = 360  # minimap edge in px at 100 %
 BASE_VIEW_FRACTION = 0.2  # minimap shows 20 % of map width at zoom 1
 KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "dinosaur": "#ff6b6b", "other": "#c8c8c8"}
+GHOST_FADE_STEP_S, GHOST_FADE_STEPS = 10.0, 4  # a ghost gets fainter every 10 s, in 4 steps (45 s grace)
+RADIUS_STICKY_FACTOR = 1.04  # a creature that was inside the view radius stays inside until 4 % beyond it
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
 EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
 DOT_CLEARANCE_PX = 7.0  # no label may cover the dot of a player or dinosaur
@@ -85,6 +87,7 @@ class MapView(QWidget):
         self._peers_snap = None
         self._peers_version = -1
         self.peer_status = ""
+        self.peer_unplaced = 0  # creatures the server replicates to us that have no position yet (see peers.PeerSnapshot.unplaced)
         self.own_age_s: float | None = None  # seconds since the last accepted own move (None: no fix)
         self.record_status = ""  # set by App once a second while --record is active
         self._marker_tools: dict[tuple, tuple[QPen, QColor]] = {}
@@ -92,6 +95,7 @@ class MapView(QWidget):
         self._pen_key = None  # (colour, stale, player) of the pen / brush currently set on the painter
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
         self._text_widths_small: dict[str, float] = {}  # the same for the smaller font of the 250 - 500 m band
+        self._near_prev: set[str] = set()  # creatures that were inside the view radius in the last frame (see RADIUS_STICKY_FACTOR)
         self._guar_prev: set[str] = set()  # creatures that were guaranteed a label in the last frame (see geo.is_guaranteed)
         self._forced: dict[str, float] = {}  # label of a peer -> when it was put on the least-overlapping spot (no free one): kept there, reviewed now and then
         self.trace_frames = False  # tools/tier_check.py --labels: keep what the last frame drew in ``frame_trace``
@@ -204,6 +208,7 @@ class MapView(QWidget):
                 snap = self._peers_snap
             if snap is not None:
                 self.peer_status = snap.status if snap.enabled else ""
+                self.peer_unplaced = snap.unplaced if snap.enabled else 0
                 # the source decides how long silence is tolerated (game: deltas only, so idle actors go quiet)
                 self.ents.ttl = getattr(self.peers, "ttl_s", PEER_TTL_S)
                 self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
@@ -219,6 +224,7 @@ class MapView(QWidget):
                     self.ents.update(snap.entities, now)
         else:
             self.peer_status = ""
+            self.peer_unplaced = 0
         self.ents.prune(now)
         self.ents.step(dt, now)
 
@@ -231,9 +237,14 @@ class MapView(QWidget):
         if radius_m is ...:
             radius_m = self.settings.peer_radius_m
         now = time.monotonic() if now is None else now
-        return visible_entities(self.ents.items_aged(now), self.interp.x, self.interp.y, radius_m,
-                                self.settings.show_players, self.settings.show_ai, self.settings.peer_self_ids,
-                                ttl_s=self.ents.ttl, stale_s=self._stale_s)
+        out = visible_entities(self.ents.items_aged(now), self.interp.x, self.interp.y, radius_m,
+                               self.settings.show_players, self.settings.show_ai, self.settings.peer_self_ids,
+                               ttl_s=self.ents.ttl, stale_s=self._stale_s)
+        ghosts = self.ents.ghosts()
+        if ghosts:  # the server destroyed these; they are held at their last position and say for how long
+            gone = {eid: self.ents.gone_s(eid, now) for eid in ghosts}
+            out = [replace(n, gone_s=gone[n.entity.id]) if gone.get(n.entity.id) is not None else n for n in out]
+        return out
 
     def view(self) -> tuple[float, float, float]:
         """(centre_left, centre_top, view width as a fraction of the map)."""
@@ -267,7 +278,7 @@ class MapView(QWidget):
                           self._draw_player):
                 self._paint_layer(layer, p)
             p.setClipping(False)
-            for layer in (self._draw_border, self._draw_peer_status, self._draw_record_status):
+            for layer in (self._draw_border, self._draw_peer_status, self._draw_record_status, self._draw_unplaced):
                 self._paint_layer(layer, p)
         finally:
             p.end()  # an unbalanced painter would blank every later frame
@@ -350,12 +361,17 @@ class MapView(QWidget):
         far: list[Nearby] = []
         if self.full_map:
             near = self.nearby(None)
+            near_ids: set[str] = set()
         else:  # beyond the radius, players and dinosaurs are not dropped: they become pointers on the circle edge
             reach = self.nearby(max(radius, EDGE_RANGE_M))
-            near = [n for n in reach if n.distance_m <= radius]
-            far = [n for n in reach if n.distance_m > radius and n.entity.kind != "ai"]
+            was_near = self._near_prev  # a creature walking along the radius stays a dot until it is clearly beyond it (no flicker dot <-> pointer)
+            near = [n for n in reach if n.distance_m <= radius * (RADIUS_STICKY_FACTOR if n.entity.id in was_near else 1.0)]
+            near_ids = {n.entity.id for n in near}
+            far = [n for n in reach if n.entity.id not in near_ids and n.entity.kind != "ai"]
         if not near and not far:
             self._label_slot, self._labelled = {}, set()
+            if self.trace_frames:
+                self.frame_trace = {"labels": {}, "glyph": {}, "pos": {}, "edge": set(), "leaders": 0}
             return
         bounds = (0.0, 0.0, float(self.width()), float(self.height()))
         # one view() per frame instead of one per entity (to_screen recomputes it every call)
@@ -376,6 +392,7 @@ class MapView(QWidget):
                 inside = (pt.x() - half) ** 2 + (pt.y() - h_px / 2) ** 2 <= lim
             (on_screen if inside else off).append((n, pt))
         far_pts = [(n, QPointF(ox + n.x * sx, oy + n.y * sy)) for n in far]
+        edge_ids = {n.entity.id for n, _ in off} | {n.entity.id for n, _ in far_pts}
         if off or far_pts:
             self._draw_edge_indicators(p, off, far_pts)
         # one order for everything (geo.priority_key): creatures before server animals, then the 250 / 500 / 1000 m tier,
@@ -514,6 +531,9 @@ class MapView(QWidget):
         for shown, row in ((self.peer_status, 0), (self.record_status, 1)):
             if shown:
                 placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
+        if self.peer_unplaced:
+            ur = self._unplaced_rect()
+            placed.append((ur.x(), ur.y(), ur.width(), ur.height()))
         if not self.full_map and self.interp.has_fix:  # no label covers your own arrow
             me = self._player_screen()
             placed.append((me.x() - 13.0, me.y() - 15.0, 26.0, 30.0))
@@ -605,7 +625,7 @@ class MapView(QWidget):
         if len(widths_small) > 2000:
             widths_small.clear()
         leader_ops: list = []
-        trace = {"labels": {}, "glyph": {}} if self.trace_frames else None
+        trace = {"labels": {}, "glyph": {}, "edge": edge_ids} if self.trace_frames else None
         for n, pt in label_order:
             guaranteed = guar(n)
             if not guaranteed and attempts >= (max_labels + max_ai_labels) * LABEL_ATTEMPTS_PER_LABEL:
@@ -658,7 +678,7 @@ class MapView(QWidget):
                     r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
                 if r is None and not is_ai and not short_only:  # a one-line extra label tries once: a crowd cannot cost frames
                     r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-                if r is None and not is_ai and tier == 0:  # the creatures inside 250 m (full map) keep their full label, even over others
+                if r is None and not is_ai and tier == 0 and n.gone_s is None:  # the creatures inside 250 m (full map) keep their full label, even over others
                     r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose, below=below)
                 if r is None and not is_ai and len(lines) > 1:  # no room for two lines: at least say who / what it is
                     lines = lines[:1]
@@ -669,7 +689,7 @@ class MapView(QWidget):
                         r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
                     if r is None and tier == 0:
                         r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-            if r is None and not is_ai and not guaranteed and pulled_in_labels < pull_cap and not is_placeholder_name(e.name):
+            if r is None and not is_ai and not guaranteed and pulled_in_labels < pull_cap and not is_placeholder_name(e.name) and n.gone_s is None:
                 pulled_in_labels += 1
                 # a known name is never left off: no free spot fits inside the round view next to a dot near its edge, so the
                 # label (one line) is pulled in towards the centre until it fits, even over other labels
@@ -739,6 +759,7 @@ class MapView(QWidget):
             trace["leaders"] = len(leader_ops)
             self.frame_trace = trace
         self._guar_prev = guar_now
+        self._near_prev = near_ids
         self._label_slot = slots_now
         self._forced = forced_now
         self._labelled = set(slots_now)
@@ -824,10 +845,13 @@ class MapView(QWidget):
         st = peer_style(e)
         known = e.heading is not None
         outline = decorate or e.kind == "ai"  # the outline (the costly part of an arrow) is for the creatures that matter
-        key = (st.color, n.stale, known, outline)
+        ghost = 0 if n.gone_s is None else 1 + min(int(n.gone_s // GHOST_FADE_STEP_S), GHOST_FADE_STEPS - 1)  # 0: live; 1..N: older and fainter
+        key = (st.color, n.stale, known, outline, ghost)
         pb = self._marker_tools.get(key)
-        if pb is None:  # one pen/brush per (colour, stale, heading known, outline): creating them per marker dominated the layer
+        if pb is None:  # one pen/brush per (colour, stale, heading known, outline, ghost age): creating them per marker dominated the layer
             alpha = STALE_ALPHA if n.stale else (255 if known or e.kind == "ai" else UNKNOWN_HEADING_ALPHA)
+            if ghost:
+                alpha = int(STALE_ALPHA * (1.0 - 0.6 * ghost / GHOST_FADE_STEPS))  # a creature the server destroyed fades with every step
             pen = QPen(_qcolor(st.outline, min(230, alpha)), 1.5) if outline else QPen(Qt.PenStyle.NoPen)
             pb = self._marker_tools[key] = (pen, _qcolor(st.color, alpha))
         if self._pen_key != key:  # a run of equal markers (a crowd) sets pen and brush once
@@ -906,6 +930,26 @@ class MapView(QWidget):
         room = self.width() * (0.9 if self.full_map else 0.62)  # inside the circle chord at that height
         text = QFontMetricsF(p.font()).elidedText(self.peer_status, Qt.TextElideMode.ElideRight, room)
         p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, text)
+
+    UNPLACED_H = 16.0
+
+    def _unplaced_rect(self) -> QRectF:
+        room = self.width() * (0.9 if self.full_map else 0.62)
+        return QRectF((self.width() - room) / 2, self.height() - (22.0 if self.full_map else 36.0), room, self.UNPLACED_H)
+
+    def _draw_unplaced(self, p: QPainter) -> None:
+        """A line "3 creatures: position unknown": replicated to us (the server thinks they are relevant to you, so they are not far) but
+        never seen moving and without a creation record: the map cannot say where they are. Better told than left out."""
+        n = self.peer_unplaced
+        if not n:
+            return
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(255, 170, 90))
+        r = self._unplaced_rect()
+        # a creature the app never saw created has no position until the server sends its creation record again: a rejoin does
+        what = f"{n} creature{'s' if n != 1 else ''}: " + ("no position - rejoin" if "rejoin" in self.peer_status.lower() else "position unknown")
+        text = QFontMetricsF(p.font()).elidedText(what, Qt.TextElideMode.ElideRight, r.width())
+        p.drawText(r, Qt.AlignmentFlag.AlignHCenter, text)
 
     def _draw_record_status(self, p: QPainter) -> None:
         if not self.record_status:

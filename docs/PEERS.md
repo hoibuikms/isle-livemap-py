@@ -136,14 +136,14 @@ A creature leaves the minimap only when the server destroys it. Everything else 
 | Cause (found in a recorded session) | What the map does now |
 |---|---|
 | Beyond the view radius (default 1000 m): the player and most dinosaurs of that session were 1.0-1.2 km away and were never drawn | players and dinosaurs up to 2.5 km are a pointer on the circle edge; the nearest six also read `Name 1.1 km` |
-| The server destroys an actor that leaves its relevancy range and sends a new creation record 6-8 s later (same handle, same spot) | players, dinosaurs and unknown creatures stay as dimmed ghosts for 12 s (`GamePeerSource.GHOST_GRACE_S`); fish still leave after 1.5 s |
+| The server destroys an actor that leaves its relevancy range and sends a new creation record 6-8 s later (same handle, same spot) | players, dinosaurs and unknown creatures stay as dimmed ghosts for 45 s (`GamePeerSource.GHOST_GRACE_S`, see "Creatures the ledger found missing"); fish still leave after 1.5 s |
 | A creature whose class could not be named (join tables missed, id not in the cache) and that stands still gave no position at all, so it stayed off the map for as long as it did not move: in the vv capture 3-6 such creatures were "replicated but not placeable" all the time | its creation record carries a spawn position and a maxHealth (plants, fruit and items have none): it is drawn at the spawn position at once, as an unknown creature, and is upgraded when its class is known (hidden creatures 3-6 -> 0-2; time to the first dot, 95th percentile, 334 s -> 13 s). Creatures that existed before the app started and never move still cannot be placed |
 | A pack of one species standing together beyond 250 m had no room for labels | one label `Carnotaurus ×5` (nearest one's position) instead of none; inside 250 m every creature keeps its own label |
 | No room for a two-line label | a one-line label (who / what it is) for at least 4 s instead of none |
 | A creature drawn as `unknown` whose creation record arrived later (or that linked to its PlayerState) stayed `unknown` until it moved | kind and name are upgraded on any state update; never downgraded |
 | Resting creatures were dimmed after 8 s although Iris sends nothing for a creature at rest | dimmed after 45 s |
 
-What stays the server's: a destroyed creature leaves after its 12 s ghost, and a creature that rests without ever having
+What stays the server's: a destroyed creature leaves after its 45 s ghost, and a creature that rests without ever having
 had a position (its creation record predates the app) is not on the map until it moves.
 
 **Player names.** A name exists only in the creation record of the PlayerState, which the server sends when that player
@@ -366,6 +366,53 @@ The game status line shows what the capture contains so far:
 
 `creation 0, exports 0` means the capture holds no join data and species/name cannot be recovered. The older fixtures show `creation 1, exports 2, destroyed 1` (one creation record in the one packet that used to be cut short by the destruction-record bug).
 
+## Species from assets (why a T-Rex can be named without the join tables)
+
+A class table is not the only place a species is named. A pawn's animation montages and sounds live under
+`/Game/TheIsle/Characters/Dinosaurs/<Species>/`, and the asset names repeat it (`AM_Tyrannosaurus_Adult_Swallow`,
+`MS_TyrannosaurusRex_Call_Broadcast`). The server exports those objects in the batches of the pawn that plays them,
+long after (or without) its creation record. `species.asset_species` reads the species of any such asset (the folder,
+else the name of an `AM_` / `MS_` / `SK_` / `BP_` asset when the name is a species of the game, so `AM_Fish_Swim` is not
+a dinosaur), and `species.stage_of_path` the growth stage when the asset states one (`Hatchling`, `Juvenile`,
+`Subadult`, `Adult`; shown as `Tyrannosaurus (Subadult)` in tooltips only).
+
+`decode.IdentityTracker` counts the species folders of the export section of EVERY batch per actor handle
+(`handle_species`). The rule:
+
+- an actor whose batches name exactly one folder is that species (source `asset`, shown without `~`: it is this
+  connection's own evidence). One batch is enough: a pawn's montages arrive minutes apart, and a requirement of two never
+  fired before the server destroyed the creature again (recorded capture X1, handle 196470, two lives of 44 s and 52 s);
+- an actor that names several folders is a relay and says nothing about itself. In the recorded captures that is the own
+  pawn (its batches carry the montages of every species nearby: 2 to 12 folders) and one other pawn (two species, one
+  batch each) that stays "Dino";
+- the evidence is forgotten when the handle is destroyed.
+
+How well it holds: of the actors whose class was known (tables or seed), 14 of 14 that named one folder named their own
+species; none disagreed. The T-Rex pawns in the recorded captures:
+
+| capture (names are local to this section) | handle | what the map showed before | now |
+|---|---|---|---|
+| X1 | 187384, 196470 | `unknown`, no species, 735 m and 644 m away | `Tyrannosaurus` (from the first montage, 10 s and 30 s after they appeared) |
+| X2 | 231298, 223284 | `unknown`, no species, 79 s and 33 s within 500 m (closest 342 m) | `Tyrannosaurus~` from the seed |
+| X3 | 142374 | `Tyrannosaurus` (its creation record named the assets) | unchanged |
+
+Only X3 has a T-Rex close to the player (91 m at the nearest, 99 s within 500 m), and it was already named. The T-Rexes of
+X1 and X2 were drawn all along, as unclassified creatures, 342 m and more away: what was missing was the name, not the dot.
+One pawn of X2 exported a Gallimimus montage and, 20 s later, a Tyrannosaurus one: it is labelled `Gallimimus` for those
+20 s and `Dino` afterwards (the relay rule), which may be a T-Rex that is wrongly named for a moment.
+
+The same evidence feeds the class memory. An actor with a creation record whose class no table gave offers the cache
+`protocol id -> /Characters/Dinosaurs/<Species>/BP_<Species>` (`IdentityTracker._learn_asset_class`), so a later session
+that misses the tables names that id (marked `~`). `tools/build_class_seed.py` reads the same entries when it builds the
+shipped seed: the Tyrannosaurus id `4f0078de` is in `isle_livemap/assets/class_seed.json`, tied by two independent
+captures (X3 and X2; a seed built from X3 alone names both X2 T-Rexes). A derived path is the conventional one; when
+the tables later give the real class path of the same species, `ClassCache.learn` replaces it silently (a different species
+still drops the entry).
+
+Long species names on the minimap: a label's first line longer than `geo.HEAD_SHORT_ABOVE` (34) characters, or a species
+longer than 14, says the short form (`species.SHORT_NAMES`: `T-Rex`, `Pachy`, `Parasaur`, ...) instead of a name cut in the
+middle; tables and tooltips keep the full name.
+
 ## Automatic session logs
 
 Every live launch (not `--replay`, not `--lab-peers`) writes two files without any flag, from the moment the app starts, so the join of a server is always on disk:
@@ -489,3 +536,51 @@ tables, but many nearby creatures were drawn once and then stood still on the ma
 
 Still impossible: a creature that existed before the app started, has no class and never moves sends state batches but
 no position the decoder can use; its first candidate vectors change by hundreds of metres between batches.
+
+## Creatures the ledger found missing (`tools/tier_check.py --ledger`)
+
+Every earlier check started from what the app had decided (a kind, a position, a label) and asked whether it was drawn. The
+ledger starts from the raw stream instead. A creature candidate is any actor generation that the server has not destroyed and
+whose creation record carried a maxHealth, or that sends the state batches of a pawn (12 or more, 80 % of them 60-400 bits,
+under 10 % of the repeated animal size); handles under 1000 and the repeated animal state are not creatures. Once a second the
+real `MapView` paints a frame (offscreen Qt, simulated clock) and each candidate with a known position is put in a tier by
+its last known position against the displayed own position and labelled with what the frame did with it: drawn, crowd
+triangle, pointer on the circle edge, or not shown and why (never reached the store, removed while still replicated, classified
+animal, not yet in the map, filtered by the view). Candidates without any position are counted apart, and so are the ghosts left
+by a server destruction. `--check` fails below 99 % drawn within 500 m, on any creature taken off the map while still
+replicated, or when the overlay counter announces less than 80 % of the unplaced ones. The ledger drives the replay with
+`--all-ports` (every connection of a capture), `--seconds N` and `--ghost-grace S` (what the ghost would have been).
+
+What it showed, on the recorded connections that have creatures:
+
+* **A creature that has a position is already drawn**: 99.85-100 % of the creature-seconds within 250 m and 500 m, in every
+  capture, before and after. Nothing is taken off the map while the server still replicates it. So "dinos missing near me" is
+  not a drawing problem.
+* **What is missing is the creatures without a position** (a creation record from before the app started, never moved since,
+  so the server sent no position): 56-4490 creature-seconds per capture. The decoder cannot place them (a hindsight search
+  over every state batch, vectors within 1.5 km chained at creature speed, finds nothing the decoder missed that is a real
+  track: the few chains it found keep one x/y and change only z). What the app can do is say so. The overlay counter
+  `3 creatures: position unknown` (`no position - rejoin` while the join tables are missed: the server sends every
+  creation record, with its position, again at a rejoin) and the Nearby table rows (`position unknown`, state updates so far)
+  now list them. Before, the counter existed but was not shown when the join tables were missed (the headline was taken by
+  `Started late`), and it counted only creatures with 30 or more state batches (a pawn needs 12; one whose creation record
+  had a maxHealth needs 3). The counter now announces 97-100 % of the unplaced creature-seconds, it was 33-99 %
+  (`C1` 72 of 221, `C2` 140 of 304, `C3` 1549 of 2463, `C4` 408 of 561).
+* **The server destroys a creature after a median of 31-43 s** (`C3` 14-82 s inter-quartile range) and creates the same handle
+  again after a median of 10-123 s (`C2`, `C3`, `C4`); of 131 returns, 18 % came within 12 s and 34 % within 30 s. The ghost
+  used to last 12 s. It is now 45 s (`GHOST_GRACE_S`), dimmer every 10 s (`overlay.GHOST_FADE_*`), and the label says `(gone 20s)` in steps
+  of ten seconds (`geo.gone_text`: a label whose text changes every second changes its width every second and hops). A
+  ghost ranks after every live creature of its distance tier (`geo.priority_key`), has no guaranteed label
+  (`GHOST_GUARANTEE_S` = 0: its dimmed arrow is always drawn, its label takes a free spot) and never takes a forced or
+  pulled-in spot from a live creature. With a guarantee of 10 s the ghosts' labels were pushed over live arrows (2 s in `C2`,
+  10 s in `C4`, where the label check was 100 % before) and the label hops of `C4` rose from 2.4 to 3.2-3.5 per minute. Creature-seconds within 500 m, in the
+  minute after the server destroyed them, that were still drawn: `C1` 43 -> 122, `C2` 82 -> 276, `C3` 186 -> 1179,
+  `C4` 116 -> 718 (of 136, 345, 1795 and 1064).
+* **A creature that rests for minutes** was dropped after 180 s although no destruction record came (silences of 100-300 s
+  are recorded); players and dinosaurs now wait for the destruction record (`TTL_S` 600 s only guards a missed one), fish 30 s.
+* **A creature walking along the view radius** flickered between a dot and a pointer on the circle edge; it now stays a dot
+  until it is 4 % beyond the radius (`overlay.RADIUS_STICKY_FACTOR`).
+
+Positions that are only the creation record's spawn point stay marked (`~` before the distance, dimmed): 13 % of the
+creature-seconds within 500 m in `C4`, 56 % in the first connection of `C5`. Most of them are creatures that have not moved,
+for which the spawn point is right, but nothing in the stream says which.

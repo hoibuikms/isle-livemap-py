@@ -4,9 +4,9 @@
 
 Replays every pcap through the same decoder the app uses and keeps each protocol id (the state-layout hash of a
 creation record) whose archetype path the export tables gave, and only when every capture agrees on one path.
-A dinosaur id that no capture had the tables for is kept too when the dinosaur assets of its own creation records
-(the same evidence the app uses live, source "asset") name one species folder in every capture: its path is then
-the conventional /Characters/Dinosaurs/<Folder>/BP_<Folder> one. The seed holds asset paths only: no player names,
+A dinosaur id that no capture had the tables for is kept too when the dinosaur assets of its own creation records or
+of its own batches (the same evidence the app uses live, source "asset") name one species folder in every capture: its
+path is then the conventional /Characters/Dinosaurs/<Folder>/BP_<Folder> one. The seed holds asset paths only: no player names,
 account ids or addresses.
 """
 
@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from isle_livemap.capture import TelemetryPipeline  # noqa: E402
-from isle_livemap.classcache import SCHEMA, SEED_PATH  # noqa: E402
+from isle_livemap.classcache import SCHEMA, SEED_PATH, ClassCache  # noqa: E402
 from isle_livemap.peers import GamePeerSource  # noqa: E402
 from isle_livemap.replay import pcap_datagrams  # noqa: E402
 
@@ -28,7 +28,8 @@ from isle_livemap.replay import pcap_datagrams  # noqa: E402
 def paths_of(pcap: Path) -> tuple[dict[int, set[str]], dict[int, set[str]]]:
     """(protocol id -> paths the export tables gave, protocol id -> dinosaur paths derived from the creation assets)."""
     pipe = TelemetryPipeline()
-    source = GamePeerSource(pipeline=pipe)
+    cache = ClassCache(None, seed={})  # learns, from the actors' own dinosaur assets, ids whose class no table gave
+    source = GamePeerSource(pipeline=pipe, class_cache=cache)
     source.start()
     for d in pcap_datagrams(pcap):
         pipe.handle(d)
@@ -45,6 +46,11 @@ def paths_of(pcap: Path) -> tuple[dict[int, set[str]], dict[int, set[str]]]:
         if folder and folder.isalnum():
             derived.setdefault(info.protocol_id, set()).add(
                 f"/Game/TheIsle/Core/Characters/Dinosaurs/{folder}/BP_{folder}.Default__BP_{folder}_C")
+    # Ids the app learned while replaying, from the assets exported in the actor's own batches (handle_species): the actor may
+    # be destroyed again by now, so the evidence is read from the cache, not from the tracker's final state.
+    for protocol, path in cache.items():
+        if protocol not in found:
+            derived.setdefault(protocol, set()).add(path)
     return found, derived
 
 

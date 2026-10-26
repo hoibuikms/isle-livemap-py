@@ -19,7 +19,7 @@ import struct
 from collections import Counter
 from dataclasses import dataclass, field
 
-from .species import folder_species
+from .species import asset_species, conventional_class_path, folder_species, stage_of_path
 
 # ---------------------------------------------------------------- helpers
 
@@ -845,6 +845,8 @@ _PS_REF_MARKER_BITS = 8
 _PS_REF_MARKER_GAP = 36  # bits from the start of the marker to the byte-count field
 _PS_REF_MAX_BYTES = 4
 _UNLEARNED_MAX = 4096
+_HANDLE_ASSETS_MAX = 8192  # actors whose dinosaur assets are counted (a long connection creates and destroys many)
+_HANDLE_ASSET_MIN = 1  # batches of one actor that must name its species folder before the species is believed (see handle_species)
 _RETIRED_NAMES_MAX = 512  # PlayerState names kept after the server destroyed their PlayerState (see IdentityTracker)
 
 
@@ -907,6 +909,13 @@ class IdentityTracker:
         self.objects: dict[int, ObjectExport] = {}
         self.actors: dict[int, ActorInfo] = {}
         self._arch_votes: dict[int, Counter] = {}  # archetype handle -> {species folder: creations that named it}
+        # Actor handle -> {species folder: batches of that actor whose export section named an asset of the folder}, from
+        # EVERY batch (a pawn's animation montages are exported in its state batches, long after, or without, its creation
+        # record). A handle that names exactly one folder is that species; one that names several is a relay (the own
+        # pawn's batches carry the montages of every species around it) and says nothing about itself.
+        self._handle_assets: dict[int, Counter] = {}
+        self._handle_stage: dict[int, str] = {}  # actor handle -> newest growth stage an animation asset of it states
+        self._asset_learned: set[int] = set()  # handles whose asset-derived species was offered to the class cache
         self.player_names: dict[int, str] = {}  # PlayerState handle -> name
         # Names of PlayerStates the server destroyed (a player out of relevancy, a PlayerState re-created): a pawn that is
         # created again keeps referencing the same PlayerState handle, so its name stays known for the whole connection.
@@ -953,22 +962,22 @@ class IdentityTracker:
     def species_source(self, handle: int) -> str | None:
         """Where the class / species of actor ``handle`` comes from: "table" (this connection's export tables, the only
         confirmed one), "cache" (saved class cache) or "seed" (shipped with the app) by protocol id, "asset" (the dinosaur
-        assets named in its creation records), None when nothing is known."""
+        assets named in its creation records or in any of its batches), None when nothing is known."""
         info = self.actors.get(handle)
         if info is None:
-            return None
+            return "asset" if self.handle_species(handle) else None  # no creation record: only its own assets can say
         if self.object_path(info.archetype_handle if info.archetype_handle is not None else handle) is not None:
             return "table"
         if info.archetype_handle is None:
-            return None
+            return "asset" if self.handle_species(handle) else None
+        folder = self.archetype_species(info.archetype_handle) or self.handle_species(handle)
         if self.class_cache is not None:
             source = self.class_cache.source(info.protocol_id)
             if source is not None:
-                folder = self.archetype_species(info.archetype_handle)
                 if folder and folder_species(self.class_cache.lookup(info.protocol_id)) == folder:
-                    return "asset"  # the remembered class is the one this connection's own creation assets name: confirmed
+                    return "asset"  # the remembered class is the one this connection's own assets name: confirmed
                 return source
-        return "asset" if self.archetype_species(info.archetype_handle) or info.asset_species else None
+        return "asset" if folder or info.asset_species else None
 
     def is_inferred(self, handle: int) -> bool:
         """True when the species of ``handle`` comes from the saved class cache or the shipped seed, not from this
@@ -987,11 +996,35 @@ class IdentityTracker:
         return folder if count >= 2 else None
 
     def species_hint(self, handle: int) -> str | None:
-        """``archetype_species`` for actor ``handle``; None when its class path is known (the path decides)."""
+        """Species folder of actor ``handle`` from dinosaur assets, when its class path is not known (the path decides
+        otherwise): the assets of its archetype's creation records (``archetype_species``), else the assets named in its
+        own batches (``handle_species``; also for an actor whose creation record was never captured)."""
         info = self.actors.get(handle)
-        if info is None or self.class_path(handle):
+        if info is not None:
+            if self.class_path(handle):
+                return None
+            folder = self.archetype_species(info.archetype_handle)
+            if folder:
+                return folder
+        return self.handle_species(handle)
+
+    def handle_species(self, handle: int) -> str | None:
+        """Species named by the dinosaur assets (animation montages, sounds) exported in the batches of actor ``handle``:
+        only when every such batch names one folder. An actor that names several folders is a relay for the montages around
+        it (in the recorded captures: the own pawn, whose batches carry the montages of every species nearby) and says
+        nothing about itself. In the recorded captures 14 of 14 single-folder actors whose class was known named their own
+        species, and a pawn's montages arrive minutes apart, so one batch is enough (a requirement of two never fired
+        before the server destroyed the creature again)."""
+        counts = self._handle_assets.get(handle)
+        if not counts or len(counts) != 1:
             return None
-        return self.archetype_species(info.archetype_handle)
+        folder, n = next(iter(counts.items()))
+        return folder if n >= _HANDLE_ASSET_MIN else None
+
+    def handle_stage(self, handle: int) -> str:
+        """Growth stage (Hatchling / Juvenile / Subadult / Adult) the newest animation asset of actor ``handle`` states;
+        "" when no asset of it states one, or when it is not a single-species actor (``handle_species``)."""
+        return self._handle_stage.get(handle, "") if self.handle_species(handle) else ""
 
     # -- ingestion ----------------------------------------------------------
     def _record_exports(self, section: ExportSection) -> None:
@@ -1004,16 +1037,55 @@ class IdentityTracker:
                 self.objects[o.handle] = o
                 self.exports_seen += 1
 
+    def _assets_of(self, section: ExportSection | None) -> list[tuple[str, str]]:
+        """(species folder, growth stage or "") of the dinosaur assets an export section defines or maps."""
+        if section is None:
+            return []
+        found: dict[str, str] = {}
+        for handle in [o.handle for o in section.objects] + list(section.must_be_mapped):
+            path = self.object_path(handle)
+            folder = asset_species(path)
+            if folder:
+                stage = stage_of_path(path)
+                if folder not in found or (stage and not found[folder]):
+                    found[folder] = stage
+        return list(found.items())
+
     def _folders_of(self, section: ExportSection | None) -> tuple[str, ...]:
         """Dinosaur species folders named by the objects an export section defines or maps (must-be-mapped)."""
-        if section is None:
-            return ()
-        found: list[str] = []
-        for handle in [o.handle for o in section.objects] + list(section.must_be_mapped):
-            folder = folder_species(self.object_path(handle))
-            if folder and folder not in found:
-                found.append(folder)
-        return tuple(found)
+        return tuple(f for f, _ in self._assets_of(section))
+
+    def _count_assets(self, packet: IrisPacket) -> None:
+        """Every batch whose export section names dinosaur assets counts them for its actor handle (once per folder)."""
+        for b in packet.batches:
+            if b.exports is None:
+                continue
+            for folder, stage in self._assets_of(b.exports):
+                counts = self._handle_assets.get(b.net_ref_handle)
+                if counts is None:
+                    if len(self._handle_assets) >= _HANDLE_ASSETS_MAX:
+                        for old in list(self._handle_assets)[: _HANDLE_ASSETS_MAX // 4]:  # oldest first (dict order)
+                            self._handle_assets.pop(old, None)
+                            self._handle_stage.pop(old, None)
+                    counts = self._handle_assets[b.net_ref_handle] = Counter()
+                counts[folder] += 1
+                if stage:
+                    self._handle_stage[b.net_ref_handle] = stage
+            self._learn_asset_class(b.net_ref_handle)
+
+    def _learn_asset_class(self, handle: int) -> None:
+        """Offer the class cache the species an actor's own assets name, once, for an actor whose class path no table gave:
+        a later session that misses the join tables then names that protocol id (marked "~" there)."""
+        if self.class_cache is None or handle in self._asset_learned:
+            return
+        info = self.actors.get(handle)
+        folder = self.handle_species(handle)
+        if info is None or info.archetype_handle is None or not folder:
+            return
+        if self.object_path(info.archetype_handle) is not None or self.class_cache.source(info.protocol_id) is not None:
+            return  # a table or an earlier entry already says it
+        self._asset_learned.add(handle)
+        self.class_cache.learn(info.protocol_id, conventional_class_path(folder))
 
     def _reference_candidates(self, bits: Bits, batch: IrisBatch, start: int) -> tuple[int, ...]:
         """Packed handles that follow the PlayerState-reference marker in ``batch`` (canonical width only)."""
@@ -1063,8 +1135,13 @@ class IdentityTracker:
                 exported = True
         if exported and self._unlearned:  # tables that arrive after their creations
             self._unlearned = {h for h in self._unlearned if not self._settle_class(h)}
+        if exported:
+            self._count_assets(packet)
         for handle in packet.destroyed_handles:
             self._waiting.discard(handle)
+            self._handle_assets.pop(handle, None)
+            self._handle_stage.pop(handle, None)
+            self._asset_learned.discard(handle)
             if self.actors.pop(handle, None) is not None:
                 self.destroyed_known += 1
             else:
@@ -1084,6 +1161,8 @@ class IdentityTracker:
             info = ActorInfo(creation.net_ref_handle, creation.archetype_handle, creation.location, creation.protocol_id,
                              self._folders_of(b.exports))
             self.actors[info.handle] = info  # a reused handle replaces the old record
+            self._asset_learned.discard(info.handle)
+            self._learn_asset_class(info.handle)  # its own batches may already have named the species
             if info.archetype_handle is not None:
                 votes = self._arch_votes.setdefault(info.archetype_handle, Counter())
                 votes.update(info.asset_species)

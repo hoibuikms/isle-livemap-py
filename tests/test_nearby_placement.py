@@ -85,8 +85,9 @@ def test_a_creation_record_with_a_maximum_health_makes_a_creature_at_once():
 def test_a_low_handle_with_a_pawn_profile_is_not_reported_as_a_hidden_creature():
     g = source()
     for _ in range(40):
-        g._note_unplaced(2, 120, 100.0)
-        g._note_unplaced(100_504, 120, 100.0)
+        for handle in (2, 100_504):
+            g._note_shape(handle, 120)
+            g._note_unplaced(handle, 120, 100.0)
     assert g.hidden_creatures() == 1  # only the dynamic handle
 
 

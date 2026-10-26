@@ -20,6 +20,7 @@ from .confidence import (
     SPECIES_INFERRED, VITALS_STALE, age_tag, is_placeholder_name, species_tier, vitals_tier,
 )
 from .decode import normalize_degrees
+from .species import short_species
 
 # ----------------------------------------------------------------- projection
 # Gateway map projection, identical to GatewayMapProjection.cs.
@@ -420,6 +421,7 @@ class Entity:
     #                    little low for a creature that has grown since) or "" (unknown)
     max_t: float | None = None  # source clock time of that maximum
     pos_source: str = ""  # "": a followed position (decoded fixes); "spawn": only the creation record's spawn position so far
+    stage: str = ""  # growth stage an animation asset of this creature states (Hatchling / Juvenile / Subadult / Adult), "" = none stated
 
     def __post_init__(self) -> None:
         h = self.heading
@@ -436,6 +438,7 @@ class Nearby:
     age_s: float | None = None  # seconds since the source last reported it (None = not tracked)
     stale_s: float = PEER_STALE_S  # dimmed from this age on (the source decides, see GAME_PEER_STALE_S)
     vitals_age_s: float | None = None  # seconds since its health / stamina were last read (None = no timestamp)
+    gone_s: float | None = None  # a ghost: seconds since the server destroyed it (held at its last position); None = still replicated
 
     @property
     def stale(self) -> bool:
@@ -632,12 +635,18 @@ def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[
                             self_ids=self_ids, me_id=me.id, my_z=me.z, use_3d=True)
 
 
-def species_text(e: Entity) -> str:
+HEAD_SHORT_ABOVE = 34  # a label's first line longer than this many characters says the short form of a long species name
+
+
+def species_text(e: Entity, short: bool = False) -> str:
     """The species as a label says it: plain when confirmed, "Name~" when remembered from an earlier session. A creature
-    whose class is not known is just a "Dino" (an "Animal" for a server animal): every non-AI creature is a dinosaur."""
+    whose class is not known is just a "Dino" (an "Animal" for a server animal): every non-AI creature is a dinosaur.
+    ``short``: the short form (``species.short_species``: "T-Rex") instead of the full name; a name longer than the limit that
+    has no short form is cut with an ellipsis as before."""
     if not e.species:
         return "Animal" if e.kind == "ai" else "Dino"
-    return truncate(e.species, 14) + ("~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else "")
+    name = short_species(e.species) if short or len(e.species) > 14 else e.species
+    return truncate(name, 14) + ("~" if species_tier(e.species, e.inferred) == SPECIES_INFERRED else "")
 
 
 NO_VALUE = "\u2013"  # a field the game did not send us (yet): an en dash, not a question mark
@@ -725,12 +734,19 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
     if e.kind == "ai":
         return f"AI - {species_text(e)} - {dist}", ""
     name = e.name or e.id
-    if not is_placeholder_name(name):
-        head = f"{truncate(name, name_max)} - {species_text(e)} - {dist}"
-    elif group > 1:  # a pack of creatures whose names were never sent: one label for all of them
-        head = f"{species_text(e)} ×{group} - {dist}"
-    else:  # the name was never sent (the player joined before the app started): the same shape, with a fixed placeholder
-        head = f"{NO_NAME} - {species_text(e)} - {dist}"
+
+    def first_line(short: bool) -> str:
+        sp_ = species_text(e, short)
+        if not is_placeholder_name(name):
+            return f"{truncate(name, name_max)} - {sp_} - {dist}"
+        if group > 1:  # a pack of creatures whose names were never sent: one label for all of them
+            return f"{sp_} ×{group} - {dist}"
+        return f"{NO_NAME} - {sp_} - {dist}"  # the name was never sent (the player joined before the app started): same shape
+
+    gone = f" ({gone_text(n.gone_s)})" if n.gone_s is not None else ""  # a ghost: said right on the label
+    head = first_line(False) + gone
+    if len(head) > HEAD_SHORT_ABOVE:  # would not fit: the name people say ("T-Rex"), not a name cut in the middle
+        head = first_line(True) + gone
     if group > 1:
         return head, ""
     return head, vitals_line(e, vitals or vitals_tier(*vitals_readings(e), n.vitals_age_s), n.vitals_age_s)
@@ -767,7 +783,8 @@ def priority_key(n: Nearby, sticky: bool = False) -> float:
     d = n.distance_m * (STICKY_DISTANCE_FACTOR if sticky else 1.0)
     kind = n.entity.kind
     group = (4 if kind == "ai" else 0) + bisect_left(PRIORITY_RADII_M, d)
-    return group * 8 + KIND_RANK.get(kind, len(KIND_RANK)) + min(d, 99_999.0) * 1e-6
+    ghost = 4 if n.gone_s is not None else 0  # a creature the server destroyed ranks after every live one of its tier: it never takes a place from one
+    return group * 8 + KIND_RANK.get(kind, len(KIND_RANK)) + ghost + min(d, 99_999.0) * 1e-6
 
 
 def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) -> tuple[tuple[int, ...], int]:
@@ -787,10 +804,24 @@ def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) ->
 GUARANTEED_STICKY_FACTOR = 1.04  # a creature that was guaranteed a moment ago stays so until 520 m: one that walks along the 500 m ring does not flip
 
 
+GHOST_GUARANTEE_S = 0.0  # a creature the server destroyed has no guaranteed label (its dimmed arrow stays): its label takes a free spot, never one over a live creature
+
+
 def is_guaranteed(n: Nearby, was: bool = False) -> bool:
     """A player-owned creature (player, dinosaur, unclassified creature) within ``GUARANTEED_RADIUS_M`` on the minimap:
-    always drawn, always labelled with its name and species. ``was``: it was guaranteed in the previous frame."""
-    return n.entity.kind in PLAYER_KINDS and n.distance_m <= GUARANTEED_RADIUS_M * (GUARANTEED_STICKY_FACTOR if was else 1.0)
+    always drawn, always labelled with its name and species. ``was``: it was guaranteed in the previous frame. A ghost
+    (the server destroyed it) keeps the guarantee for ``GHOST_GUARANTEE_S`` seconds (none): its dimmed arrow stays, its
+    label takes a free spot, and the labels of live creatures are never pushed over an arrow to make room for it."""
+    return (n.entity.kind in PLAYER_KINDS and n.distance_m <= GUARANTEED_RADIUS_M * (GUARANTEED_STICKY_FACTOR if was else 1.0)
+            and (n.gone_s is None or n.gone_s <= GHOST_GUARANTEE_S))
+
+
+def gone_text(gone_s: float) -> str:
+    """How long ago the server destroyed a creature that is still drawn at its last position, in steps of ten seconds (a
+    label whose text changes every second changes its width every second and hops): gone <10s, gone 20s, gone 1m."""
+    if gone_s < 10.0:
+        return "gone <10s"
+    return f"gone {int(gone_s // 10) * 10}s" if gone_s < 60.0 else f"gone {int(gone_s // 60)}m"
 
 
 def peer_label_lines(n: Nearby, my_z: float | None = None, vitals: str | None = None, group: int = 1) -> list[str]:
@@ -807,10 +838,21 @@ def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
             "?" if dz is None else f"{format_height(dz)} {'higher' if dz >= 0.5 else 'lower' if dz <= -0.5 else ''}".strip())
 
 
+def unplaced_row(info: dict) -> tuple[str, ...]:
+    """Nearby-table cells of a creature the server replicates to us but that has no position yet (``peers.unplaced_creatures``):
+    who it is, as far as known, and why there is no distance."""
+    name = info.get("name") or (NO_NAME if info.get("kind") in ("player", "dino", "unknown") else "?")
+    species = info.get("species") or "?"
+    return (truncate(name, 24), species, "?", "-", "?", "-", "-", "position unknown",
+            f"{info.get('batches', 0)} state updates", "-", "-")
+
+
 def entity_summary(n: Nearby, my_z: float | None = None) -> str:
     """One-line text of a peer (tooltips, logs). Same wording as the minimap label: HP / ST, then where it is."""
     e = n.entity
     sp = f" {e.species}" if e.species else ""
+    if e.species and e.stage:
+        sp += f" ({e.stage})"
     vit = ""
     if vitals_readings(e)[0] is not None:
         vit += f" HP {hp_text(e)}"
@@ -1099,6 +1141,14 @@ class EntitySmoother:
     def is_ghost(self, eid: str) -> bool:
         """The source no longer lists ``eid`` but it is held at its last position (see ``ghost_grace_s``)."""
         return eid in self._missing and self._grace_for(eid) == self.ghost_grace_s and bool(self.ghost_grace_s)
+
+    def gone_s(self, eid: str, now: float) -> float | None:
+        """Seconds since the source stopped listing ``eid`` while it is held as a ghost (see ``ghost_grace_s``); else None."""
+        since = self._missing.get(eid)
+        return None if since is None or not self.is_ghost(eid) else max(now - since, 0.0)
+
+    def ghosts(self) -> list[str]:
+        return [eid for eid in self._missing if self.is_ghost(eid)]
 
     def _forget(self, gone) -> None:
         for eid in gone:

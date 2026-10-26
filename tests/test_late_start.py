@@ -42,6 +42,7 @@ def source(tables_seen: bool = False, packets: int | None = None) -> GamePeerSou
 
 def feed(g: GamePeerSource, handle: int, sizes: list[int], t: float = 100.0) -> None:
     for bits in sizes:
+        g._note_shape(handle, bits)
         g._note_unplaced(handle, bits, t)
 
 
@@ -60,7 +61,7 @@ def test_world_objects_animals_and_short_histories_are_not_hidden_creatures():
     feed(g, 2, ([27, 84, 97] * 40))  # the game state: 59 % of it inside the band, below the share needed
     feed(g, 877, ([48] * 25 + [118] * 6 + [80] * 3))  # the sky actor
     feed(g, 30, [158] * 60)  # a fish
-    feed(g, 31, PAWN[:12])  # a pawn seen only briefly
+    feed(g, 31, PAWN[:8])  # a pawn seen only briefly
     assert g.hidden_creatures() == 0
 
 
