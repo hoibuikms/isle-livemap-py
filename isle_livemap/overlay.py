@@ -6,6 +6,7 @@ import math
 from functools import lru_cache
 import time
 from dataclasses import replace
+from typing import Sequence
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QPixmap, QPolygonF
@@ -21,6 +22,7 @@ from .geo import (
     PEER_STALE_S, PEER_TTL_S, SLOT_SLACK_PX, label_limits, place_label, priority_key, priority_tier, visible_entities,
     marker_extent, marker_radius, peer_style, truncate, _overlaps, display_name, vitals_readings, with_vitals,
     own_marker_stale, own_stale_text,
+    GUARANTEED_CROWD, GUARANTEED_CROWD_LABELS, GUARANTEED_FULL_LABELS, GUARANTEED_MAX_LABELS, LEADER_MIN_PX, is_guaranteed, leader_end, least_overlap, spread_slots, label_slots, spread_slot, SPREAD_COUNT,
 )
 from .peers import status_is_warning
 
@@ -30,8 +32,8 @@ KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "di
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
 EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
 DOT_CLEARANCE_PX = 7.0  # no label may cover the dot of a player or dinosaur
-SOFT_INFERRED, SOFT_UNKNOWN = 0.75, 0.6  # label head opacity of a remembered / unknown species (confirmed: 1.0)
-LABEL_BG, LABEL_BG_STALE = QColor(8, 12, 16, 125), QColor(8, 12, 16, 60)
+SOFT_INFERRED, SOFT_UNKNOWN = 0.9, 0.8  # label head opacity of a remembered / unknown species (confirmed: 1.0)
+LABEL_BG, LABEL_BG_STALE = QColor(8, 12, 16, 175), QColor(8, 12, 16, 140)
 BAR_TRACK, BAR_ST_FILL = QColor(0, 0, 0, 170), QColor(90, 170, 255)
 BAR_UNKNOWN = QColor(150, 150, 150, 95)  # a reading never received: an empty grey track, so every creature has the same two bars
 BAR_HP_H, BAR_ST_H, BAR_GAP = 3.0, 2.0, 1.5  # px
@@ -46,6 +48,13 @@ CLUSTER_PX = 12.0  # creatures of one species whose dots are closer than this sh
 HALO_MAX = 40  # halos and bars for the most important this many peers (labels are limited in the same way)
 CROWD_GLYPHS = 150  # full glyphs for the most important this many peers; the rest of a crowd are tiny triangles
 LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
+SMALL_FONT_PT = 7  # labels of the 250 - 500 m band (the 8 pt of the nearest tier is easier to read where it matters most)
+LAST_RESORT_PER_FRAME = 6  # labels per frame that may take the least-overlapping spot when every free one is gone
+LEADER_ALPHA = 150
+LABEL_STALE_ALPHA = 185  # a label of a stale / spawn-only creature stays readable (its arrow is the dimmed part)
+SEARCH_BUDGET = 10  # guaranteed labels per frame that may search the whole list of spots; the rest of a crowd reuse the spot they had
+FORCED_REVIEW_S = 1.0  # a label that sits on a spot overlapping others looks for a better one only every this many seconds
+DOT_KEEP_CLEAR_MAX = 24  # labels keep clear of the arrows of this many nearest creatures (a preference; in a bigger crowd it is pointless)
 
 
 @lru_cache(maxsize=128)
@@ -82,6 +91,11 @@ class MapView(QWidget):
         self._bar_colors: dict[int, QColor] = {}  # health bar fill by 5 % step (no QColor built per frame)
         self._pen_key = None  # (colour, stale, player) of the pen / brush currently set on the painter
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
+        self._text_widths_small: dict[str, float] = {}  # the same for the smaller font of the 250 - 500 m band
+        self._guar_prev: set[str] = set()  # creatures that were guaranteed a label in the last frame (see geo.is_guaranteed)
+        self._forced: dict[str, float] = {}  # label of a peer -> when it was put on the least-overlapping spot (no free one): kept there, reviewed now and then
+        self.trace_frames = False  # tools/tier_check.py --labels: keep what the last frame drew in ``frame_trace``
+        self.frame_trace: dict = {}
         self._label_slot: dict[str, int] = {}  # peer id -> label slot used last frame: tried first, so labels do not hop
         self._grouped: set[str] = set()
         self._compact_until: dict[str, float] = {}  # peer id -> until when its label stays one line
@@ -368,12 +382,19 @@ class MapView(QWidget):
         # then players before dinosaurs, then the nearest; a peer that had a label keeps it over a newcomer at almost the
         # same distance
         before = self._labelled
+        guar_prev = self._guar_prev
+
+        def guar(n):
+            return (not self.full_map) and is_guaranteed(n, n.entity.id in guar_prev)
+
         by_priority = sorted(on_screen, key=lambda it: priority_key(it[0], it[0].entity.id in before))
         ai_on_screen = sum(1 for it in by_priority if it[0].entity.kind == "ai")
         tier_caps, max_ai_labels = label_limits(len(by_priority) - ai_on_screen, ai_on_screen, self.full_map)
         max_labels = sum(tier_caps[:3])
         font = QFont("Segoe UI", 8)
         fm = QFontMetricsF(font)
+        font_small = QFont("Segoe UI", SMALL_FONT_PT)
+        fm_small = QFontMetricsF(font_small)
         p.setFont(font)
         centre, radius = QPointF(self.width() / 2, self.height() / 2), self.width() / 2 - 3
 
@@ -395,13 +416,122 @@ class MapView(QWidget):
             x0, y0 = ax - w / 2, ay + 8.0 + below
             return [(x0 + (ccx - w / 2 - x0) * f, y0 + (ccy - h / 2 - y0) * f, w, h) for f in (i / 5.0 for i in range(1, 6))]
 
+        searches = [0, 0]  # [whole-list searches, last-resort placements] of the guaranteed labels in this frame
+        forced_now: dict[str, float] = {}
+
+        def place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now):
+            """A label that must be shown (a creature within 500 m on the minimap). In order: the spot it had; the usual spots and
+            the spread-out ones, clear of other labels and of arrows, then clear of other labels only; one line instead of two
+            (250 - 500 m band only); at last the spot that covers the least of the others (or, past ``SEARCH_BUDGET`` searches
+            in a frame, the spot it had even if it overlaps). Returns (rect, lines)."""
+            ax, ay = pt.x(), pt.y()
+            fm_l, widths_l = (fm_small, widths_small) if small else (fm, widths)
+
+            def size(ls):
+                wd = max(widths_l[t] if t in widths_l else widths_l.setdefault(t, fm_l.horizontalAdvance(t)) for t in ls) + 2
+                return wd, fm_l.height() * len(ls)
+
+            def more(wd, hd):
+                return [*spread_slots(ax, ay, wd, hd, below), *pulled_in(ax, ay, wd, hd, below)]
+
+            def candidate(wd, hd, idx):  # one spot by its index (see geo.label_slots / spread_slots / pulled_in), without building the lists
+                if idx < 10:
+                    return label_slots(ax, ay, wd, hd, bounds, below)[idx]
+                if idx < 10 + SPREAD_COUNT:
+                    return spread_slot(ax, ay, wd, hd, below, idx - 10)
+                k_ = idx - 10 - SPREAD_COUNT
+                return pulled_in(ax, ay, wd, hd, below)[k_] if k_ < 5 else None
+
+            def covers_core(r):
+                return any(r[0] < c[0] + c[2] and c[0] < r[0] + r[2] and r[1] < c[1] + c[3] and c[1] < r[1] + r[3] for c in cores)
+
+            def inside(r):
+                return r[0] >= bounds[0] and r[1] >= bounds[1] and r[0] + r[2] <= bounds[0] + bounds[2] and r[1] + r[3] <= bounds[1] + bounds[3]
+
+            w_, h_ = size(lines)
+            extra_ = ()
+            r_ = None
+            if prefer is not None and prefer >= 10:  # a spread-out spot it had: kept while it is still free (a tolerance of a few px)
+                r_ = candidate(w_, h_, prefer)
+                tol = SLOT_SLACK_PX
+                if r_ is not None and inside(r_) and in_circle_loose(r_) and not any(
+                        r_[0] < o[0] + o[2] - tol and o[0] < r_[0] + r_[2] - tol and r_[1] < o[1] + o[3] - tol and o[1] < r_[1] + r_[3] - tol
+                        for o in kept_obstacles(())) and not covers_core(r_):
+                    slot[0] = prefer
+                    return r_, lines
+                r_ = None
+            elif prefer is not None:
+                r_ = place_label(ax, ay, w_, h_, kept_obstacles(()), bounds, in_circle, prefer, slot, in_circle_loose, True, (), below=below)
+                if r_ is not None and not covers_core(r_):  # a kept side only gives way to an arrow under its text (no tolerance there)
+                    return r_, lines
+                r_ = None
+            if prefer is not None and eid in self._forced and now - self._forced[eid] < FORCED_REVIEW_S:
+                # it sat on an overlapping spot a moment ago because nothing was free: stay there instead of searching again
+                r_ = candidate(w_, h_, prefer)
+                if r_ is not None and inside(r_) and in_circle_loose(r_):
+                    forced_now[eid] = self._forced[eid]
+                    slot[0] = prefer
+                    return r_, lines
+                r_ = None
+            if searches[0] < SEARCH_BUDGET:
+                searches[0] += 1
+                extra_ = more(w_, h_)
+                r_ = place_label(ax, ay, w_, h_, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
+                if r_ is None:
+                    r_ = place_label(ax, ay, w_, h_, placed, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
+                if r_ is None and tier == 1 and len(lines) > 1:  # between 250 and 500 m one line says who / what it is
+                    lines = lines[:1]
+                    self._compact_until[eid] = now + COMPACT_HOLD_S
+                    w_, h_ = size(lines)
+                    extra_ = more(w_, h_)
+                    r_ = place_label(ax, ay, w_, h_, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
+                    if r_ is None:
+                        r_ = place_label(ax, ay, w_, h_, placed, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
+                if r_ is not None:
+                    return r_, lines
+            if not extra_:
+                extra_ = more(w_, h_)
+            cands = [*label_slots(ax, ay, w_, h_, bounds, below), *extra_]
+            order = list(range(len(cands)))
+            if prefer is not None and 0 <= prefer < len(cands):  # the spot it had comes first: a crowd does not shuffle its labels
+                order.remove(prefer)
+                order.insert(0, prefer)
+            ordered = [cands[i] for i in order]
+            searches[1] += 1
+            r_ = least_overlap(ordered, placed if searches[1] <= LAST_RESORT_PER_FRAME else hard, bounds, in_circle)
+            if r_ is None:
+                r_ = least_overlap(ordered, hard, bounds, in_circle)
+            if r_ is None:
+                r_ = least_overlap(ordered, [], bounds, None)
+            if r_ is not None:
+                slot[0] = order[ordered.index(r_)]
+                forced_now[eid] = now
+            return r_, lines
+
         placed: list[tuple[float, float, float, float]] = []  # label rectangles already taken; the status lines are too
         top = 6.0 if self.full_map else 18.0
         room = self.width() * (0.9 if self.full_map else 0.62)
         for shown, row in ((self.peer_status, 0), (self.record_status, 1)):
             if shown:
                 placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
+        if not self.full_map and self.interp.has_fix:  # no label covers your own arrow
+            me = self._player_screen()
+            placed.append((me.x() - 13.0, me.y() - 15.0, 26.0, 30.0))
         self._draw_edge_captions(p, far_pts, placed)
+        n_strong = len(placed)
+        if not self.full_map and self.settings.show_rings and self.interp.has_fix:  # the "500 m" captions of the rings are not covered
+            own = self._player_screen()  # (by a new spot; a label that already sits there keeps its side: that would be a hop for a caption)
+            px_m = self.width() / span
+            for ring in build_rings(self.settings.ring_radii_m):
+                placed.append((own.x() + 2.0, own.y() - ring.rx * px_m - 13.0, 40.0, 14.0))
+        hard = list(placed)  # status lines, your own arrow, edge and ring captions: no label goes there, whatever the crowd
+        n_hard = len(hard)
+        keep_obstacles = placed[:n_strong]
+
+        def kept_obstacles(extra_rects):
+            """What a label that already has a side must stay clear of to keep it: the status lines, your arrow, the edge
+            captions and the labels placed so far (not the ring captions: moving a label for them is a hop for no good reason)."""
+            return [*keep_obstacles, *placed[n_hard:], *extra_rects]
         p.setFont(font)
         attempts = ai_labelled = named_extra = pulled_in_labels = 0
         creatures = len(by_priority) - ai_on_screen
@@ -417,11 +547,14 @@ class MapView(QWidget):
         # dots of players and dinosaurs that can compete with a label: kept clear when possible (a preference, so two
         # creatures standing next to each other still both get a label)
         dots = []
+        cores = []  # the middle of each arrow in ``dots``
         bars_on = bool(self.settings.show_vitals_bars)
         first_ai = len(by_priority) - ai_on_screen
-        for n, pt in (*by_priority[:max_labels], *by_priority[first_ai:first_ai + 2 * max_ai_labels]):  # creatures, then the fish that can get a label
+        for n, pt in (*by_priority[:min(max_labels, DOT_KEEP_CLEAR_MAX)], *by_priority[first_ai:first_ai + 2 * max_ai_labels]):  # creatures, then the fish that can get a label
             c = max(DOT_CLEARANCE_PX, marker_extent(n.entity) + 3.0)  # a big dino's dot is wider than the default
-            dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c))
+            bars_h = (marker_radius(n.entity) + 3.0 + BAR_BOX_H + 1.0 - c) if bars_on and n.entity.kind != "ai" else 0.0  # its bars hang under it
+            dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c + max(0.0, bars_h)))
+            cores.append((pt.x() - 3.0, pt.y() - 3.0, 6.0, 6.0))  # a kept label side only gives way to an arrow under its text
         pos = self.pipeline.latest.position
         my_z = pos.z if pos is not None else None
         now = time.monotonic()
@@ -433,7 +566,8 @@ class MapView(QWidget):
         scanned, scan_limit = 0, (tier_caps[1] + tier_caps[2]) * 6
         for n, pt in by_priority:
             e = n.entity
-            if e.kind not in ("dino", "unknown") or not e.species or priority_tier(n.distance_m) == 0 or not is_placeholder_name(e.name):
+            if e.kind not in ("dino", "unknown") or not e.species or priority_tier(n.distance_m) == 0 or not is_placeholder_name(e.name) \
+                    or guar(n):  # inside 500 m every creature keeps its own label
                 if e.kind == "ai":
                     break  # sorted: only server animals from here on
                 continue  # the creatures inside 250 m each keep their own full label
@@ -448,9 +582,33 @@ class MapView(QWidget):
             else:
                 leaders.append((n, pt))
                 group_of[e.id] = 1
-        # players and dinosaurs claim label space before server animals (fish) do, the nearest tier first
-        for n, pt in by_priority:
-            if attempts >= (max_labels + max_ai_labels) * LABEL_ATTEMPTS_PER_LABEL:
+        # players and dinosaurs claim label space before server animals (fish) do, the nearest tier first. On the minimap
+        # every player-owned creature within 500 m (geo.is_guaranteed) is guaranteed a label with its name and species:
+        # no tier cap, no pack label; the first GUARANTEED_FULL_LABELS (nearest first) have two lines, the next ones one,
+        # and when the free spots next to the marker are gone the label is spread out with a leader line to its marker.
+        guaranteed_used = 0
+        band_total = 0
+        guar_now: set[str] = set()
+        band_ends: list[int] = []  # index just after each guaranteed creature in by_priority
+        if not self.full_map:
+            for idx, it in enumerate(by_priority):  # creatures come first, server animals last
+                if it[0].entity.kind == "ai":
+                    break
+                if guar(it[0]):
+                    band_total += 1
+                    guar_now.add(it[0].entity.id)
+                    band_ends.append(idx + 1)
+        guaranteed_max = GUARANTEED_MAX_LABELS if band_total <= GUARANTEED_CROWD else GUARANTEED_CROWD_LABELS
+        # a crowd beyond the label limit: the creatures between the last labelled one and the end of the band are not visited
+        label_order = by_priority if band_total <= guaranteed_max else by_priority[:band_ends[guaranteed_max - 1]] + by_priority[band_ends[-1]:]
+        widths_small = self._text_widths_small
+        if len(widths_small) > 2000:
+            widths_small.clear()
+        leader_ops: list = []
+        trace = {"labels": {}, "glyph": {}} if self.trace_frames else None
+        for n, pt in label_order:
+            guaranteed = guar(n)
+            if not guaranteed and attempts >= (max_labels + max_ai_labels) * LABEL_ATTEMPTS_PER_LABEL:
                 break
             if n.entity.id in skip:
                 continue
@@ -458,16 +616,22 @@ class MapView(QWidget):
             tier = priority_tier(n.distance_m)
             below = BAR_BOX_H + 3.0 if bars_on and not is_ai else 0.0  # the slots under the arrow start below its bars
             short_only = False
-            if is_ai:
-                if ai_labelled >= max_ai_labels:
+            if guaranteed:
+                if guaranteed_used >= guaranteed_max:
                     continue
-            elif tier_used[min(tier, len(tier_caps) - 1)] >= tier_caps[min(tier, len(tier_caps) - 1)]:
-                # the tier is full: a player whose name is known still gets a one-line label (the name is what a player is
-                # looked for by), up to NAMED_EXTRA_LABELS of them; everybody else waits for a free label
-                if is_placeholder_name(n.entity.name) or named_extra >= named_cap:
-                    continue
-                short_only = True
-            attempts += 1
+                guaranteed_used += 1
+                short_only = guaranteed_used > GUARANTEED_FULL_LABELS
+            else:
+                if is_ai:
+                    if ai_labelled >= max_ai_labels:
+                        continue
+                elif tier_used[min(tier, len(tier_caps) - 1)] >= tier_caps[min(tier, len(tier_caps) - 1)]:
+                    # the tier is full: a player whose name is known still gets a one-line label (the name is what a player
+                    # is looked for by), up to NAMED_EXTRA_LABELS of them; everybody else waits for a free label
+                    if is_placeholder_name(n.entity.name) or named_extra >= named_cap:
+                        continue
+                    short_only = True
+                attempts += 1
             e = n.entity
             h_now, s_now = vitals_readings(e)
             sp, inferred, hp, st, vtier = self._conf.settle(n.entity.id, e.species, e.inferred, h_now, s_now, n.vitals_age_s, now)
@@ -476,31 +640,36 @@ class MapView(QWidget):
             lines = peer_label_lines(n, my_z, vtier, group_of.get(n.entity.id, 1))
             if short_only:
                 lines = lines[:1]
-            if len(lines) > 1 and now < self._compact_until.get(n.entity.id, 0.0):
+            if len(lines) > 1 and now < self._compact_until.get(n.entity.id, 0.0) and not (guaranteed and tier == 0):
                 lines = lines[:1]  # it did not fit in full a moment ago: stay short for a few seconds instead of flipping size
-            w = max(widths[t] if t in widths else widths.setdefault(t, fm.horizontalAdvance(t)) for t in lines) + 2
-            h = fm.height() * len(lines)
+            small = guaranteed and tier == 1  # the 250 - 500 m band: a smaller font, so that more of them fit
+            fm_l, widths_l = (fm_small, widths_small) if small else (fm, widths)
+            w = max(widths_l[t] if t in widths_l else widths_l.setdefault(t, fm_l.horizontalAdvance(t)) for t in lines) + 2
+            h = fm_l.height() * len(lines)
             eid = n.entity.id
             prefer, slot = self._label_slot.get(eid), [0]
             r = None
-            if prefer is not None:  # the side it had: kept while it still fits, even if a dot has moved under it (no hopping)
-                r = place_label(pt.x(), pt.y(), w, h, list(placed), bounds, in_circle, prefer, slot, in_circle_loose, True, below=below)
-            if r is None:
-                r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-            if r is None and not is_ai and not short_only:  # a one-line extra label tries once: a crowd cannot cost frames
-                r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-            if r is None and not is_ai and tier == 0:  # the creatures inside 250 m always keep their full label, even over others
-                r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-            if r is None and not is_ai and len(lines) > 1:  # no room for two lines: at least say who / what it is
-                lines = lines[:1]
-                self._compact_until[eid] = now + COMPACT_HOLD_S
-                w, h = widths[lines[0]] + 2 if lines[0] in widths else fm.horizontalAdvance(lines[0]) + 2, fm.height()
-                r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
+            if guaranteed:
+                r, lines = place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now)
+            else:
+                if prefer is not None:  # the side it had: kept while it still fits, even if a dot has moved under it (no hopping)
+                    r = place_label(pt.x(), pt.y(), w, h, kept_obstacles(()), bounds, in_circle, prefer, slot, in_circle_loose, True, below=below)
                 if r is None:
+                    r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
+                if r is None and not is_ai and not short_only:  # a one-line extra label tries once: a crowd cannot cost frames
                     r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-                if r is None and tier == 0:
+                if r is None and not is_ai and tier == 0:  # the creatures inside 250 m (full map) keep their full label, even over others
                     r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose, below=below)
-            if r is None and not is_ai and pulled_in_labels < pull_cap and not is_placeholder_name(e.name):
+                if r is None and not is_ai and len(lines) > 1:  # no room for two lines: at least say who / what it is
+                    lines = lines[:1]
+                    self._compact_until[eid] = now + COMPACT_HOLD_S
+                    w, h = widths[lines[0]] + 2 if lines[0] in widths else fm.horizontalAdvance(lines[0]) + 2, fm.height()
+                    r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
+                    if r is None:
+                        r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
+                    if r is None and tier == 0:
+                        r = place_label(pt.x(), pt.y(), w, h, [], bounds, in_circle, prefer, slot, in_circle_loose, below=below)
+            if r is None and not is_ai and not guaranteed and pulled_in_labels < pull_cap and not is_placeholder_name(e.name):
                 pulled_in_labels += 1
                 # a known name is never left off: no free spot fits inside the round view next to a dot near its edge, so the
                 # label (one line) is pulled in towards the centre until it fits, even over other labels
@@ -517,25 +686,43 @@ class MapView(QWidget):
             slots_now[eid] = slot[0]
             if is_ai:
                 ai_labelled += 1
-            elif short_only:
+            elif short_only and not guaranteed:
                 named_extra += 1
-            else:
+            elif not guaranteed:
                 tier_used[min(tier, len(tier_caps) - 1)] += 1
-            alpha = STALE_ALPHA if n.stale else 255
-            tier = species_tier(sp, inferred)  # a species that is only remembered / unknown is drawn softer than a confirmed one
-            head_alpha = int(alpha * (SOFT_INFERRED if tier == SPECIES_INFERRED else SOFT_UNKNOWN if tier == SPECIES_UNKNOWN else 1.0))
-            label_ops.append((r, lines, alpha, _qcolor(peer_style(n.entity).color, head_alpha), head_alpha))
+            alpha = LABEL_STALE_ALPHA if n.stale else 255
+            sp_tier = species_tier(sp, inferred)  # a species that is only remembered / unknown is drawn softer than a confirmed one
+            head_alpha = int(alpha * (SOFT_INFERRED if sp_tier == SPECIES_INFERRED else SOFT_UNKNOWN if sp_tier == SPECIES_UNKNOWN else 1.0))
+            color = _qcolor(peer_style(n.entity).color, head_alpha)
+            label_ops.append((r, lines, alpha, color, head_alpha, small))
+            if not is_ai:
+                nx, ny, gap = leader_end(r, pt.x(), pt.y())
+                if gap > max(LEADER_MIN_PX, 1.5 * marker_radius(n.entity) + 6.0):  # displaced from its marker: a line joins them
+                    leader_ops.append((pt.x(), pt.y(), nx, ny))
+            if trace is not None:
+                trace["labels"][eid] = (list(lines), r, small)
         if bars_on:  # under the arrows, before the label pills: a label is never covered by a bar
-            self._draw_all_bars(p, by_priority, skip, BAR_MAX if creatures <= CROWD_GLYPHS else BAR_CROWDED)
-        for r, lines, alpha, color, head_alpha in label_ops:
+            band = min(band_total, guaranteed_max)
+            self._draw_all_bars(p, by_priority, skip, max(BAR_MAX if creatures <= CROWD_GLYPHS else BAR_CROWDED, band))
+        if leader_ops:  # thin lines from a displaced label to its marker, under the pills and the arrows
+            p.setPen(QPen(QColor(200, 160, 255, LEADER_ALPHA), 1.0))
+            for ax_, ay_, nx_, ny_ in leader_ops:
+                p.drawLine(QPointF(ax_, ay_), QPointF(nx_, ny_))
+        cur_small = False
+        for r, lines, alpha, color, head_alpha, small in label_ops:
+            if small != cur_small:
+                p.setFont(font_small if small else font)
+                cur_small = small
+            fm_d = fm_small if small else fm
             p.setPen(Qt.PenStyle.NoPen)  # a soft dark pill behind the text: readable on forest, rock and water alike
             p.setBrush(LABEL_BG if alpha == 255 else LABEL_BG_STALE)
             p.drawRoundedRect(QRectF(r[0] - 2.0, r[1] - 0.5, r[2] + 2.0, r[3] + 1.0), 3.0, 3.0)
             for i, text in enumerate(lines):
-                base = QPointF(r[0], r[1] + fm.ascent() + i * fm.height())
-                a = head_alpha if i == 0 else alpha
+                base = QPointF(r[0], r[1] + fm_d.ascent() + i * fm_d.height())
                 p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
+        if cur_small:
+            p.setFont(font)
         # the glyphs go on top of every pill and caption: the most important peer (players before dinosaurs before fish, the
         # 250 m tier before the 500 m one) is painted last, so nothing covers an arrow that matters
         self._pen_key = None
@@ -545,7 +732,15 @@ class MapView(QWidget):
                 self._draw_crowd_dot(p, n, pt)
             else:
                 self._draw_entity_marker(p, n, pt, rank <= HALO_MAX)
+            if trace is not None:
+                trace["glyph"][n.entity.id] = rank <= CROWD_GLYPHS
+        if trace is not None:
+            trace["pos"] = {n.entity.id: (pt.x(), pt.y(), n.distance_m, n.entity.kind) for n, pt in by_priority}
+            trace["leaders"] = len(leader_ops)
+            self.frame_trace = trace
+        self._guar_prev = guar_now
         self._label_slot = slots_now
+        self._forced = forced_now
         self._labelled = set(slots_now)
         if len(self._compact_until) > 400:
             self._compact_until = {k: v for k, v in self._compact_until.items() if v > now}

@@ -739,7 +739,13 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
 # ------------------------------------------------------------ who gets glyph budget and label space first
 PRIORITY_RADII_M = (250.0, 500.0, 1000.0)  # distance tiers: inside 250 m first, then 500 m, then 1000 m, then the rest
 KIND_RANK = {"player": 0, "dino": 1, "unknown": 2, "ai": 3}
-LABEL_CAPS_MINIMAP = (12, 6, 4, 0)  # labels per distance tier (inside 250 m / 500 m / 1000 m / beyond) on the minimap ...
+GUARANTEED_RADIUS_M = 500.0  # every player-owned creature this close (displayed distance) is drawn AND has its own label on the minimap
+GUARANTEED_FULL_LABELS = 30  # ... the first this many (nearest first) with two lines, ...
+GUARANTEED_MAX_LABELS = 45  # ... the next ones with one line (name - species - distance), up to this many in all; a crowd of more
+#                             than that within 500 m (never seen in a recording) keeps its arrows and bars but loses the farthest labels
+GUARANTEED_CROWD = 60  # more creatures than this within 500 m is a pathological crowd (a stress test; the busiest recording has far fewer):
+GUARANTEED_CROWD_LABELS = 20  # ... only the nearest this many keep a label, so that a frame stays cheap
+LABEL_CAPS_MINIMAP = (GUARANTEED_MAX_LABELS, GUARANTEED_MAX_LABELS, 4, 0)  # labels per distance tier (inside 250 m / 500 m / 1000 m / beyond) on the minimap ...
 LABEL_CAPS_FULL = (24, 16, 12, 8)  # ... and on the full map
 AI_LABELS_MINIMAP, AI_LABELS_FULL = 3, 8  # server animals (fish) never use up the labels of players and dinosaurs
 CROWDED_ON_SCREEN = 20  # above this many creatures on screen, the 500 m and 1000 m tiers get fewer labels (never the 250 m tier)
@@ -770,10 +776,21 @@ def label_limits(creatures_on_screen: int, ai_on_screen: int, full_map: bool) ->
     caps = list(LABEL_CAPS_FULL if full_map else LABEL_CAPS_MINIMAP)
     ai = AI_LABELS_FULL if full_map else AI_LABELS_MINIMAP
     if creatures_on_screen > CROWDED_ON_SCREEN:
-        caps[1], caps[2] = min(caps[1], CROWDED_TIER_CAPS[0]), min(caps[2], CROWDED_TIER_CAPS[1])
+        if full_map:
+            caps[1] = min(caps[1], CROWDED_TIER_CAPS[0])
+        caps[2] = min(caps[2], CROWDED_TIER_CAPS[1])  # the minimap's 250 m and 500 m tiers are guaranteed: a crowd never reduces them
     if ai_on_screen > CROWDED_ON_SCREEN:
         ai = 0
     return tuple(caps), ai
+
+
+GUARANTEED_STICKY_FACTOR = 1.04  # a creature that was guaranteed a moment ago stays so until 520 m: one that walks along the 500 m ring does not flip
+
+
+def is_guaranteed(n: Nearby, was: bool = False) -> bool:
+    """A player-owned creature (player, dinosaur, unclassified creature) within ``GUARANTEED_RADIUS_M`` on the minimap:
+    always drawn, always labelled with its name and species. ``was``: it was guaranteed in the previous frame."""
+    return n.entity.kind in PLAYER_KINDS and n.distance_m <= GUARANTEED_RADIUS_M * (GUARANTEED_STICKY_FACTOR if was else 1.0)
 
 
 def peer_label_lines(n: Nearby, my_z: float | None = None, vitals: str | None = None, group: int = 1) -> list[str]:
@@ -827,7 +844,60 @@ def label_slots(ax: float, ay: float, w: float, h: float, bounds: Rect, below: f
             (cx, ay + 9 + below + h, w, h), (cx, ay - 9 - 2 * h, w, h)]
 
 
-SLOT_SLACK_PX = 3.0  # the slot a label already has may be this much worse than a new one would be allowed to be
+_SPREAD_DIRS = ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0), (0.866, 0.5), (-0.866, 0.5), (0.866, -0.5), (-0.866, -0.5),
+                (0.5, 0.866), (-0.5, 0.866), (0.5, -0.866), (-0.5, -0.866))  # down, up, right, left, then every 30 degrees
+SPREAD_RINGS_PX = (20.0, 36.0, 54.0, 76.0, 104.0)  # how far from the marker the labels of a crowd are spread (nearest edge of the label)
+SPREAD_COUNT = len(SPREAD_RINGS_PX) * len(_SPREAD_DIRS)
+LEADER_MIN_PX = 14.0  # a label whose nearest edge is further than this from its marker gets a leader line
+
+
+def spread_slot(ax: float, ay: float, w: float, h: float, below: float, index: int) -> Rect:
+    """One entry of ``spread_slots`` (``index`` 0 .. SPREAD_COUNT - 1), without building the list."""
+    ring, k = SPREAD_RINGS_PX[index // len(_SPREAD_DIRS)], index % len(_SPREAD_DIRS)
+    dx, dy = _SPREAD_DIRS[k]
+    cx = ax + dx * (ring + abs(dx) * w / 2)
+    cy = ay + dy * (ring + abs(dy) * h / 2) + (below if dy > 0 else 0.0)
+    return (cx - w / 2, cy - h / 2, w, h)
+
+
+def spread_slots(ax: float, ay: float, w: float, h: float, below: float = 0.0) -> list[Rect]:
+    """Candidate rects further out than ``label_slots`` for a label that finds no room next to its marker (a crowd):
+    five rings (``SPREAD_RINGS_PX``) of twelve directions, the nearest edge of the label at the ring's distance. The list
+    always has the same order and length, so an index means the same place from frame to frame (a label keeps its spot)."""
+    return [spread_slot(ax, ay, w, h, below, i) for i in range(SPREAD_COUNT)]
+
+
+def leader_end(r: Rect, ax: float, ay: float) -> tuple[float, float, float]:
+    """(x, y, distance) of the point of rect ``r`` that is nearest to the marker at (ax, ay)."""
+    nx = min(max(ax, r[0]), r[0] + r[2])
+    ny = min(max(ay, r[1]), r[1] + r[3])
+    return nx, ny, math.hypot(nx - ax, ny - ay)
+
+
+def least_overlap(cands: Sequence[Rect], placed: Sequence[Rect], bounds: Rect, accept: Callable[[Rect], bool] | None = None) -> Rect | None:
+    """The candidate inside ``bounds`` (and accepted) that covers the least area of the rects in ``placed``: the last
+    resort of a label that must be shown (a creature within 500 m) when every free spot is gone."""
+    bx, by, bw, bh = bounds
+    best, best_cost = None, None
+    for r in cands:
+        if not (r[0] >= bx and r[1] >= by and r[0] + r[2] <= bx + bw and r[1] + r[3] <= by + bh):
+            continue
+        if accept is not None and not accept(r):
+            continue
+        cost = 0.0
+        for o in placed:
+            ox = min(r[0] + r[2], o[0] + o[2]) - max(r[0], o[0])
+            oy = min(r[1] + r[3], o[1] + o[3]) - max(r[1], o[1])
+            if ox > 0 and oy > 0:
+                cost += ox * oy
+        if best_cost is None or cost < best_cost:
+            best, best_cost = r, cost
+            if cost == 0.0:
+                break
+    return best
+
+
+SLOT_SLACK_PX = 6.0  # the slot a label already has may be this much worse than a new one would be allowed to be
 
 
 def place_label(ax: float, ay: float, w: float, h: float, placed: list[Rect], bounds: Rect,

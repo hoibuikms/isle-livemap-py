@@ -93,4 +93,4 @@ def test_labels_are_drawn_before_glyphs():
     from isle_livemap import overlay
 
     src = inspect.getsource(overlay.MapView._draw_entities)
-    assert src.index("for r, lines, alpha, color, head_alpha in label_ops") < src.index("self._draw_entity_marker(p, n, pt")
+    assert src.index("for r, lines, alpha, color, head_alpha, small in label_ops") < src.index("self._draw_entity_marker(p, n, pt")

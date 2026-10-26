@@ -138,17 +138,25 @@ def at(view, i, metres, degrees, name="", **kw):
 
 def test_a_player_with_a_known_name_keeps_a_one_line_label_when_the_distance_tier_is_full(tmp_path, clock):
     view, fp = view_with(tmp_path, clock)
-    crowd = [at(view, i, 300.0 + i * 10.0, 40.0 * i) for i in range(1, 7)]  # six nameless players fill the 500 m tier
-    named = at(view, 9, 490.0, 300.0, name="P1")  # the furthest of them all
+    crowd = [at(view, i, 600.0 + i * 10.0, 40.0 * i) for i in range(1, 7)]  # six nameless players fill the 1000 m tier (4 labels)
+    named = at(view, 9, 990.0, 300.0, name="P1")  # the furthest of them all
     fp.set([*crowd, named])
     advance(view, clock, 0.3)
     view.grab()
     assert "9" in view._labelled
-    fp.set(crowd)  # without the name it has to wait for a free label
-    fp.set([*crowd, at(view, 9, 490.0, 300.0)])
+    fp.set([*crowd, at(view, 9, 990.0, 300.0)])  # without the name it has to wait for a free label
     advance(view, clock, 0.3)
     view.grab()
     assert "9" not in view._labelled
+
+
+def test_inside_500_m_every_creature_has_a_label_whether_its_name_is_known_or_not(tmp_path, clock):
+    view, fp = view_with(tmp_path, clock)
+    crowd = [at(view, i, 300.0 + i * 10.0, 40.0 * i) for i in range(1, 7)]  # six nameless players
+    fp.set([*crowd, at(view, 9, 490.0, 300.0)])
+    advance(view, clock, 0.3)
+    view.grab()
+    assert {"1", "2", "3", "4", "5", "6", "9"} <= view._labelled
 
 
 def test_the_bars_hang_under_every_player_and_dinosaur_with_a_grey_track_where_nothing_is_known(tmp_path, clock):

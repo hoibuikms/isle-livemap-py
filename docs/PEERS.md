@@ -56,7 +56,7 @@ Tray menu items: "Show other players", "Nearby radius...", "Health / stamina bar
   * a server animal: `AI - <name> - <distance>`, one line (`AI - Catfish - 120 m`, `AI - Forktail - 1.5 km`, `AI - Animal - 120 m` without a class)
   * a pack of nameless creatures of one species standing together beyond 250 m: `Carnotaurus ×5 - <distance of the nearest>`, one line. A creature with a known name is never part of a pack: its name is not swallowed by a `×N` label.
   The second line holds only what was read (`geo.vitals_line`, with `hp_text` / `st_text` shared by the label, the Nearby table cells and the tooltip text): **the raw values the game sent, in points**, not a percentage (the bars under the arrow show the ratio). Health is `<current>/<max>`; the maximum is `~1650` while it is only the creation record's (a creature grows after it is created: `Entity.max_src == "creation"`; a full attribute block gives the real one: `"block"`), and `–` when no maximum is known (`HP 1500/–`). Stamina is `<current>/<max>`; the maximum is `–` when the block did not carry it (the 8-slot block leaves it out and no creation record has it), so a stamina value can stand without a maximum (`ST 624/–`), and then its bar stays an empty track because there is no ratio. Values below 10 keep one decimal (a hatchling is `HP 1.6/1.6`, not `2/2`). Without a raw value (the lab feed) the percentage is printed instead (`HP 86%`). Unread values are `–`, a creature nothing was read for has no second line, and an old reading gets a coarse age tag (`[2m+]`). Where the numbers come from: current health, health maximum (block), current stamina and stamina maximum (9-slot block only) are float32 attribute values in points (own pawn, same slots: a hatchling `1.6/1.6`, `79.7/107.9`; recorded adults `2275/2620`, `134/163`); the pair health + stamina that follows between blocks is absolute too. In the recorded sessions the stamina value was known for every pawn-second with a health reading, its maximum for 27-100 % of them, and the health maximum came from a full block for 42-100 % (the rest from the creation record, hence the `~`). Compass direction and height are not on the minimap label; they are in the Nearby table and the tooltip text (`geo.entity_summary`). The label keeps the side of the dot it had (even when a dot has moved under it) while it still fits. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet points north, one that has moved points the way it went (and keeps that direction while it rests).
-- **Priority** (`geo.priority_key`, one number used for the dot budget, the label slots and collisions): creatures before server animals; then the distance tier **within 250 m, within 500 m, within 1000 m, further**; inside a tier players before dinosaurs before unidentified creatures; then the nearest. A peer that had a label last frame ranks as 15 % nearer, so two creatures at almost the same distance do not swap labels. Labels per tier on the minimap: 12 / 6 / 4 (a crowd of more than 20 creatures cuts the 500 m and 1000 m tiers to 3 and 2, **never the 250 m tier**); fish get at most 3 labels and none in a shoal of 20+. Every creature inside 250 m keeps its full two-line label: when no free spot is left it takes the best one over other labels instead of being dropped or shortened. Beyond the 1000 m view radius players and dinosaurs up to 2.5 km are pointers on the circle edge.
+- **Priority** (`geo.priority_key`, one number used for the dot budget, the label slots and collisions): creatures before server animals; then the distance tier **within 250 m, within 500 m, within 1000 m, further**; inside a tier players before dinosaurs before unidentified creatures; then the nearest. A peer that had a label last frame ranks as 15 % nearer, so two creatures at almost the same distance do not swap labels. Beyond 500 m the labels per tier on the minimap are 4 (1000 m; a crowd of more than 20 creatures cuts it to 2); fish get at most 3 labels and none in a shoal of 20+. **Inside 500 m there is no cap**: see "Every creature within 500 m" below. Beyond the 1000 m view radius players and dinosaurs up to 2.5 km are pointers on the circle edge.
 - **Your own stats** (growth, hunger, thirst, health) are not drawn anywhere on the minimap: there is no panel and no text for the red arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
 
@@ -267,6 +267,42 @@ Effect on the own marker (`tools/stability_replay.py --local-port N`, per connec
 **The server's own copy of the own location cannot be the authority.** It is sent rarely: 0-16 confirmed copies per connection, intervals p50 9-171 s (max 327 s), so for most of a session there is none. Wherever one exists it agrees with the decoded track: after the fixes p50 1.7 m, p90 4.6 m, max 9.1 m over 46 confirmations (the 27 m of the `C8` bird connection was the 7 s decode gap; it is 3.2 m now), plus the one teleport. Adopting it would have moved the marker only in that single teleport, and a chance triple of doubles could move it wrongly, so it still only verifies.
 
 **The marker says when it cannot know.** After `OWN_STALE_S` (3 s) without an accepted move the own arrow is drawn hollow and dim with `? no moves 12 s` next to it (`geo.own_marker_stale`, `MapView.own_age_s`), and the session log gets `own moves resumed after N s without one, M m from where they stopped` (`TelemetryPipeline.move_gaps`, counter `own_move_gaps`). Distances to other players measured from a held marker are as old as the marker.
+
+## Every creature within 500 m: arrow, bars and its own label (name + species)
+
+Guarantee (minimap only; `geo.is_guaranteed`): every player, dinosaur or unclassified creature whose displayed distance is
+at most **500 m** has (1) a full arrow and its health / stamina bars, (2) its own label whose first line is
+`<name or Player ?> - <species or Dino> - <distance>` and (3) a spot for that label inside the round view that does not cover
+another creature's arrow, your own arrow, the status lines or the ring captions. A creature that was guaranteed a moment ago
+stays so until 520 m (`GUARANTEED_STICKY_FACTOR`), so one walking along the 500 m ring does not flip between label modes.
+
+* **No tier cap and no pack label inside 500 m.** The nearest `GUARANTEED_FULL_LABELS` = 30 have two lines (name - species - distance, then HP / ST);
+  the next ones one line, up to `GUARANTEED_MAX_LABELS` = 45. More than `GUARANTEED_CROWD` = 60 creatures within 500 m (a stress test, never seen in
+  a recording: the busiest second had 10) keeps every arrow but labels only the nearest `GUARANTEED_CROWD_LABELS` = 20, so a frame stays cheap
+  (`tests/test_peers_ui.py::test_500_entities_selection_and_paint_budget`, 3.7 ms of 4.0).
+* **Between 250 and 500 m the label uses a 7 pt font** (8 pt inside 250 m), so more of them fit. A label may become one line there when the two-line one finds no room (for 4 s, no flipping); inside 250 m it stays two lines.
+* **Placement** (`overlay.MapView._draw_entities`, `place_guaranteed`): the side it had (kept while it still fits; it gives way only to an arrow under its text, not to a ring caption) -> the usual ten spots and five rings of twelve directions (`geo.spread_slots`, 20 - 104 px from the arrow; an index means the same place from frame to frame) clear of other labels and arrows -> clear of other labels only -> one line (250 - 500 m) -> the spot that covers the least of the others (`geo.least_overlap`; a few per frame, then the spot it had) -> never none. A label that is more than 14 px (`LEADER_MIN_PX`) from its arrow gets a thin leader line. At most 10 whole-list searches per frame (`SEARCH_BUDGET`); the rest of a crowd reuses its spot, reviewed after 1 s (`FORCED_REVIEW_S`).
+* **Nothing is hidden**: labels avoid your own arrow, the status lines, the ring captions (a label that already sits on one keeps its side) and the edge captions; arrows are painted after all pills, players topmost.
+* Label contrast: the pill is 69 % opaque (55 % for a stale creature), a stale or spawn-only creature's label keeps 73 % text opacity (its arrow is the dimmed part), a remembered / unknown species 90 % / 80 %.
+
+Checking it on a capture: `.venv/bin/python -I tools/tier_check.py --labels SESSION.pcap [--png DIR] [--check]` replays the capture through the real `MapView`
+(offscreen, simulated clock) and each second asks, for every creature within 500 m: inside the view, full arrow, own label with name and species, label inside the round view, not covering an arrow.
+`--png` saves the busiest second at 3x. Result on the recorded sessions (creature-seconds within 500 m; before = commit d861cce):
+
+| session | creature-seconds | before | after |
+|---|---|---|---|
+| session A, connection 1 | 142 | 73.9 % | 100 % |
+| session A, connection 2 | 16 | 100 % | 100 % |
+| session B | 604 | 93.5 % | 100 % |
+| session C | 277 | 49.1 % | 100 % |
+| session D, flying connection | 888 | 64.6 % | 100 % |
+| session E | 961 | 74.7 % | 100 % |
+| four more sessions (and D's swimming connection) | 0 | nobody within 500 m | |
+
+The names behind the placeholders: "Player ?" stood for every label in B, E, C and A-1 (the app started after the join, so the server's player names were never seen:
+the server sends a name once, at join) and for 200 of 888 in D; "Dino" (species unknown: no table seen, id neither in the shipped seed nor in the user's class cache, which these runs did not use) for 604 / 604 in B, 793 / 961 in E, 527 / 888 in D, 121 / 277 in C, 24 / 142 in A-1. Both upgrade as soon as the name or class is known (`tests/test_label_guarantee.py`).
+In a dense cluster two labels can still share a few pixels (informational; 6 - 13 % of the creature-seconds in the recordings); none covers an arrow and none is clipped.
+`tools/stability_replay.py --check` still reports only the known budgets (time to first dot, dot jumps in session C, headline changes in session D); the label hop budget (3 per minute) holds on every capture (worst 2.7), because a kept side tolerates `SLOT_SLACK_PX` = 6 px.
 
 ## Painting order, tiers and low-confidence positions
 

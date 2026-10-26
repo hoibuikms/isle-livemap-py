@@ -288,29 +288,29 @@ def test_a_label_tolerates_a_few_pixels_where_a_new_one_would_not_fit():
     r = place_label(86.0, 200, 80, 26, [], bounds, None, 3, slot)  # its left side sticks out of the view by 2 px
     assert slot == [3] and r[0] == -2.0
     slot = [0]
-    r = place_label(83.0, 200, 80, 26, [], bounds, None, 3, slot)  # 5 px: more than the slack, another side is taken
+    r = place_label(79.0, 200, 80, 26, [], bounds, None, 3, slot)  # 9 px: more than the slack, another side is taken
     assert slot != [3] and r[0] >= 0.0
 
 
 def test_a_peer_that_has_a_label_keeps_it_over_a_newcomer_at_almost_the_same_distance(tmp_path, clock, monkeypatch):
     from test_peers_ui import peer
 
-    monkeypatch.setattr("isle_livemap.geo.LABEL_CAPS_MINIMAP", (0, 2, 0, 0))  # room for two labels in the 500 m tier, so a newcomer has to take one over
+    monkeypatch.setattr("isle_livemap.geo.LABEL_CAPS_MINIMAP", (0, 0, 2, 0))  # two labels in the 1000 m tier (the inner tiers are guaranteed), so a newcomer has to take one over
 
     def at(i, metres, degrees):
         a = math.radians(degrees)
         return peer(view, i, metres * math.cos(a), metres * math.sin(a), name="")  # nameless: named players have extra labels
 
     view, fp = view_with(tmp_path, clock)
-    fp.set([at(1, 300.0, 0.0), at(2, 400.0, 120.0)])
+    fp.set([at(1, 600.0, 0.0), at(2, 700.0, 120.0)])
     advance(view, clock, 0.3)
     view.grab()
     assert view._labelled == {"1", "2"}
-    fp.set([at(1, 300.0, 0.0), at(2, 400.0, 120.0), at(4, 395.0, 240.0)])  # P4 is 1 % nearer than P2, but P2 has the label
+    fp.set([at(1, 600.0, 0.0), at(2, 700.0, 120.0), at(4, 695.0, 240.0)])  # P4 is 1 % nearer than P2, but P2 has the label
     advance(view, clock, 0.3)
     view.grab()
     assert view._labelled == {"1", "2"}
-    fp.set([at(1, 300.0, 0.0), at(2, 400.0, 120.0), at(4, 280.0, 240.0)])  # clearly nearer: now it takes the label
+    fp.set([at(1, 600.0, 0.0), at(2, 700.0, 120.0), at(4, 520.0, 240.0)])  # clearly nearer: now it takes the label
     advance(view, clock, 0.3)
     view.grab()
     assert "4" in view._labelled

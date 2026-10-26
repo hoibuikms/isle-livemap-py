@@ -64,10 +64,10 @@ def test_fish_never_use_up_the_label_budget_of_players():
     assert label_limits(2, 0, full_map=True)[0] == LABEL_CAPS_FULL
 
 
-def test_a_crowd_takes_labels_from_the_far_tiers_never_from_the_250_m_tier():
+def test_a_crowd_takes_labels_from_the_1000_m_tier_never_from_the_two_inner_tiers():
     caps, _ = label_limits(25, 0, full_map=False)
-    assert caps[0] == LABEL_CAPS_MINIMAP[0]
-    assert caps[1] < LABEL_CAPS_MINIMAP[1] and caps[2] < LABEL_CAPS_MINIMAP[2]
+    assert caps[0] == LABEL_CAPS_MINIMAP[0] and caps[1] == LABEL_CAPS_MINIMAP[1]  # inside 500 m a crowd takes nothing (geo.is_guaranteed)
+    assert caps[2] < LABEL_CAPS_MINIMAP[2]  # the 1000 m tier gives way
 
 
 def test_minimap_labels_the_player_first_even_when_many_fish_are_nearer(tmp_path, monkeypatch):
