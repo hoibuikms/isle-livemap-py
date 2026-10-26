@@ -309,6 +309,19 @@ def shortest_arc(a: float, b: float) -> float:
     return 180.0 if d == -180.0 else d
 
 
+OWN_STALE_S = 3.0  # no accepted own move for this long: the marker is held at the last place and drawn as uncertain
+
+
+def own_marker_stale(age_s: float | None) -> bool:
+    """True when the own marker has had no new move for ``OWN_STALE_S`` (dead, loading, teleported: it may not be where
+    the player is). ``age_s``: seconds since the last accepted move; None before the first fix."""
+    return age_s is not None and age_s > OWN_STALE_S
+
+
+def own_stale_text(age_s: float) -> str:
+    return f"? no moves {age_s:.0f} s"
+
+
 class Interpolator:
     """Eases the displayed position/heading toward the latest telemetry so a
     ~20-60 Hz stream is drawn smoothly at 60 fps. Exponential smoothing with a

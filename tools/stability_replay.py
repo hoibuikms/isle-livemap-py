@@ -1,6 +1,6 @@
 """Replay a recorded session through the real app path and measure what the minimap would have drawn.
 
-    .venv/bin/python -I tools/stability_replay.py SESSION.pcap [more.pcap ...] [--json out.json] [--seconds N]
+    .venv/bin/python -I tools/stability_replay.py SESSION.pcap [more.pcap ...] [--json out.json] [--seconds N] [--local-port N]
 
 Path: pcap -> TelemetryPipeline.handle -> GamePeerSource -> MapView.tick (60 fps, offscreen Qt) -> MapView.grab (5 Hz),
 with ``time.monotonic`` replaced by a simulated clock that follows the datagram times, so a 6 minute capture replays
@@ -558,6 +558,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("pcap", nargs="+", type=Path)
     ap.add_argument("--json", type=Path)
     ap.add_argument("--seconds", type=float)
+    ap.add_argument("--local-port", type=int, help="the game's UDP port when a capture holds several connections (default: the busiest)")
     ap.add_argument("--cache", type=Path, help="class_cache.json to start from (default: the shipped seed only)")
     ap.add_argument("--no-seed", action="store_true")
     ap.add_argument("--check", action="store_true", help="exit 1 when a stability budget (BUDGETS) is exceeded")
@@ -568,7 +569,7 @@ def main(argv: list[str]) -> int:
     for path in args.pcap:
         cache = ClassCache.load(args.cache, seed={} if args.no_seed else None)
         cache.path = None  # replays never write the user's cache
-        r = run(path, cache, args.seconds)
+        r = run(path, cache, args.seconds, local_port=args.local_port)
         r["budget_violations"] = check_budgets(r)
         results.append(r)
         print(json.dumps(r, indent=1, default=str))

@@ -30,7 +30,7 @@ from typing import Callable, Iterable
 from .ifaces import (
     collect_interfaces, derive_capture_status, get_logger, outbound_ip, select_interfaces, should_fallback_to_all,
 )
-from .decode import MovementCandidate
+from .decode import MovementCandidate, find_server_locations
 from .tracking import MovementTracker, Vitals, VitalsObservation, VitalsTracker
 
 GAME_PROCESS_NAME = "TheIsleClient-Win64-Shipping"  # without .exe
@@ -153,6 +153,18 @@ JUMP_MIN_SPEED_CM_S = 10_000.0  # ... at more than 100 m/s: no creature moves li
 JUMP_MAX_GAP_S = 10.0  # the tracker takes a new place over only after a couple of seconds of silence from the old one
 JUMP_CLOCK_TOL_S = 1.5  # the client clock advanced by the wall time between the two moves, give or take this
 JUMPS_KEPT = 20
+# The server's own copy of the own location (decode.find_server_locations), confirmed by a second packet: compared with the
+# position decoded from the client's moves. 60 m is more than a fast mover's latency (29 m at 15 m/s, 2 s behind).
+SERVER_FIX_REPEAT_S = 1.0
+SERVER_FIX_SAME_M = 3.0
+SERVER_FIX_MAX_DZ_M = 60.0
+SERVER_FIX_MAX_M = 6_000.0
+SERVER_FIX_FAR_M = 60.0
+FRAME_CHECKS_KEPT = 20
+# No accepted own move for this long: the marker is where the last move put it, not necessarily where the player is (dead and
+# waiting to respawn, a loading screen, a teleport: recorded gaps of 4 s to 24 s, ending 50 m to 1.4 km from where they began).
+MOVE_GAP_S = 3.0
+MOVE_GAPS_KEPT = 20
 
 
 class TelemetryPipeline:
@@ -175,7 +187,8 @@ class TelemetryPipeline:
         # fn(datagram) for EVERY datagram handed to handle(), both directions, before decoding (the recorder).
         self._datagram_observers: list[Callable[[Datagram], None]] = []
         self._counts = {"outbound": 0, "inbound": 0, "dropped": 0, "udp_total": 0, "decoded": 0,
-                        "queue_max": 0, "slow_decodes": 0, "capture_errors": 0, "worker_restarts": 0}
+                        "queue_max": 0, "slow_decodes": 0, "capture_errors": 0, "worker_restarts": 0,
+                        "server_fixes": 0, "server_fixes_far": 0}
         # fn(where) called from inside an ``except`` block when a decoder/observer raised (the session log
         # records the traceback); the exception itself is still swallowed so capture never stops.
         self.error_hook: Callable[[str], None] | None = None
@@ -187,6 +200,12 @@ class TelemetryPipeline:
         self._raw: MovementCandidate | None = None
         self._raw_at = 0.0
         self.jumps: list[tuple[float, float]] = []  # (datagram time, metres) of the last JUMPS_KEPT position jumps
+        # (datagram time of the move that ended the gap, seconds without an accepted move, metres from where it began)
+        self.move_gaps: list[tuple[float, float, float]] = []
+        # (datagram time, metres between the server's own location and the decoded one, server (x, y, z) cm) of the last
+        # FRAME_CHECKS_KEPT confirmed server locations that were further than SERVER_FIX_FAR_M from the decoded position
+        self.frame_checks: list[tuple[float, float, tuple[float, float, float]]] = []
+        self._srv_prev: tuple[float, list[tuple[float, float, float]]] | None = None
 
     def set_status(self, status: str) -> None:
         with self._lock:
@@ -243,6 +262,7 @@ class TelemetryPipeline:
         with self._lock:
             self._movement.reset()
             self._vitals.reset()
+            self._srv_prev = None
             self._server = None
             self._rival = None
             self._align, self._align_stale, self._raw = (0.0, 0.0), False, None
@@ -295,6 +315,39 @@ class TelemetryPipeline:
             self._counts["position_jumps"] = self._counts.get("position_jumps", 0) + 1
             if self._align[0] or self._align[1]:
                 self._align_stale = True
+
+    def _note_move_gap(self, sample: MovementCandidate, at: float) -> None:
+        prev = self._raw
+        if prev is None or at - self._raw_at <= MOVE_GAP_S:
+            return
+        self.move_gaps.append((at, at - self._raw_at, math.hypot(sample.x - prev.x, sample.y - prev.y) / 100.0))
+        del self.move_gaps[:-MOVE_GAPS_KEPT]
+        self._counts["own_move_gaps"] = self._counts.get("own_move_gaps", 0) + 1
+
+    def _check_server_location(self, d: Datagram) -> None:
+        """Inbound packet of the learned server: does it carry the own location the server holds, and does it agree with the
+        position decoded from the client's moves? Counted only (never changes the position): in every recorded connection
+        the two agree to a few metres, which is what shows the own marker and the replicated creatures share a frame."""
+        locs = find_server_locations(d.payload)
+        prev = self._srv_prev
+        if locs:
+            self._srv_prev = (d.observed_at, locs)  # packets without a triple in between do not forget the last one
+        raw = self._raw
+        if not locs or prev is None or raw is None or d.observed_at - prev[0] > SERVER_FIX_REPEAT_S or d.observed_at - self._raw_at > 2.0:
+            return
+        for x, y, z in locs:
+            if not any(math.hypot(x - px, y - py) < SERVER_FIX_SAME_M * 100 and abs(z - pz) < SERVER_FIX_SAME_M * 100 for px, py, pz in prev[1]):
+                continue
+            dz = abs(z - raw.z) / 100.0
+            far = math.hypot(x - raw.x, y - raw.y) / 100.0
+            if dz > SERVER_FIX_MAX_DZ_M or far > SERVER_FIX_MAX_M:
+                continue  # not the own location (another triple of doubles)
+            self._counts["server_fixes"] += 1
+            if far > SERVER_FIX_FAR_M:
+                self._counts["server_fixes_far"] += 1
+                self.frame_checks.append((d.observed_at, far, (x, y, z)))
+                del self.frame_checks[:-FRAME_CHECKS_KEPT]
+            return
 
     def align_to(self, x: float, y: float) -> bool:
         """The user stands at world (x, y) (cm), e.g. next to another player whose position is known: from now on every
@@ -358,7 +411,7 @@ class TelemetryPipeline:
                         self._server, self._server_seen, self._rival = dest, d.observed_at, None
                         self._vitals.reset()
                         vit, vit_at = None, 0.0
-                        self._align, self._align_stale, self._raw = (0.0, 0.0), False, None
+                        self._align, self._align_stale, self._raw, self._srv_prev = (0.0, 0.0), False, None, None
                         reset_taps = list(self._reset_observers)
                     else:
                         return None  # a stray datagram: not game traffic of the learned server
@@ -366,6 +419,7 @@ class TelemetryPipeline:
                 if sample is not None:
                     self._counts["decoded"] += 1
                     self._note_jump(sample, d.observed_at)
+                    self._note_move_gap(sample, d.observed_at)
                     self._raw, self._raw_at = sample, d.observed_at
                     pos, pos_at, changed = self._aligned(sample), d.observed_at, True
             elif d.direction == INBOUND:
@@ -374,6 +428,7 @@ class TelemetryPipeline:
                     obs: VitalsObservation | None = self._vitals.track(d.payload, d.observed_at)
                     if obs is not None:
                         vit, vit_at, changed = obs.vitals, d.observed_at, True
+                    self._check_server_location(d)
                     if self._inbound_observers:
                         tap = (list(self._inbound_observers), self._vitals.self_handle)
             if not changed:

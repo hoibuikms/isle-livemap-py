@@ -20,6 +20,7 @@ from .geo import (
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, UNKNOWN_HEADING_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
     PEER_STALE_S, PEER_TTL_S, SLOT_SLACK_PX, label_limits, place_label, priority_key, priority_tier, visible_entities,
     marker_extent, marker_radius, peer_style, truncate, _overlaps, display_name, vitals_readings, with_vitals,
+    own_marker_stale, own_stale_text,
 )
 from .peers import status_is_warning
 
@@ -75,6 +76,7 @@ class MapView(QWidget):
         self._peers_snap = None
         self._peers_version = -1
         self.peer_status = ""
+        self.own_age_s: float | None = None  # seconds since the last accepted own move (None: no fix)
         self.record_status = ""  # set by App once a second while --record is active
         self._marker_tools: dict[tuple, tuple[QPen, QColor]] = {}
         self._bar_colors: dict[int, QColor] = {}  # health bar fill by 5 % step (no QColor built per frame)
@@ -178,6 +180,7 @@ class MapView(QWidget):
             # marker parked there with "nearby" measured from it is a stuck map. Say "waiting" until a new fix arrives.
             self.interp.has_fix = False
             self._last_pos_at = 0.0
+        self.own_age_s = max(0.0, now - t.position_at) if t.position is not None and t.position_at and self.interp.has_fix else None
         self.interp.step(dt, now)
         if self.peers is not None:
             try:
@@ -730,10 +733,17 @@ class MapView(QWidget):
         p.translate(c)
         p.rotate(self.interp.heading)
         st = ENTITY_STYLE["self"]
-        p.setPen(QPen(_qcolor(st.outline), 1.5))
-        p.setBrush(_qcolor(st.color))
+        stale = own_marker_stale(self.own_age_s)
+        # no move for a few seconds (dead, loading, teleported): the arrow is where the last move put it, so it is drawn hollow
+        # and dim, with a "?" - never as an exact position
+        p.setPen(QPen(_qcolor(st.outline, 120 if stale else 255), 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush if stale else _qcolor(st.color))
         p.drawPolygon(QPolygonF([QPointF(0, -10), QPointF(7, 8), QPointF(0, 4), QPointF(-7, 8)]))
         p.restore()
+        if stale:
+            p.setPen(QColor(255, 170, 90))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(QPointF(c.x() + 11, c.y() + 14), own_stale_text(self.own_age_s))
 
     def _draw_border(self, p: QPainter) -> None:
         p.setBrush(Qt.BrushStyle.NoBrush)

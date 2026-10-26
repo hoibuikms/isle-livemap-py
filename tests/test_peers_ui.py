@@ -41,7 +41,7 @@ def make_view(tmp_path, peers=None, fix=True, settings=None):
     QApplication.instance() or QApplication([])
     pipe = TelemetryPipeline()
     if fix:
-        for d in SyntheticSource().datagrams(10.0):
+        for d in SyntheticSource().datagrams(10.0, t0=time.monotonic() - 10.0):  # on the live clock: the fix is fresh
             pipe.handle(d)
     view = MapView(pipe, MarkerStore(tmp_path / "m.json"), settings or Settings(), peers)
     view.tick()

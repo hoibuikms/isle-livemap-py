@@ -43,9 +43,11 @@ def _needed(v: int) -> int:
     return 1 + (~v if v < 0 else v).bit_length()
 
 
-def encode_move_payload(x: float, y: float, z: float, unreal_yaw_deg: float, client_ts: float) -> bytes:
+def encode_move_payload(x: float, y: float, z: float, unreal_yaw_deg: float, client_ts: float,
+                        accel: tuple[int, int, int] | None = None) -> bytes:
     """Build a client->server move payload the decoder understands:
-    pad | f32 timestamp | zero acceleration | FVector_NetQuantize100 location | rotation."""
+    pad | f32 timestamp | acceleration | FVector_NetQuantize100 location | rotation.
+    ``accel``: the acceleration as raw FVector_NetQuantize10 integers (cm/s² × 10); None: zero."""
     raw = [round(v * 100) for v in (x, y, z)]
     comp = max(_needed(r) for r in raw)
     if comp < 23 or comp > 31:
@@ -53,8 +55,14 @@ def encode_move_payload(x: float, y: float, z: float, unreal_yaw_deg: float, cli
     w = BitWriter()
     w.write(0, 40)
     w.write(struct.unpack("<I", struct.pack("<f", client_ts))[0], 32)
-    w.write(1 | 64, 7)  # acceleration vector: 1-bit components (all zero)
-    w.write(0, 3)
+    if accel is None:
+        w.write(1 | 64, 7)  # acceleration vector: 1-bit components (all zero)
+        w.write(0, 3)
+    else:
+        bits = max(_needed(a) for a in accel)
+        w.write(bits | 64, 7)
+        for a in accel:
+            w.write(a, bits)
     w.write(comp | 64, 7)
     for r in raw:
         w.write(r, comp)

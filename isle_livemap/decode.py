@@ -14,6 +14,7 @@ is turned into one big integer and bit fields are read with shift and mask.
 from __future__ import annotations
 
 import math
+import re
 import struct
 from collections import Counter
 from dataclasses import dataclass, field
@@ -105,8 +106,15 @@ _MIN_COMP_BITS = 1
 _MAX_COMP_BITS = 31
 _MIN_WORLD_XY, _MAX_WORLD_XY = -800_000.0, 800_000.0
 _MIN_WORLD_Z, _MAX_WORLD_Z = -10_000.0, 100_000.0
-_MAX_ACCEL = 100_000.0
+# Largest acceleration component (cm/s²) a move record may carry. Fast movers send more than 100 000 (recorded: 105 000 to
+# 110 000 on a flyer at 25 m/s): with the old cap those moves did not parse, the marker stood still for up to 15 s and then
+# jumped 200-400 m. 2 000 000 gives the same decode as 400 000 on every recorded capture.
+_MAX_ACCEL = 400_000.0
 _MAX_CLIENT_TS = 10_000_000.0
+# A client clock below a millisecond is not a clock: it is some other 32 bits that happen to sit where a timestamp would. The
+# prefix reader used to stop at the first acceleration width whose header matched, and a false 4-bit match with a timestamp of
+# 5.6e-17 hid the true 20-bit one (recorded session: 12 s of moves ignored, the marker stood still, then jumped).
+_MIN_CLIENT_TS = 1e-3
 
 
 def _read_signed(bits: Bits, offset: int, count: int) -> int:
@@ -157,7 +165,7 @@ def _read_move_prefix(bits: Bits, location_offset: int) -> float | None:
         if max(abs(rx), abs(ry), abs(rz)) / scale > _MAX_ACCEL:
             continue
         ts = f32(bits.read(ts_off, _FLOAT_BITS))
-        if not math.isfinite(ts) or ts <= 0.0 or ts > _MAX_CLIENT_TS:
+        if not math.isfinite(ts) or ts < _MIN_CLIENT_TS or ts > _MAX_CLIENT_TS:
             continue
         return ts
     return None
@@ -221,6 +229,40 @@ def decode_movement(payload: bytes) -> list[MovementCandidate]:
         if not ok:
             continue
         out.append(MovementCandidate(x, y, z, yaw, ts, len(payload), off, comp))
+    return out
+
+
+# ---------------------------------------------------------------- the server's own copy of the own location
+#
+# From time to time (a correction, and when the pawn is re-synchronised) the server sends the owner's location as three
+# IEEE doubles (cm) at any bit offset of an inbound packet, repeated in the next few packets. It is the one place where
+# the own position is known in the server's frame: in all ten recorded connections (flying, walking and swimming) it
+# equals the position decoded from the client's own moves to 0-6 m (29 m at 15 m/s with 2 s of latency), so the own
+# marker and the replicated creatures share a frame. ``tools/`` and the session log use it to verify that.
+
+_DOUBLE_HI = rb"[\x40\x41\xc0\xc1]"  # top byte of a double of magnitude 2 .. 2^21 (positions in cm are below 8e5)
+_TRIPLE_RE = re.compile(rb"(?=(.{7}" + _DOUBLE_HI + rb".{7}" + _DOUBLE_HI + rb".{7}" + _DOUBLE_HI + rb"))", re.S)
+_SERVER_LOC_MIN_CM = 1e4  # x and y of a real position are both > 100 m from the world origin; smaller triples are other data
+
+
+def find_server_locations(payload: bytes) -> list[tuple[float, float, float]]:
+    """Every plausible (x, y, z) in cm that the packet carries as three consecutive doubles, at any bit offset. Most
+    packets have none; a few chance triples exist, so a caller trusts one only when a second packet repeats it."""
+    n = len(payload)
+    if n < 24:
+        return []
+    value = int.from_bytes(payload, "little")
+    out: list[tuple[float, float, float]] = []
+    for shift in range(8):
+        data = ((value >> shift) & ((1 << (8 * n - shift)) - 1)).to_bytes(n, "little")
+        for m in _TRIPLE_RE.finditer(data):
+            x, y, z = struct.unpack_from("<ddd", data, m.start())
+            if (
+                math.isfinite(x) and math.isfinite(y) and math.isfinite(z)
+                and _SERVER_LOC_MIN_CM < abs(x) < _MAX_WORLD_XY and _SERVER_LOC_MIN_CM < abs(y) < _MAX_WORLD_XY
+                and 1.0 < abs(z) < _MAX_WORLD_Z
+            ):
+                out.append((x, y, z))
     return out
 
 

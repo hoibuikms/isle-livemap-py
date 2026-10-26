@@ -164,6 +164,8 @@ class SessionLog:
         self._labels_sig: frozenset | None = None
         self._labels_at = -1e9
         self._jump_at = -1e9  # datagram time of the newest position jump already logged
+        self._frame_at = -1e9  # ... and of the newest server-vs-decoded own location disagreement
+        self._gap_at = -1e9  # ... and of the newest gap in the own moves
         self._align_seen = (0.0, 0.0)
         self._first_creation = False
         self._errors: dict[str, int] = {}
@@ -312,6 +314,17 @@ class SessionLog:
                 self._jump_at = at
                 self.event("own position jumped %.0f m while the client clock carried on (a teleport, or the frame the client "
                            "reports in changed); other players are not corrected for it", metres)
+        for at, secs, metres in tuple(getattr(pipe, "move_gaps", ())):
+            if at > self._gap_at:
+                self._gap_at = at
+                self.event("own moves resumed after %.0f s without one, %.0f m from where they stopped (death and respawn, "
+                           "a loading screen or a teleport); the own marker was held at the last place and drawn as uncertain",
+                           secs, metres)
+        for at, metres, (sx, sy, sz) in tuple(getattr(pipe, "frame_checks", ())):
+            if at > self._frame_at:
+                self._frame_at = at
+                self.event("the server's own location is %.0f m from the decoded one (server %.0f, %.0f, %.0f m): the client's "
+                           "position was stale or in another frame", metres, sx / 100, sy / 100, sz / 100)
         align = getattr(pipe, "alignment_m", (0.0, 0.0))
         if align != self._align_seen:
             self._align_seen = align
@@ -352,10 +365,11 @@ class SessionLog:
             summary = getattr(self.peers, "summary", None)
             self.event("%s: in=%d out=%d decoded=%d dropped=%d | creation=%d exports=%d destroyed=%d | "
                        "actors tracked=%d distinct handles=%d | worker queue max=%d slow decodes=%d capture errors=%d "
-                       "worker restarts=%d | recorded=%s%s",
+                       "worker restarts=%d | server own-location confirmations=%d (far=%d) | recorded=%s%s",
                        label, c.get("inbound", 0), c.get("outbound", 0), c.get("decoded", 0), c.get("dropped", 0),
                        self.creation, self.exports, self.destroyed, actors, len(self.handles),
                        c.get("queue_max", 0), c.get("slow_decodes", 0), c.get("capture_errors", 0), c.get("worker_restarts", 0),
+                       c.get("server_fixes", 0), c.get("server_fixes_far", 0),
                        f"{rec.packets} pkts in {rec.path.name}" if rec is not None else "no",
                        f" | {summary()}" if callable(summary) else "")
         except Exception:  # noqa: BLE001
