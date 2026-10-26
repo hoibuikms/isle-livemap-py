@@ -146,3 +146,15 @@ def test_least_overlap_prefers_a_free_spot_then_the_one_that_covers_least():
         or least_overlap(cands, [(0.0, 0.0, 50.0, 10.0), (0.0, 20.0, 50.0, 10.0), (10.0, 40.0, 50.0, 10.0)], bounds) == cands[2]
     assert least_overlap([(-20.0, 0.0, 50.0, 10.0)], [], bounds) is None  # nothing inside the bounds
     assert GUARANTEED_MAX_LABELS > GUARANTEED_FULL_LABELS
+
+
+def test_the_last_resort_goes_over_labels_before_it_goes_over_an_arrow():
+    from isle_livemap.geo import least_overlap
+
+    bounds = (0.0, 0.0, 200.0, 100.0)
+    over_a_label = (10.0, 10.0, 60.0, 12.0)  # overlaps a label by 60 x 6 px
+    over_an_arrow = (100.0, 10.0, 60.0, 12.0)  # overlaps nothing but the middle of an arrow
+    labels = [(10.0, 16.0, 60.0, 12.0)]
+    arrows = [(125.0, 13.0, 6.0, 6.0)]
+    assert least_overlap([over_a_label, over_an_arrow], labels, bounds) == over_an_arrow  # without the arrows it only counts labels
+    assert least_overlap([over_a_label, over_an_arrow], labels, bounds, avoid=arrows) == over_a_label

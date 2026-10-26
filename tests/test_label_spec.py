@@ -58,7 +58,7 @@ def test_server_animals_say_ai_and_their_name_in_one_line():
 
 def test_the_label_has_no_compass_or_height_they_are_in_the_table_and_the_summary():
     e = E("6", "player", name="Rex", species="Allosaurus", z=14_000.0)
-    text = " ".join(entity_label_lines(Nearby(e, 0.0, 0.0, 724.0, 45.0), my_z=10_000.0))
+    text = " ".join(entity_label_lines(Nearby(e, 0.0, 0.0, 724.0, 45.0)))
     assert "NE" not in text and "▲" not in text
 
 

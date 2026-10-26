@@ -269,9 +269,12 @@ def test_own_marker_dead_reckoning_stops_at_the_horizon_and_on_teleport():
     it = Interpolator(tau_s=0.09)
     it.set_target(0, 0, 0, 0.0)
     it.set_target(100, 0, 0, 0.2)  # 500 cm/s
-    for i in range(600):
+    for i in range(30):  # 0.5 s after the sample: the 0.2 s horizon is over (plus the grace), the marker is at its end
         it.step(1 / 60, 0.2 + i / 60)
-    assert it.x == pytest.approx(200.0, abs=1.0)  # 0.2 s horizon, never beyond
+    assert 170.0 < it.x <= 201.0  # 0.2 s horizon, never beyond
+    for i in range(30, 600):  # nothing new for 10 s: it eased back to the last real position, it does not stay overshot
+        it.step(1 / 60, 0.2 + i / 60)
+    assert it.x == pytest.approx(100.0, abs=1.0)
     it.set_target(100, 0, 0, 20.0)  # long silence, then the same spot: velocity dropped
     it.set_target(100, 0, 0, 20.3)
     for i in range(120):

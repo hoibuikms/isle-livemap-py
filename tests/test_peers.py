@@ -12,7 +12,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from isle_livemap import peers
-from isle_livemap.geo import Entity, local_entity, nearby_3d, vital_lines, visible_entities
+from isle_livemap.geo import Entity, local_entity, vital_lines, visible_entities
 from isle_livemap.nearby import nearby_entities as lab_nearby
 from isle_livemap.peers import (
     LAB_PLAYER_ID, GamePeerSource, LabPeerSource, PeerStore, SyntheticPeers, create_peer_source, from_record,

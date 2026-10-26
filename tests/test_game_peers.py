@@ -150,7 +150,7 @@ def test_game_labels_say_animal_for_an_unknown_server_animal_and_never_show_grow
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     near = visible_entities([(p.entity, p.entity.x, p.entity.y) for p in g.snapshot().entities], 200_000.0, -250_000.0, 5_000.0)
     assert near
-    lines = peer_label_lines(near[0], my_z=30_000.0)
+    lines = peer_label_lines(near[0])
     assert len(lines) == 1 and re.fullmatch(r"AI - Animal - \d+ m", lines[0]), lines  # a server animal with no class: "AI - Animal"
     assert "HP" not in lines[0] and "G " not in lines[0]  # no vitals line for fish, no growth / hunger / thirst
 

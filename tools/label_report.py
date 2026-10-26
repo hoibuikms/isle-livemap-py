@@ -388,7 +388,7 @@ def _labels_at_without_qt(pcap: Path, at_s: float, cache, local_port) -> dict:
     dots = []
     for i, n in enumerate(sorted(near, key=priority_key)):
         dots.append({"id": n.entity.id, "kind": n.entity.kind, "row": rows.get(n.entity.id), "distance_m": n.distance_m,
-                     "bearing": n.bearing, "lines": peer_label_lines(n, own[2]) if i < total else None, "stale": False,
+                     "bearing": n.bearing, "lines": peer_label_lines(n) if i < total else None, "stale": False,
                      "inside": None})
     return {"dots": dots, "status": peers.status(), "rendered": False, "own": own, "radius_m": settings.peer_radius_m,
             "hidden": peers.hidden_creatures(), "errors": 0, "peers": peers}

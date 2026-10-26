@@ -44,7 +44,7 @@ Out of scope:
 ### 2.2 Shared geo path (`geo.py`)
 - Unreal cm, north = -Y. `Entity(id, kind, name, species, x, y, z, growth/health/stamina/hunger/thirst_pct)`: **no heading field**.
 - `vital_pct(cur, max)` is the single vitals decoder (used by `local_entity`, `nearby.from_lab`, and, in the working tree, `feed._pct`).
-- `nearby_entities(items, px, py, radius, show_players, show_ai)` (2D, no self filter) is what `MapView.nearby()` uses. `nearby_3d(me, entities, r)` filters `e.id != me.id` and sorts by 3D distance, but is used only by `nearby.py`.
+- `nearby_entities(items, px, py, radius, show_players, show_ai)` (2D, no self filter) is what `MapView.nearby()` uses. `nearby_3d(me, entities, r)` filters `e.id != me.id` and sorts by 3D distance, but is used only by `nearby.py`. **Later change:** the minimap is flat, so `nearby_3d`, the 3D distance and the height delta were removed; `nearby.py` now uses `visible_entities` (2D) like the map and the Nearby panel (see `docs/PEERS.md`, "Distance, direction and why a dot can be missing").
 - `local_entity` uses id `"local"`. Packet ids never equal `"local"`, so the `nearby_3d` self filter is a no-op for packet-sourced data unless self is removed upstream (relevant to section 4.4).
 - `EntitySmoother`: per-id smoothing (tau 0.15 s), drops vanished ids immediately. `Settings`: `show_players`, `show_ai`, `feed_radius_m` (the radius is not really feed-specific), plus the feed fields (DEPRECATED, section 9).
 

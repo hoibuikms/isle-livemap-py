@@ -100,8 +100,8 @@ The session log has a compact `labels:` line, written every 30 s while creatures
 
 There are no species, diet or size categories on the marker: every dinosaur of another person (a creature that
 references a PlayerState, a dinosaur whose controller is not known, and a creature whose class is not known at all) is
-the **same purple arrow** as your own red one: the same polygon at 75 % of its size (`geo.PEER_ARROW_SCALE`), purple
-`#a24dff` (`geo.PEER_COLOR`) with a dark outline for the 40 most important peers. It points along the direction of travel
+the **same purple arrow** as your own red one: the same polygon at 85 % of its size (`geo.PEER_ARROW_SCALE`), purple
+`#a24dff` (`geo.PEER_COLOR`) with a dark 2.2 px outline (`geo.PEER_OUTLINE_W`; yours is 1.5 px, the fish's too) for the 40 most important peers. It points along the direction of travel
 (measured from successive positions; kept while the creature rests) and points north, slightly softer, until the creature
 has moved. The species, the name and the numbers are in the label text only. Your own arrow stays red.
 
@@ -111,7 +111,11 @@ has moved. The species, the name and the numbers are in the label text only. You
 | another player's dinosaur, any species or none | purple arrow, the same shape as yours |
 | server animal (fish) | small muted grey-blue diamond: background, not a target |
 
-Labels sit on a soft dark pill, so the second line reads on any background. A thin **health bar** (green to red) and a
+**Players are bolder than the rest.** The first line of a player's or dinosaur's label (`Name - Species - Distance`) is set in a
+bold font in a lighter purple (`geo.PEER_LABEL_COLOR`) on a darker pill (`LABEL_BG_PLAYER`, 86 % opaque; the fish's pill is
+69 %), and so is the name caption of a far player on the circle edge. A fish's label stays regular and muted. Label widths are
+measured with the bold font (`lines_width` in `MapView._draw_entities`), so the bolder text does not run out of its pill or
+the collision boxes. Labels sit on a dark pill, so the second line reads on any background. A thin **health bar** (green to red) and a
 **stamina bar** (blue) hang under the arrow of every player and dinosaur, the 60 most important (`BAR_MAX`), whether it has
 a label or not (`show_vitals_bars`, tray "Health / stamina bars"; not for fish). A value that was never read is an empty
 grey track, so every creature has the same two bars. The bars show the ratio of the label's second line on purpose: the
@@ -121,13 +125,18 @@ of its own creature (the slots under the arrow start below the bars: `place_labe
 (500 anti-aliased glyphs do not fit a 16 ms frame; the 500-peer paint test takes ~3.6 ms: the arrows are cached polygons
 moved by the painter, and only the 40 most important have an outline).
 
-## Distance, direction, height and why a dot can be missing
+## Distance, direction and why a dot can be missing
 
-Every place that describes where a creature is uses one wording (`geo.where_text`): `724 m NE ▲40 m` (tooltip text and
-log lines) and, in separate columns, in the Nearby table (Distance, Direction, Height Δ); the minimap label itself carries the
-distance only. The direction is a
-compass bearing from map-north (north = -Y), not relative to where you look; the minimap does not rotate. `▲` is above you,
-`▼` below you, `level` within half a metre, and the height is left out when it is not known. Health and stamina are printed
+**The minimap is flat: every distance is the horizontal (2D) one, `sqrt(dx² + dy²)` in metres (`geo.distance_m`), and height is
+not shown anywhere.** The distance tiers (250 / 500 / 1000 m), the view radius, the sort order, the label ranking, the edge
+captions, the `~` of a spawn-only position, the Nearby table, the session log and `nearby.py` (the lab radar) all use that one
+number; a dinosaur on a cliff 40 m above you is as far away as the one on the ground below it. `Entity.z` is still decoded (it
+is used to validate the movement lock and to recognise the server's own-location copy) but it is no part of any distance and
+there is no height text, `▲`/`▼`, `level` or Height column any more (`geo.distance_3d_m`, `height_delta_m`, `format_height`,
+`nearby_3d` and the `use_3d` mode of `visible_entities` are gone). Every place that describes where a creature is uses one
+wording (`geo.where_text`): `724 m NE` (tooltip text and log lines) and, in separate columns, in the Nearby table (Distance,
+Direction); the minimap label itself carries the distance only. The direction is a compass bearing from map-north (north =
+-Y), not relative to where you look; the minimap does not rotate. Health and stamina are printed
 once in the label, as `HP` / `ST` (table headers use the same two words); the bars under the arrows show the same
 readings as a picture.
 
@@ -202,7 +211,7 @@ Not all creatures in view are positioned: the capture shows creatures (Deinosuch
 The own marker follows the client's own outbound move packets (no network hop). Other actors can only be as fresh as the server's replication of them: one-way latency plus the server's send interval for that actor, which Iris decides per actor (priority, relevance, only when state changed). The recorded fixtures carry no packet timestamps, so that rate cannot be measured in seconds from them. What the code controls:
 
 - Every decoded location is written to the store immediately (no buffering, decode cost 0.04..3 ms per packet) and the overlay reads the store every frame (16 ms timer), the same tick that moves the own marker.
-- Between samples the dot is dead-reckoned (`geo.EntitySmoother`, `DR_*`): the target advances along the velocity of the last two distinct samples, for at most twice the measured interval and never more than 3 s (`DR_PEER_HORIZON_FACTOR`, `DR_PEER_MAX_EXTRAP_S`; the own marker keeps one interval / 1 s), then holds and is dimmed by its age (`PEER_STALE_S`); a position re-sent unchanged, a gap over 3 s, a teleport or an implausible speed (over 60 m/s) switches it off. Position only: it never produces a heading.
+- Between samples the dot is dead-reckoned (`geo.EntitySmoother`, `DR_*`): the target advances along the velocity of the last two distinct samples, for at most twice the measured interval and never more than 3 s (`DR_PEER_HORIZON_FACTOR`, `DR_PEER_MAX_EXTRAP_S`; the own marker keeps one interval / 1 s), then eases back to the last real position over `DR_RELAX_S` (2 s, `geo.relax_factor`) and is dimmed by its age (`PEER_STALE_S`); a position re-sent unchanged, a gap over 3 s, a teleport or an implausible speed (over 60 m/s) switches it off. Position only: it never produces a heading.
 - The dot is **feed-forward**: it moves at the measured velocity all the time and the error to the newest sample is blended in over `DR_CORR_TAU_S` (0.2 s). The earlier version chased the target with a 0.09 s lag filter; with samples 0.7-1 s apart it stood still at the end of each horizon and jumped when the next sample came (6-20 visible jumps a minute). A sample that is late by up to `DR_FF_GRACE_S` (0.3 s) no longer stops the dot. The own marker still uses the 0.09 s filter with the lead (its samples come every ~0.1 s).
 - A reused handle (`PeerEntity.born` changes) is a different creature: the dot starts at its position instead of gliding there from the old one.
 
@@ -268,6 +277,32 @@ Effect on the own marker (`tools/stability_replay.py --local-port N`, per connec
 
 **The marker says when it cannot know.** After `OWN_STALE_S` (3 s) without an accepted move the own arrow is drawn hollow and dim with `? no moves 12 s` next to it (`geo.own_marker_stale`, `MapView.own_age_s`), and the session log gets `own moves resumed after N s without one, M m from where they stopped` (`TelemetryPipeline.move_gaps`, counter `own_move_gaps`). Distances to other players measured from a held marker are as old as the marker.
 
+## Exact positions on the screen
+
+What is drawn is the position that was decoded, not a nearby one:
+
+* **The middle of the arrow is the coordinate.** The arrow (yours and every other player's) is one polygon, `geo.ARROW_POINTS`,
+  moved so that its **area centroid is the origin** (it used to hang 0.7 px above it), and it turns around that point. A
+  creature at world (x, y) has the middle of its arrow on `MapView.world_to_screen(x, y)`: sub-pixel (`QPointF`), the view
+  centred on your own displayed position at the same instant, north up, the same number of pixels per metre east-west and
+  north-south (checked by algebra and by `tests/test_exact_position.py`: 100 m east and 250 m north land on the pixel the
+  constants give, two creatures at one world position land on one pixel, the entity loop equals `world_to_screen`).
+* **At rest the dot is exactly on its last position** (within a millimetre): the smoothing converges on the sample and, since the
+  server sends changes only, a dot that was dead-reckoned and then heard nothing more **eases back** to the last real position
+  over `DR_RELAX_S` = 2 s after its horizon (`geo.relax_factor`). Before this the dot stayed where the extrapolation ended, up to
+  twice the measured interval of movement (up to 3 s of it) past the place where the creature stopped.
+* **In motion it is neither ahead nor behind**: for a steady walker the mean signed error along the path is under 25 cm and
+  the worst under 1.5 m, for peers (a sample every 0.5 s) and for your own marker (every 0.14 s). The lead of `tau` cancels the
+  filter's lag (`Interpolator._aim`, `EntitySmoother.step`).
+* **Measured on the recordings** (8 sessions, 9399 position intervals, ad-hoc script not kept: for every pair of consecutive
+  decoded positions, the displayed dot just before the second against the second): median error **0.75 m** (a dot left on the
+  first position: 1.85 m), 90th percentile 3.8 m (6.9 m); with a moving creature and a gap of 3 - 6 s the dot is closer to
+  the next position than the held one in 54 % of the cases (48 % before the easing back), 90th percentile 2.9 m (3.7 m). What
+  remains is the server's own granularity: its positions are quantised to about 0.6 m and arrive every 0.3 - 1 s.
+* **Check it yourself**: tray "Show exact positions (debug)" (or `ISLE_DEBUG_POSITIONS=1`; off at every start) draws a
+  yellow crosshair on the newest decoded position of every creature, a magenta one on yours, and a thin line to the middle
+  of the arrow that is drawn. For a creature at rest the line has no length; in motion it is the dead-reckoned lead.
+
 ## Every creature within 500 m: arrow, bars and its own label (name + species)
 
 Guarantee (minimap only; `geo.is_guaranteed`): every player, dinosaur or unclassified creature whose displayed distance is
@@ -282,6 +317,9 @@ stays so until 520 m (`GUARANTEED_STICKY_FACTOR`), so one walking along the 500 
   (`tests/test_peers_ui.py::test_500_entities_selection_and_paint_budget`, 3.7 ms of 4.0).
 * **Between 250 and 500 m the label uses a 7 pt font** (8 pt inside 250 m), so more of them fit. A label may become one line there when the two-line one finds no room (for 4 s, no flipping); inside 250 m it stays two lines.
 * **Placement** (`overlay.MapView._draw_entities`, `place_guaranteed`): the side it had (kept while it still fits; it gives way only to an arrow under its text, not to a ring caption) -> the usual ten spots and five rings of twelve directions (`geo.spread_slots`, 20 - 104 px from the arrow; an index means the same place from frame to frame) clear of other labels and arrows -> clear of other labels only -> one line (250 - 500 m) -> the spot that covers the least of the others (`geo.least_overlap`; a few per frame, then the spot it had) -> never none. A label that is more than 14 px (`LEADER_MIN_PX`) from its arrow gets a thin leader line. At most 10 whole-list searches per frame (`SEARCH_BUDGET`); the rest of a crowd reuses its spot, reviewed after 1 s (`FORCED_REVIEW_S`).
+* **Last resorts keep off the arrows**: the "clear of other labels only" try and the least-overlapping spot both avoid the middle of every arrow
+  (`geo.least_overlap(..., avoid=cores)`, `AVOID_COST`): a bold label, which is about 8 % wider than the regular one, goes over other labels
+  (still readable) before it goes over somebody's arrow. Without this one recording had a label over a neighbour's arrow for 2 s.
 * **Nothing is hidden**: labels avoid your own arrow, the status lines, the ring captions (a label that already sits on one keeps its side) and the edge captions; arrows are painted after all pills, players topmost.
 * Label contrast: the pill is 69 % opaque (55 % for a stale creature), a stale or spawn-only creature's label keeps 73 % text opacity (its arrow is the dimmed part), a remembered / unknown species 90 % / 80 %.
 

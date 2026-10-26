@@ -8,7 +8,7 @@ import pytest
 
 from isle_livemap import species as sp
 from isle_livemap.geo import (
-    AI_RADIUS_PX, ENTITY_STYLE, LEGEND_ENTRIES, PEER_ARROW_SCALE, PEER_COLOR, Entity, marker_extent, marker_radius,
+    AI_RADIUS_PX, ARROW_POINTS, ENTITY_STYLE, LEGEND_ENTRIES, PEER_ARROW_SCALE, PEER_COLOR, Entity, marker_extent, marker_radius,
     peer_style,
 )
 
@@ -35,7 +35,7 @@ def test_marker_size_does_not_depend_on_the_species():
     sizes = {marker_radius(ent(s)) for s in ("Tyrannosaurus", "Troodon", "", "Zzzsaurus")}
     extents = {marker_extent(ent(s, heading=h)) for s in ("Tyrannosaurus", "Troodon") for h in (None, 0.0, 90.0)}
     assert len(sizes) == 1 and len(extents) == 1
-    assert marker_extent(ent("Tyrannosaurus")) == 10 * PEER_ARROW_SCALE
+    assert marker_extent(ent("Tyrannosaurus")) == pytest.approx(-min(y for _x, y in ARROW_POINTS) * PEER_ARROW_SCALE)  # the tip of the arrow
     assert marker_radius(ent("Longear", kind="ai")) == AI_RADIUS_PX and marker_extent(ent("Longear", kind="ai")) == AI_RADIUS_PX + 1
 
 

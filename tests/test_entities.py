@@ -100,36 +100,33 @@ def test_settings_roundtrip_and_normalise(tmp_path):
     assert not any(k.startswith("feed_") for k in json.loads(p.read_text()))  # no legacy keys are written
 
 
-def test_summary_shows_vitals_and_height_delta():
+def test_summary_shows_vitals_and_no_height():
     e = E("p", "player", 25_000, stamina_pct=70, hunger_pct=60, thirst_pct=80, z=13_000)
     n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
-    s = entity_summary(n, my_z=10_000)
-    assert "ST 70% HU 60% TH 80%" in s and "▲30 m" in s
-    bare = entity_summary(nearby_entities([(E("q", x=25_000), 25_000, 0)], 0, 0)[0], my_z=10_000)
+    s = entity_summary(n)
+    assert "ST 70% HU 60% TH 80%" in s and "▲" not in s and "▼" not in s
+    bare = entity_summary(nearby_entities([(E("q", x=25_000), 25_000, 0)], 0, 0)[0])
     assert "ST" not in bare and "▲" not in bare and "▼" not in bare
 
 
-def test_row_and_3d_distance():
-    from isle_livemap.geo import distance_3d_m, entity_row
+def test_row_distance_is_flat():
+    from isle_livemap.geo import entity_row
     e = E("p", "player", 30_000, name="Alpha", species="Rex", health_pct=100, growth_pct=80, z=14_000)
-    n = nearby_entities([(e, 30_000, 0)], 0, 0)[0]  # 300 m east, 40 m up
-    assert math.isclose(distance_3d_m(n, 10_000), 50 * 0 + math.hypot(300, 40))
-    row = entity_row(n, my_z=10_000)
-    assert row[0] == "Alpha" and row[2] == "100%" and row[3] == "80%" and row[-1] == "▲40 m higher"
-    assert entity_row(n)[-1] == "?" and distance_3d_m(n, None) == n.distance_m
+    n = nearby_entities([(e, 30_000, 0)], 0, 0)[0]  # 300 m east, 40 m up: the map is flat, so 300 m
+    assert n.distance_m == 300.0
+    row = entity_row(n)
+    assert row[0] == "Alpha" and row[2] == "100%" and row[3] == "80%" and row[7] == "300 m" and row[8] == "E (90°)"
+    assert len(row) == 9 and not any("higher" in c or "lower" in c or "▲" in c for c in row)
 
 
-def test_label_shows_height_delta():
+def test_label_and_summary_have_no_height():
     e = E("p", "player", 25_000, name="Alpha", z=13_000)
     n = nearby_entities([(e, 25_000, 0)], 0, 0)[0]
-    # the minimap label has distance only; compass direction and height are in the summary (tooltips, logs) and the table
-    assert "▲" not in " ".join(entity_label_lines(n, my_z=10_000)) and " E " not in entity_label_lines(n, my_z=10_000)[0]
-    assert entity_summary(n, my_z=10_000).endswith("250 m E (90°) ▲30 m")
-    assert "▲" not in entity_summary(n)
-    below = nearby_entities([(E("q", "player", 25_000, name="Beta", z=7_000), 25_000, 0)], 0, 0)[0]
-    assert entity_summary(below, my_z=10_000).endswith("250 m E (90°) ▼30 m")
-    level = nearby_entities([(E("r", "player", 25_000, name="Gamma", z=10_020), 25_000, 0)], 0, 0)[0]
-    assert entity_summary(level, my_z=10_000).endswith("250 m E (90°) level")
+    # the minimap label has distance only; compass direction is in the summary (tooltips, logs) and the table; height nowhere
+    assert "▲" not in " ".join(entity_label_lines(n)) and " E " not in entity_label_lines(n)[0]
+    assert entity_summary(n).endswith("250 m E (90°)")
+    below = nearby_entities([(E("q", "player", 25_000, name="Beta", z=-90_000), 25_000, 0)], 0, 0)[0]
+    assert entity_summary(below).endswith("250 m E (90°)") and below.distance_m == n.distance_m  # 1 km lower: still 250 m away
 
 
 def test_local_player_shares_entity_path():

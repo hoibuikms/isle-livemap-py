@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 import time
 from dataclasses import replace
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import QWidget
 from .capture import TelemetryPipeline
 from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, is_placeholder_name, species_tier
 from .geo import (
-    CROWDED_ON_SCREEN,
+    ARROW_POINTS, CROWDED_ON_SCREEN, PEER_OUTLINE_W,
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, UNKNOWN_HEADING_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
@@ -36,6 +37,7 @@ EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
 DOT_CLEARANCE_PX = 7.0  # no label may cover the dot of a player or dinosaur
 SOFT_INFERRED, SOFT_UNKNOWN = 0.9, 0.8  # label head opacity of a remembered / unknown species (confirmed: 1.0)
 LABEL_BG, LABEL_BG_STALE = QColor(8, 12, 16, 175), QColor(8, 12, 16, 140)
+LABEL_BG_PLAYER, LABEL_BG_PLAYER_STALE = QColor(6, 8, 14, 220), QColor(6, 8, 14, 170)  # behind the bold label of a player: stronger than the fish's
 BAR_TRACK, BAR_ST_FILL = QColor(0, 0, 0, 170), QColor(90, 170, 255)
 BAR_UNKNOWN = QColor(150, 150, 150, 95)  # a reading never received: an empty grey track, so every creature has the same two bars
 BAR_HP_H, BAR_ST_H, BAR_GAP = 3.0, 2.0, 1.5  # px
@@ -65,9 +67,10 @@ def _arrow_polygon(step: int) -> QPolygonF:
     a = math.radians(step * 3.0)
     c, s = math.cos(a), math.sin(a)
     k = PEER_ARROW_SCALE
-    return QPolygonF([QPointF(vx * c - vy * s, vx * s + vy * c) for vx, vy in ((0, -10 * k), (7 * k, 8 * k), (0, 4 * k), (-7 * k, 8 * k))])
+    return QPolygonF([QPointF(vx * k * c - vy * k * s, vx * k * s + vy * k * c) for vx, vy in ARROW_POINTS])
 
 
+_OWN_ARROW = QPolygonF([QPointF(x, y) for x, y in ARROW_POINTS])  # drawn around its centroid: the middle of the arrow is the position
 _CROWD_ARROW = QPolygonF([QPointF(0, -3.2), QPointF(2.4, 2.6), QPointF(-2.4, 2.6)])
 
 
@@ -95,6 +98,9 @@ class MapView(QWidget):
         self._pen_key = None  # (colour, stale, player) of the pen / brush currently set on the painter
         self._text_widths: dict[str, float] = {}  # label font is constant, so widths can persist across frames
         self._text_widths_small: dict[str, float] = {}  # the same for the smaller font of the 250 - 500 m band
+        self._text_widths_bold: dict[str, float] = {}  # the first line of a player's label is bold: measured with the bold font
+        self._text_widths_small_bold: dict[str, float] = {}
+        self.debug_positions = bool(os.environ.get("ISLE_DEBUG_POSITIONS"))  # crosshair at every exact decoded position (tray: Show exact positions)
         self._near_prev: set[str] = set()  # creatures that were inside the view radius in the last frame (see RADIUS_STICKY_FACTOR)
         self._guar_prev: set[str] = set()  # creatures that were guaranteed a label in the last frame (see geo.is_guaranteed)
         self._forced: dict[str, float] = {}  # label of a peer -> when it was put on the least-overlapping spot (no free one): kept there, reviewed now and then
@@ -260,6 +266,11 @@ class MapView(QWidget):
         px = self.width() / span  # pixels per unit of normalised map width
         return QPointF(self.width() / 2 + (left - cl) * px, self.height() / 2 + (top - ct) * px * MAP_HEIGHT / MAP_WIDTH)
 
+    def world_to_screen(self, x: float, y: float) -> QPointF:
+        """Where the world point (x, y), Unreal centimetres, is drawn: the one conversion for every marker. Sub-pixel (QPointF),
+        centred on the own position at the same instant, north up, the same metres per pixel in x and y."""
+        return self.to_screen(*project_unclamped(x, y))
+
     def from_screen(self, p: QPointF) -> tuple[float, float]:
         cl, ct, span = self.view()
         px = self.width() / span
@@ -275,7 +286,7 @@ class MapView(QWidget):
                 p.setClipRegion(self._circle_region())
             p.fillRect(r, QColor(10, 14, 18, 150 if self.full_map else 90))
             for layer in (self._draw_map, self._draw_zones, self._draw_rings, self._draw_markers, self._draw_entities,
-                          self._draw_player):
+                          self._draw_player, self._draw_debug_positions):
                 self._paint_layer(layer, p)
             p.setClipping(False)
             for layer in (self._draw_border, self._draw_peer_status, self._draw_record_status, self._draw_unplaced):
@@ -412,6 +423,29 @@ class MapView(QWidget):
         fm = QFontMetricsF(font)
         font_small = QFont("Segoe UI", SMALL_FONT_PT)
         fm_small = QFontMetricsF(font_small)
+        font_b, font_small_b = QFont("Segoe UI", 8), QFont("Segoe UI", SMALL_FONT_PT)  # the first line of a player's label is bold
+        font_b.setBold(True)
+        font_small_b.setBold(True)
+        fm_b, fm_small_b = QFontMetricsF(font_b), QFontMetricsF(font_small_b)
+        widths_b, widths_small_b = self._text_widths_bold, self._text_widths_small_bold
+        if len(widths_b) > 2000 or len(widths_small_b) > 2000:
+            widths_b.clear()
+            widths_small_b.clear()
+
+        def lines_width(ls, small: bool, bold: bool) -> float:
+            """Width of a label (px): the widest line, the first one measured with the bold font when ``bold``."""
+            wd = 0.0
+            for i, t in enumerate(ls):
+                if bold and i == 0:
+                    cache, m = (widths_small_b, fm_small_b) if small else (widths_b, fm_b)
+                else:
+                    cache, m = (widths_small, fm_small) if small else (widths, fm)
+                w_ = cache.get(t)
+                if w_ is None:
+                    w_ = cache[t] = m.horizontalAdvance(t)
+                if w_ > wd:
+                    wd = w_
+            return wd + 2
         p.setFont(font)
         centre, radius = QPointF(self.width() / 2, self.height() / 2), self.width() / 2 - 3
 
@@ -436,17 +470,16 @@ class MapView(QWidget):
         searches = [0, 0]  # [whole-list searches, last-resort placements] of the guaranteed labels in this frame
         forced_now: dict[str, float] = {}
 
-        def place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now):
+        def place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now, bold):
             """A label that must be shown (a creature within 500 m on the minimap). In order: the spot it had; the usual spots and
             the spread-out ones, clear of other labels and of arrows, then clear of other labels only; one line instead of two
             (250 - 500 m band only); at last the spot that covers the least of the others (or, past ``SEARCH_BUDGET`` searches
             in a frame, the spot it had even if it overlaps). Returns (rect, lines)."""
             ax, ay = pt.x(), pt.y()
-            fm_l, widths_l = (fm_small, widths_small) if small else (fm, widths)
+            fm_l = fm_small if small else fm
 
             def size(ls):
-                wd = max(widths_l[t] if t in widths_l else widths_l.setdefault(t, fm_l.horizontalAdvance(t)) for t in ls) + 2
-                return wd, fm_l.height() * len(ls)
+                return lines_width(ls, small, bold), fm_l.height() * len(ls)
 
             def more(wd, hd):
                 return [*spread_slots(ax, ay, wd, hd, below), *pulled_in(ax, ay, wd, hd, below)]
@@ -495,7 +528,7 @@ class MapView(QWidget):
                 extra_ = more(w_, h_)
                 r_ = place_label(ax, ay, w_, h_, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
                 if r_ is None:
-                    r_ = place_label(ax, ay, w_, h_, placed, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
+                    r_ = place_label(ax, ay, w_, h_, placed + cores, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)  # clear of other labels and of every arrow centre
                 if r_ is None and tier == 1 and len(lines) > 1:  # between 250 and 500 m one line says who / what it is
                     lines = lines[:1]
                     self._compact_until[eid] = now + COMPACT_HOLD_S
@@ -503,7 +536,7 @@ class MapView(QWidget):
                     extra_ = more(w_, h_)
                     r_ = place_label(ax, ay, w_, h_, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
                     if r_ is None:
-                        r_ = place_label(ax, ay, w_, h_, placed, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
+                        r_ = place_label(ax, ay, w_, h_, placed + cores, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)  # clear of other labels and of every arrow centre
                 if r_ is not None:
                     return r_, lines
             if not extra_:
@@ -515,9 +548,9 @@ class MapView(QWidget):
                 order.insert(0, prefer)
             ordered = [cands[i] for i in order]
             searches[1] += 1
-            r_ = least_overlap(ordered, placed if searches[1] <= LAST_RESORT_PER_FRAME else hard, bounds, in_circle)
+            r_ = least_overlap(ordered, placed if searches[1] <= LAST_RESORT_PER_FRAME else hard, bounds, in_circle, cores)
             if r_ is None:
-                r_ = least_overlap(ordered, hard, bounds, in_circle)
+                r_ = least_overlap(ordered, hard, bounds, in_circle, cores)
             if r_ is None:
                 r_ = least_overlap(ordered, [], bounds, None)
             if r_ is not None:
@@ -575,8 +608,6 @@ class MapView(QWidget):
             bars_h = (marker_radius(n.entity) + 3.0 + BAR_BOX_H + 1.0 - c) if bars_on and n.entity.kind != "ai" else 0.0  # its bars hang under it
             dots.append((pt.x() - c, pt.y() - c, 2 * c, 2 * c + max(0.0, bars_h)))
             cores.append((pt.x() - 3.0, pt.y() - 3.0, 6.0, 6.0))  # a kept label side only gives way to an arrow under its text
-        pos = self.pipeline.latest.position
-        my_z = pos.z if pos is not None else None
         now = time.monotonic()
         # creatures of one species standing together (a pack) share the label of the nearest one: "Carnotaurus ×5". Only
         # the creatures that can compete for a label are looked at, so a crowd of 500 costs nothing here.
@@ -657,20 +688,21 @@ class MapView(QWidget):
             sp, inferred, hp, st, vtier = self._conf.settle(n.entity.id, e.species, e.inferred, h_now, s_now, n.vitals_age_s, now)
             if (sp, inferred, hp, st) != (e.species, e.inferred, h_now, s_now):
                 n = replace(n, entity=with_vitals(replace(e, species=sp, inferred=inferred), hp, st))
-            lines = peer_label_lines(n, my_z, vtier, group_of.get(n.entity.id, 1))
+            lines = peer_label_lines(n, vtier, group_of.get(n.entity.id, 1))
             if short_only:
                 lines = lines[:1]
             if len(lines) > 1 and now < self._compact_until.get(n.entity.id, 0.0) and not (guaranteed and tier == 0):
                 lines = lines[:1]  # it did not fit in full a moment ago: stay short for a few seconds instead of flipping size
             small = guaranteed and tier == 1  # the 250 - 500 m band: a smaller font, so that more of them fit
-            fm_l, widths_l = (fm_small, widths_small) if small else (fm, widths)
-            w = max(widths_l[t] if t in widths_l else widths_l.setdefault(t, fm_l.horizontalAdvance(t)) for t in lines) + 2
+            fm_l = fm_small if small else fm
+            bold = not is_ai  # the first line of a player's / dinosaur's label is bold; the fish's stays regular
+            w = lines_width(lines, small, bold)
             h = fm_l.height() * len(lines)
             eid = n.entity.id
             prefer, slot = self._label_slot.get(eid), [0]
             r = None
             if guaranteed:
-                r, lines = place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now)
+                r, lines = place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now, bold)
             else:
                 if prefer is not None:  # the side it had: kept while it still fits, even if a dot has moved under it (no hopping)
                     r = place_label(pt.x(), pt.y(), w, h, kept_obstacles(()), bounds, in_circle, prefer, slot, in_circle_loose, True, below=below)
@@ -683,7 +715,7 @@ class MapView(QWidget):
                 if r is None and not is_ai and len(lines) > 1:  # no room for two lines: at least say who / what it is
                     lines = lines[:1]
                     self._compact_until[eid] = now + COMPACT_HOLD_S
-                    w, h = widths[lines[0]] + 2 if lines[0] in widths else fm.horizontalAdvance(lines[0]) + 2, fm.height()
+                    w, h = lines_width(lines, False, bold), fm.height()
                     r = place_label(pt.x(), pt.y(), w, h, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
                     if r is None:
                         r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, prefer, slot, in_circle_loose, below=below)
@@ -695,7 +727,7 @@ class MapView(QWidget):
                 # label (one line) is pulled in towards the centre until it fits, even over other labels
                 if len(lines) > 1:
                     lines = lines[:1]
-                    w, h = widths[lines[0]] + 2 if lines[0] in widths else fm.horizontalAdvance(lines[0]) + 2, fm.height()
+                    w, h = lines_width(lines, False, bold), fm.height()
                 pulled = pulled_in(pt.x(), pt.y(), w, h, below)
                 r = place_label(pt.x(), pt.y(), w, h, placed, bounds, in_circle, None, slot, None, False, pulled, below=below)  # clear of other labels if it can be
                 if r is None:
@@ -713,8 +745,9 @@ class MapView(QWidget):
             alpha = LABEL_STALE_ALPHA if n.stale else 255
             sp_tier = species_tier(sp, inferred)  # a species that is only remembered / unknown is drawn softer than a confirmed one
             head_alpha = int(alpha * (SOFT_INFERRED if sp_tier == SPECIES_INFERRED else SOFT_UNKNOWN if sp_tier == SPECIES_UNKNOWN else 1.0))
-            color = _qcolor(peer_style(n.entity).color, head_alpha)
-            label_ops.append((r, lines, alpha, color, head_alpha, small))
+            st_ = peer_style(n.entity)
+            color = _qcolor(st_.label_color or st_.color, head_alpha)
+            label_ops.append((r, lines, alpha, color, head_alpha, small, bold))
             if not is_ai:
                 nx, ny, gap = leader_end(r, pt.x(), pt.y())
                 if gap > max(LEADER_MIN_PX, 1.5 * marker_radius(n.entity) + 6.0):  # displaced from its marker: a line joins them
@@ -728,20 +761,24 @@ class MapView(QWidget):
             p.setPen(QPen(QColor(200, 160, 255, LEADER_ALPHA), 1.0))
             for ax_, ay_, nx_, ny_ in leader_ops:
                 p.drawLine(QPointF(ax_, ay_), QPointF(nx_, ny_))
-        cur_small = False
-        for r, lines, alpha, color, head_alpha, small in label_ops:
-            if small != cur_small:
-                p.setFont(font_small if small else font)
-                cur_small = small
+        cur_font = font
+        for r, lines, alpha, color, head_alpha, small, bold in label_ops:
             fm_d = fm_small if small else fm
-            p.setPen(Qt.PenStyle.NoPen)  # a soft dark pill behind the text: readable on forest, rock and water alike
-            p.setBrush(LABEL_BG if alpha == 255 else LABEL_BG_STALE)
+            p.setPen(Qt.PenStyle.NoPen)  # a dark pill behind the text: readable on forest, rock and water alike (stronger for a player)
+            if bold:
+                p.setBrush(LABEL_BG_PLAYER if alpha == 255 else LABEL_BG_PLAYER_STALE)
+            else:
+                p.setBrush(LABEL_BG if alpha == 255 else LABEL_BG_STALE)
             p.drawRoundedRect(QRectF(r[0] - 2.0, r[1] - 0.5, r[2] + 2.0, r[3] + 1.0), 3.0, 3.0)
             for i, text in enumerate(lines):
+                want = (font_small_b if small else font_b) if bold and i == 0 else (font_small if small else font)
+                if want is not cur_font:
+                    p.setFont(want)
+                    cur_font = want
                 base = QPointF(r[0], r[1] + fm_d.ascent() + i * fm_d.height())
                 p.setPen(color if i == 0 else QColor(255, 255, 255, alpha))
                 p.drawText(base, text)
-        if cur_small:
+        if cur_font is not font:
             p.setFont(font)
         # the glyphs go on top of every pill and caption: the most important peer (players before dinosaurs before fish, the
         # 250 m tier before the 500 m one) is painted last, so nothing covers an arrow that matters
@@ -852,7 +889,7 @@ class MapView(QWidget):
             alpha = STALE_ALPHA if n.stale else (255 if known or e.kind == "ai" else UNKNOWN_HEADING_ALPHA)
             if ghost:
                 alpha = int(STALE_ALPHA * (1.0 - 0.6 * ghost / GHOST_FADE_STEPS))  # a creature the server destroyed fades with every step
-            pen = QPen(_qcolor(st.outline, min(230, alpha)), 1.5) if outline else QPen(Qt.PenStyle.NoPen)
+            pen = QPen(_qcolor(st.outline, min(230, alpha)), 1.5 if e.kind == "ai" else PEER_OUTLINE_W) if outline else QPen(Qt.PenStyle.NoPen)
             pb = self._marker_tools[key] = (pen, _qcolor(st.color, alpha))
         if self._pen_key != key:  # a run of equal markers (a crowd) sets pen and brush once
             p.setPen(pb[0])
@@ -897,8 +934,10 @@ class MapView(QWidget):
             return
         cx, cy = self.width() / 2, self.height() / 2
         r = self.width() / 2 - EDGE_INSET_PX
-        p.setFont(QFont("Segoe UI", 7))
-        fm = QFontMetricsF(p.font())
+        cap_font = QFont("Segoe UI", 7)
+        cap_font.setBold(True)  # the name of a far player, like the first line of a label
+        p.setFont(cap_font)
+        fm = QFontMetricsF(cap_font)
         for n, pt in sorted(far, key=lambda it: (is_placeholder_name(it[0].entity.name), it[0].distance_m))[:EDGE_CAPTIONS]:
             a = edge_anchor(cx, cy, pt.x(), pt.y(), r)  # players with a known name first, then the nearest
             if a is None:
@@ -917,9 +956,10 @@ class MapView(QWidget):
                 continue
             placed.append(box)
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(LABEL_BG)
+            p.setBrush(LABEL_BG_PLAYER)
             p.drawRoundedRect(QRectF(box[0] - 2, box[1], w + 2, h), 3.0, 3.0)
-            p.setPen(_qcolor(peer_style(e).color, STALE_ALPHA if n.stale else 235))
+            st_ = peer_style(e)
+            p.setPen(_qcolor(st_.label_color or st_.color, STALE_ALPHA if n.stale else 235))
             p.drawText(QPointF(box[0], box[1] + fm.ascent()), text)
 
     def _draw_peer_status(self, p: QPainter) -> None:
@@ -977,12 +1017,35 @@ class MapView(QWidget):
         # and dim, with a "?" - never as an exact position
         p.setPen(QPen(_qcolor(st.outline, 120 if stale else 255), 1.5))
         p.setBrush(Qt.BrushStyle.NoBrush if stale else _qcolor(st.color))
-        p.drawPolygon(QPolygonF([QPointF(0, -10), QPointF(7, 8), QPointF(0, 4), QPointF(-7, 8)]))
+        p.drawPolygon(_OWN_ARROW)
         p.restore()
         if stale:
             p.setPen(QColor(255, 170, 90))
             p.setFont(QFont("Segoe UI", 8))
             p.drawText(QPointF(c.x() + 11, c.y() + 14), own_stale_text(self.own_age_s))
+
+    def _draw_debug_positions(self, p: QPainter) -> None:
+        """Off by default (tray: "Show exact positions", or ISLE_DEBUG_POSITIONS=1). A crosshair at the exact newest decoded
+        position of every creature (yellow) and of you (magenta), and a thin line to the centre of the arrow that is drawn:
+        the line is the distance the smoothing and dead reckoning put between the two (zero for a creature at rest)."""
+        if not self.debug_positions or not self.interp.has_fix:
+            return
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        def cross(a: QPointF, b: QPointF, color: QColor) -> None:
+            p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 130), 0.8))
+            p.drawLine(a, b)
+            p.setPen(QPen(color, 1.0))
+            p.drawLine(QPointF(a.x() - 4.0, a.y()), QPointF(a.x() + 4.0, a.y()))
+            p.drawLine(QPointF(a.x(), a.y() - 4.0), QPointF(a.x(), a.y() + 4.0))
+
+        for n in self.nearby(None):
+            e = self.ents.entities.get(n.entity.id)
+            if e is not None:
+                cross(self.world_to_screen(e.x, e.y), self.world_to_screen(n.x, n.y), QColor(255, 235, 60))
+        pos = self.pipeline.latest.position
+        if pos is not None:
+            cross(self.world_to_screen(pos.x, pos.y), self._player_screen(), QColor(255, 60, 220))
 
     def _draw_border(self, p: QPainter) -> None:
         p.setBrush(Qt.BrushStyle.NoBrush)

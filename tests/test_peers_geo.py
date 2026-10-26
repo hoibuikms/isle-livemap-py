@@ -6,8 +6,8 @@ import math
 import pytest
 
 from isle_livemap.geo import (
-    ENTITY_STYLE, PEER_STALE_S, PEER_TTL_S, Entity, EntitySmoother, Interpolator, Settings, canonical_id, edge_anchor,
-    entity_label_lines, is_self, local_entity, nearby_3d, nearby_entities, peer_label_lines, shortest_arc,
+    DR_FF_GRACE_S, ENTITY_STYLE, PEER_STALE_S, PEER_TTL_S, Entity, EntitySmoother, Interpolator, Settings, canonical_id, edge_anchor,
+    entity_label_lines, is_self, local_entity, nearby_entities, peer_label_lines, shortest_arc,
     visible_entities,
 )
 from isle_livemap.peers import PeerEntity
@@ -32,23 +32,19 @@ def test_visible_entities_filters_orders_and_matches_nearby_entities():
     assert [n.entity.id for n in visible_entities(items(*es), 0, 0, 1000, show_ai=False)] == ["near", "mid", "edge"]
 
 
-def test_visible_entities_and_nearby_3d_agree_in_3d():
-    me = local_entity(type("P", (), {"x": 0.0, "y": 0.0, "z": 0.0})(), None)
-    es = [E("a", 3_000, z=0.0), E("b", 2_000, z=4_000.0), E("c", 10_000), E("edge", 10_000)]
-    by_3d = nearby_3d(me, es, 100.0)  # strict: c and edge sit exactly at 100 m
-    assert [n.entity.id for n in by_3d] == ["a", "b"]
-    mine = visible_entities(items(*es), 0, 0, 100.0, my_z=0.0, use_3d=True)
-    assert [n.entity.id for n in mine] == [n.entity.id for n in by_3d]
-    assert [n.distance_m for n in mine] == [n.distance_m for n in by_3d]
+def test_distance_is_horizontal_whatever_the_height():
+    es = [E("a", 3_000, z=0.0), E("b", 2_000, z=400_000.0), E("c", 10_000), E("edge", 10_001)]
+    got = visible_entities(items(*es), 0, 0, 100.0)
+    assert [n.entity.id for n in got] == ["b", "a", "c"]  # b is 4 km higher and still the nearest on a flat map; 100 m is inclusive
+    assert [n.distance_m for n in got] == [20.0, 30.0, 100.0]
 
 
 def test_self_filter_local_me_id_and_configured_ids():
     es = [E("local", 1), E("me", 2), E("7", 3), E("-1", 4), E("ok", 5)]
     got = visible_entities(items(*es), 0, 0, me_id="me", self_ids=["7", "4294967295"])  # unsigned spelling of -1
     assert [n.entity.id for n in got] == ["ok"]
-    me = local_entity(None, None)
-    assert [n.entity.id for n in nearby_3d(me, [E("local"), E("x")], 1e9)] == ["x"]  # id "local" is self
-    assert [n.entity.id for n in nearby_3d(me, [E("9"), E("x")], 1e9, self_ids=["9"])] == ["x"]
+    assert [n.entity.id for n in visible_entities(items(E("local"), E("x")), 0, 0)] == ["x"]  # id "local" is self
+    assert [n.entity.id for n in visible_entities(items(E("9"), E("x")), 0, 0, self_ids=["9"])] == ["x"]
     assert is_self("local") and is_self("5", self_ids={"5"}) and not is_self("5")
     assert canonical_id(" 4294967295 ") == "-1" and canonical_id("abc") == "abc"
 
@@ -179,17 +175,22 @@ def test_dead_reckoning_is_bounded_so_a_stop_is_not_overshot_by_more_than_two_in
     s = EntitySmoother(tau_s=0.09)
     s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
     s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)  # 800 cm/s, then silence (the actor stopped, nothing more is sent)
-    for i in range(1, 600):
+    peak = 0.0
+    for i in range(1, 800):  # ten seconds of silence
         s.step(0.016, 0.5 + i * 0.016)
-    assert s.pos["a"][0] == pytest.approx(400.0 + 800.0 * 1.0, abs=1.0)  # horizon = twice the measured 0.5 s interval
-    assert s.target("a", 1000.0)[0] == pytest.approx(1200.0)  # and it never grows after that
+        peak = max(peak, s.pos["a"][0])
+    # the horizon is twice the measured 0.5 s interval; the dot keeps its pace for the grace after it, never further
+    assert 1100.0 < peak <= 400.0 + 800.0 * (1.0 + DR_FF_GRACE_S) + 1.0
+    assert s.pos["a"][0] == pytest.approx(400.0, abs=1.0)  # and nothing more came: it eased back to where it stopped
+    assert s.target("a", 1.5)[0] == pytest.approx(1200.0)  # the end of the horizon, 1 s after the sample
+    assert s.target("a", 1000.0)[0] == pytest.approx(400.0)
 
 
 def test_peer_horizon_is_capped_at_three_seconds_and_the_own_marker_keeps_one_interval():
     s = EntitySmoother(tau_s=0.09)
     s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
     s.update([PeerEntity(E("a", 1600.0), 2.0)], now=2.0)  # 800 cm/s measured over 2 s: twice that would be 4 s
-    assert s.target("a", 1000.0)[0] == pytest.approx(1600.0 + 800.0 * 3.0)
+    assert s.target("a", 5.0)[0] == pytest.approx(1600.0 + 800.0 * 3.0)  # 3 s after the sample: the end of the capped horizon
     i = Interpolator(tau_s=0.09)
     i.set_target(0.0, 0.0, None, at=0.0)
     i.set_target(400.0, 0.0, None, at=0.5)
@@ -248,7 +249,7 @@ def test_nearby_stale_threshold_follows_the_source():
 
 def test_peer_label_includes_known_vitals_only_in_order():
     n = visible_entities(items(E("1", 25_000, health_pct=92.4, growth_pct=40.0, z=13_000.0)), 0, 0)[0]
-    assert peer_label_lines(n, my_z=10_000.0) == ["P1 - Dino - 250 m", "HP 92%  ST –"]  # growth is never printed
+    assert peer_label_lines(n) == ["P1 - Dino - 250 m", "HP 92%  ST –"]  # growth is never printed
     n = visible_entities(items(E("1", 25_000, growth_pct=40.0)), 0, 0)[0]
     assert peer_label_lines(n) == ["P1 - Dino - 250 m"]  # a player whose health was never read has no second line
 
@@ -262,7 +263,8 @@ def test_target_lead_stays_inside_the_horizon():
     s.update([PeerEntity(E("a", 0.0), 0.0)], now=0.0)
     s.update([PeerEntity(E("a", 400.0), 0.5)], now=0.5)
     assert s.target("a", 0.5, 0.09)[0] == pytest.approx(400.0 + 800.0 * 0.09)
-    assert s.target("a", 9.0, 0.09)[0] == pytest.approx(1200.0)  # horizon (twice 0.5 s) still caps it
+    assert s.target("a", 1.5, 0.09)[0] == pytest.approx(1200.0)  # horizon (twice 0.5 s) still caps it
+    assert s.target("a", 9.0, 0.09)[0] == pytest.approx(400.0)  # long after: back on the last real position
 
 
 # ---- fluid motion: velocity blending and a tail that slows down

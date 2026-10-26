@@ -17,8 +17,7 @@ from test_other_players_data import colour_near, render  # noqa: E402
 
 import isle_livemap.overlay as overlay  # noqa: E402
 from isle_livemap.geo import (  # noqa: E402
-    ENTITY_STYLE, Entity, EntitySmoother, entity_label_lines, entity_row, entity_summary, format_height, nearby_entities,
-    where_text,
+    ENTITY_STYLE, Entity, EntitySmoother, entity_label_lines, entity_row, entity_summary, nearby_entities, where_text,
 )
 from isle_livemap.peers import GamePeerSource  # noqa: E402
 
@@ -27,22 +26,21 @@ def E(eid, kind="dino", x=0.0, y=0.0, **kw):
     return Entity(eid, kind, kw.pop("name", f"Actor #{eid}"), kw.pop("species", "Allosaurus"), x, y, kw.pop("z", None), **kw)
 
 
-# ---------------------------------------------------------------- height and direction, worded the same everywhere
-def test_height_is_an_arrow_and_a_number_and_level_inside_half_a_metre():
-    assert format_height(40.0) == "▲40 m" and format_height(-31.4) == "▼31 m" and format_height(0.3) == "level"
-    assert where_text(724.0, 45.0, 40.0) == "724 m NE ▲40 m"
-    assert where_text(1500.0, 200.0, None) == "1.5 km S"  # no height known: nothing is invented
+# ---------------------------------------------------------------- distance and direction, worded the same everywhere
+def test_where_is_a_flat_distance_and_a_compass_direction_and_no_height():
+    assert where_text(724.0, 45.0) == "724 m NE"
+    assert where_text(1500.0, 200.0) == "1.5 km S"
 
 
 def test_label_summary_and_table_say_the_same_thing():
     n = nearby_entities([(E("1", x=0.0, y=-72_400.0, z=14_000.0, name="P1"), 0.0, -72_400.0)], 0, 0)[0]  # north = -Y
-    assert entity_label_lines(n, my_z=10_000.0)[0] == "P1 - Allosaurus - 724 m"  # the minimap label: distance only
-    assert "724 m N (0°) ▲40 m" in entity_summary(n, my_z=10_000.0)
-    row = entity_row(n, my_z=10_000.0)
-    assert row[7] == "724 m" and row[8] == "N (0°)" and row[-1] == "▲40 m higher"
-    below = nearby_entities([(E("2", x=-72_400.0, y=0.0, z=6_000.0), -72_400.0, 0.0)], 0, 0)[0]  # west
-    assert "724 m W (270°) ▼40 m" in entity_summary(below, my_z=10_000.0)
-    assert entity_row(below, my_z=10_000.0)[-1] == "▼40 m lower"
+    assert entity_label_lines(n)[0] == "P1 - Allosaurus - 724 m"  # the minimap label: distance only
+    assert entity_summary(n).endswith("724 m N (0°)")  # 40 m higher than you: it does not show and does not count
+    row = entity_row(n)
+    assert row[7] == "724 m" and row[8] == "N (0°)" and len(row) == 9
+    below = nearby_entities([(E("2", x=-72_400.0, y=0.0, z=-6_000.0), -72_400.0, 0.0)], 0, 0)[0]  # west
+    assert entity_summary(below).endswith("724 m W (270°)") and below.distance_m == n.distance_m
+    assert "▲" not in " ".join(row) + entity_summary(n) and "▼" not in entity_summary(below)
 
 
 # ---------------------------------------------------------------- beyond the radius: a pointer, not nothing
@@ -62,9 +60,9 @@ def test_dinosaurs_of_one_species_standing_together_share_one_label(tmp_path, mo
     seen = []
     real = overlay.peer_label_lines
 
-    def spy(n, my_z=None, vitals=None, group=1):
+    def spy(n, vitals=None, group=1):
         seen.append((n.entity.id, group))
-        return real(n, my_z, vitals, group)
+        return real(n, vitals, group)
 
     monkeypatch.setattr(overlay, "peer_label_lines", spy)
     pack = lambda v: [E(str(i), x=v.interp.x + 60_000.0 + i * 120.0, y=v.interp.y, species="Carnotaurus") for i in range(4)]  # noqa: E731 (600 m: beyond the 250 m tier, where every creature keeps its own label)

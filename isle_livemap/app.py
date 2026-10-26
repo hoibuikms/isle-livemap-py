@@ -105,7 +105,7 @@ class MarkersPanel(QDialog):
 class NearbyPanel(QDialog):
     """Other players from the peer source, nearest first (same selection as the minimap)."""
 
-    COLUMNS = ("Name", "Species", "HP", "Growth", "ST", "Hunger", "Water", "Distance", "Direction", "3D", "Height Δ")
+    COLUMNS = ("Name", "Species", "HP", "Growth", "ST", "Hunger", "Water", "Distance", "Direction")
 
     def __init__(self, view: MapView) -> None:
         super().__init__()
@@ -139,10 +139,8 @@ class NearbyPanel(QDialog):
 
     def refresh(self) -> None:
         self.status.setText(self.view.peer_status or "no nearby-players source")
-        pos = self.view.pipeline.latest.position
-        my_z = pos.z if pos is not None else None
         self._near = list(self.view.nearby())
-        rows = [entity_row(n, my_z) for n in self._near]
+        rows = [entity_row(n) for n in self._near]
         unplaced = getattr(getattr(self.view, "peers", None), "unplaced_creatures", None)
         if callable(unplaced):  # replicated to us, no position yet: listed below the located ones, so that nobody is silently missing
             rows += [unplaced_row(info) for info in unplaced()]
@@ -259,6 +257,10 @@ class App(QObject):
             a.setChecked(getattr(self.settings, attr))
             a.toggled.connect(lambda on, at=attr: setattr(self.settings, at, on))
             menu.addAction(a)
+        dbg = QAction("Show exact positions (debug)", menu, checkable=True)  # runtime only, off at every start
+        dbg.setChecked(self.view.debug_positions)
+        dbg.toggled.connect(lambda on: setattr(self.view, "debug_positions", on))
+        menu.addAction(dbg)
         menu.addSeparator()
         q = QAction("Quit", menu)
         q.triggered.connect(self.quit)

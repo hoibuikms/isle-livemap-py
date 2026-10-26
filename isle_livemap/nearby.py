@@ -1,9 +1,9 @@
 """Nearby-entities radar: a thin adapter over the shared ``isle_livemap.geo`` path.
 
 The local player comes from ``geo.local_entity`` and every nearby entry is a
-``geo.Entity``, so positions, vitals (0-100 %), names, ids, the self filter, 3D
-distance and height delta all use the same code as the map overlay and Nearby panel.
-Nothing is parsed or computed separately here.
+``geo.Entity``, so positions, vitals (0-100 %), names, ids, the self filter and the
+horizontal (2D) distance all use the same code as the map overlay and Nearby panel.
+Nothing is parsed or computed separately here. The map is flat: height never counts.
 
 UNITS / AXES WARNING: ``geo`` works in Unreal centimetres with X/Y horizontal and Z as
 height. The lab radar input (``from_lab``) is **Y-up metres** (X and Z horizontal, Y
@@ -19,8 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 
 from .geo import (
-    UNITS_PER_METER, Entity, Nearby, _pct, distance_3d_m, height_delta_m, local_entity, nearby_3d, truncate,
-    vital_pct,
+    UNITS_PER_METER, Entity, Nearby, _pct, local_entity, truncate, visible_entities, vital_pct,
 )
 
 try:  # optional; not added to requirements
@@ -28,7 +27,7 @@ try:  # optional; not added to requirements
 except ImportError:  # pragma: no cover - depends on environment
     _tabulate = None
 
-HEADERS = ["Name", "Species", "Health", "Growth", "Distance (m)", "Delta height (m)"]
+HEADERS = ["Name", "Species", "Health", "Growth", "Distance (m)"]
 
 
 def _num(value: Any) -> float:
@@ -79,31 +78,25 @@ def from_lab(raw: Mapping[str, Any]) -> Entity | None:
 
 def nearby_entities(my_pos: Mapping[str, Any], entities: Iterable[Mapping[str, Any]],
                     max_distance: float = 100.0) -> list[Nearby]:
-    """Entities within ``max_distance`` metres (3D, strictly less) of ``my_pos``, nearest first.
+    """Entities within ``max_distance`` metres (horizontal, 2D, inclusive) of ``my_pos``, nearest first.
 
-    Y is vertical: distance = sqrt(dx^2 + dy^2 + dz^2) and the height delta is
-    entity.y - me.y (positive = higher), computed by ``geo.distance_3d_m`` /
-    ``geo.height_delta_m``. Entities with a missing or non-numeric ``pos`` are skipped.
+    Y is vertical in the lab input and is ignored: distance = sqrt(dx^2 + dz^2), the same
+    ``geo.distance_m`` as the minimap. Entities with a missing or non-numeric ``pos`` are skipped.
     Raises ValueError/KeyError only if ``my_pos`` itself is invalid.
     """
     me = my_entity(my_pos)
     parsed = [e for e in map(from_lab, entities) if e is not None]
-    return nearby_3d(me, parsed, max_distance)
+    return visible_entities([(e, e.x, e.y) for e in parsed], me.x, me.y, max_distance, me_id=me.id)
 
 
-def table_rows(rows: Iterable[Nearby], my_y: float | None) -> list[list[str]]:
-    """Cells for ``HEADERS``; ``my_y`` is the local height in geo units (``my_entity(...).z``)."""
-    out = []
-    for n in rows:
-        e, dy = n.entity, height_delta_m(n, my_y)
-        out.append([truncate(e.name or e.id or "?", 24), e.species or "-", _pct(e.health_pct), _pct(e.growth_pct),
-                    f"{distance_3d_m(n, my_y):.1f}",
-                    "?" if dy is None else f"{dy:+.1f} ({'higher' if dy > 0 else 'lower' if dy < 0 else 'level'})"])
-    return out
+def table_rows(rows: Iterable[Nearby]) -> list[list[str]]:
+    """Cells for ``HEADERS``."""
+    return [[truncate(n.entity.name or n.entity.id or "?", 24), n.entity.species or "-", _pct(n.entity.health_pct),
+             _pct(n.entity.growth_pct), f"{n.distance_m:.1f}"] for n in rows]
 
 
-def format_table(rows: Iterable[Nearby], my_y: float | None) -> str:
-    body = table_rows(rows, my_y)
+def format_table(rows: Iterable[Nearby]) -> str:
+    body = table_rows(rows)
     if _tabulate is not None:
         return _tabulate(body, headers=HEADERS, tablefmt="simple")
     widths = [max(len(r[i]) for r in [HEADERS, *body]) for i in range(len(HEADERS))]
@@ -115,7 +108,7 @@ def print_nearby(my_pos: Mapping[str, Any], entities: Iterable[Mapping[str, Any]
                  max_distance: float = 100.0) -> list[Nearby]:
     """Compute, print the table, and return the list (see ``nearby_entities``)."""
     rows = nearby_entities(my_pos, entities, max_distance)
-    print(format_table(rows, my_entity(my_pos).z))
+    print(format_table(rows))
     return rows
 
 

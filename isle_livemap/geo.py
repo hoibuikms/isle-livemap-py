@@ -78,18 +78,10 @@ def format_distance(meters: float) -> str:
     return f"{text} km"
 
 
-def format_height(dz_m: float) -> str:
-    """Height difference to the player: "▲31 m" (above you), "▼31 m" (below you), "level" within half a metre."""
-    if abs(dz_m) < 0.5:
-        return "level"
-    return f"{'▲' if dz_m > 0 else '▼'}{abs(dz_m):.0f} m"
-
-
-def where_text(distance_m_: float, bearing: float, dz_m: float | None) -> str:
-    """Where a creature is, the same way everywhere (minimap label, tooltip, table): "724 m NE ▲40 m". The bearing is
-    a compass direction from map-north (not relative to where you look); the height is omitted when it is not known."""
-    text = f"{format_distance(distance_m_)} {compass_label(bearing)}"
-    return text if dz_m is None else f"{text} {format_height(dz_m)}"
+def where_text(distance_m_: float, bearing: float) -> str:
+    """Where a creature is, the same way everywhere (tooltip, table): "724 m NE". The distance is the horizontal (2D) one,
+    the minimap is flat; the bearing is a compass direction from map-north (not relative to where you look)."""
+    return f"{format_distance(distance_m_)} {compass_label(bearing)}"
 
 
 # ----------------------------------------------------------------- range rings
@@ -367,7 +359,8 @@ class Interpolator:
         v, at = self._vel, self._sample_at
         if now is None or v is None or at is None:
             return self.target_x, self.target_y
-        ahead = min(max(now - at, 0.0) + self.tau, v[2])
+        age = max(now - at, 0.0)
+        ahead = min(age + self.tau, v[2]) * relax_factor(age, v[2])
         return self.target_x + v[0] * ahead, self.target_y + v[1] * ahead
 
     def step(self, dt: float, now: float | None = None) -> tuple[float, float, float]:
@@ -454,12 +447,14 @@ class EntityStyle:
     outline: str
     radius: float  # dot radius / arrow half-length scale, px
     glyph: str  # "arrow" (self), "dot" (+ arrow when heading is known), "diamond"
+    label_color: str = ""  # colour of the label text (the arrow's own colour when empty)
 
 
 PEER_COLOR = "#a24dff"  # every dinosaur / player of another person: one purple arrow, whatever the species
+PEER_LABEL_COLOR = "#cfa8ff"  # the same purple, lighter: the bold name of a player reads on forest, rock and water alike
 ENTITY_STYLE = {
     "self": EntityStyle("#ff4040", "#000000", 10.0, "arrow"),  # local player: red arrow, biggest, drawn last
-    "player": EntityStyle(PEER_COLOR, "#12002b", 4.0, "arrow"),  # another person's dinosaur: the same arrow, purple, smaller
+    "player": EntityStyle(PEER_COLOR, "#12002b", 4.0, "arrow", PEER_LABEL_COLOR),  # another person's dinosaur: the same arrow, purple, smaller
     "ai": EntityStyle("#8fa6b3", "#0b1318", 5.0, "diamond"),  # server animals (fish): muted, they are background
 }
 # Entity kinds from the game source (species.py): "player" (a creature that references a PlayerState), "dino" (a
@@ -480,10 +475,29 @@ def peer_style(e: "Entity") -> EntityStyle:
 
 
 STALE_ALPHA = 105  # 0-255 opacity of a stale (> PEER_STALE_S) peer
-PEER_ARROW_SCALE = 0.75  # peer arrow size relative to the local arrow (same polygon, so it reads as the same marker)
+
+
+def _centred(points: tuple) -> tuple:
+    """``points`` of a polygon moved so that its area centroid is the origin."""
+    twice_area = cy = 0.0
+    for i, (x0, y0) in enumerate(points):
+        x1, y1 = points[(i + 1) % len(points)]
+        cross = x0 * y1 - x1 * y0
+        twice_area += cross
+        cy += (y0 + y1) * cross
+    cy /= 3.0 * twice_area
+    return tuple((x, y - cy) for x, y in points)
+
+
+# The arrow of the local player and of every other player's dinosaur: one shape, pointing up, drawn around its area
+# centroid, so that the (x, y) a creature is drawn at is the middle of the arrow and not its tip or its tail.
+ARROW_POINTS = _centred(((0.0, -10.0), (7.0, 8.0), (0.0, 4.0), (-7.0, 8.0)))
+PEER_ARROW_SCALE = 0.85  # peer arrow size relative to the local arrow (same polygon, so it reads as the same marker; a little
+#                          larger than before so that the players stand out from the fish)
+PEER_OUTLINE_W = 2.2  # px: the outline of another player's arrow (the local arrow's is 1.5)
 UNKNOWN_HEADING_ALPHA = 190  # an arrow whose direction of travel is not known yet points north, a little softer
 AI_RADIUS_PX = 3.5
-_OWN_ARROW_FRONT_PX = 10.0  # the local arrow reaches 10 px ahead of its centre
+_OWN_ARROW_FRONT_PX = -min(y for _x, y in ARROW_POINTS)  # the local arrow reaches this far ahead of its centre (10.67 px)
 
 
 def marker_radius(e: Entity) -> float:
@@ -583,30 +597,15 @@ def vital_lines(e: Entity) -> list[str]:
     return [f"{label} {v:.0f}%" for label, attr in VITAL_FIELDS if (v := getattr(e, attr)) is not None]
 
 
-def height_delta_m(n: Nearby, my_z: float | None) -> float | None:
-    """Entity height minus player height in metres (> 0: above you); None if either is unknown."""
-    if n.entity.z is None or my_z is None:
-        return None
-    return (n.entity.z - my_z) / 100.0
-
-
-def distance_3d_m(n: Nearby, my_z: float | None) -> float:
-    """sqrt(horizontal² + dZ²); falls back to the horizontal distance without heights."""
-    dz = height_delta_m(n, my_z)
-    return n.distance_m if dz is None else math.hypot(n.distance_m, dz)
-
-
 def visible_entities(items, px: float, py: float, radius_m: float | None = None, show_players: bool = True,
-                     show_ai: bool = True, self_ids=(), me_id: str = LOCAL_ID, my_z: float | None = None,
-                     use_3d: bool = False, ttl_s: float | None = PEER_TTL_S,
+                     show_ai: bool = True, self_ids=(), me_id: str = LOCAL_ID, ttl_s: float | None = PEER_TTL_S,
                      stale_s: float = PEER_STALE_S) -> list[Nearby]:
-    """The one selection used by the minimap, the Nearby panel and nearby.py.
+    """The one selection used by the minimap and the Nearby panel.
 
     ``items``: iterable of (Entity, x, y) or (Entity, x, y, age_s) from (px, py). Drops the
     local player (``is_self``: "local", ``me_id``, ``self_ids``), kinds switched off, entries
-    older than ``ttl_s`` and anything beyond ``radius_m`` (None = unlimited). Horizontal mode
-    keeps the radius inclusive (``nearby_entities`` contract); ``use_3d`` measures sqrt(h²+dZ²)
-    from ``my_z`` and keeps it strict (``nearby_3d`` contract). Nearest first, ties by id."""
+    older than ``ttl_s`` and anything beyond ``radius_m`` (None = unlimited; the radius is inclusive).
+    Distances are horizontal (2D): the map is flat, height never counts. Nearest first, ties by id."""
     ids = {canonical_id(i) for i in self_ids} | {LOCAL_ID, canonical_id(me_id)}
     out = []
     for item in items:
@@ -620,19 +619,11 @@ def visible_entities(items, px: float, py: float, radius_m: float | None = None,
         if age is not None and ttl_s is not None and age >= ttl_s:
             continue
         n = Nearby(e, x, y, distance_m(px, py, x, y), bearing_deg(px, py, x, y), age, stale_s, vitals_age)
-        d = distance_3d_m(n, my_z) if use_3d else n.distance_m
-        if radius_m is not None and (d >= radius_m if use_3d else d > radius_m):
+        if radius_m is not None and n.distance_m > radius_m:
             continue
-        out.append((d, n))
-    out.sort(key=lambda t: (t[0], t[1].entity.id))
-    return [n for _, n in out]
-
-
-def nearby_3d(me: Entity, entities, max_distance_m: float, self_ids=()) -> list[Nearby]:
-    """Entities with 3D distance < ``max_distance_m`` from ``me`` (e.g. ``local_entity``),
-    nearest first, skipping ``me`` itself and ``self_ids`` (see ``visible_entities``)."""
-    return visible_entities([(e, e.x, e.y) for e in entities], me.x, me.y, max_distance_m,
-                            self_ids=self_ids, me_id=me.id, my_z=me.z, use_3d=True)
+        out.append(n)
+    out.sort(key=lambda n: (n.distance_m, n.entity.id))
+    return out
 
 
 HEAD_SHORT_ABOVE = 34  # a label's first line longer than this many characters says the short form of a long species name
@@ -714,8 +705,7 @@ def vitals_line(e: Entity, tier: str, vitals_age_s: float | None) -> str:
     return text
 
 
-def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
-                       vitals: str | None = None, group: int = 1) -> tuple[str, str]:
+def entity_label_lines(n: Nearby, name_max: int = 16, vitals: str | None = None, group: int = 1) -> tuple[str, str]:
     """(head, tail) of the minimap label, worded by how sure each field is (``confidence``).
 
     head:  a player          ``Name - Species - 724 m``
@@ -723,12 +713,11 @@ def entity_label_lines(n: Nearby, name_max: int = 16, my_z: float | None = None,
            a server animal   ``AI - Catfish - 120 m``  (``AI - Animal - 120 m`` without a class)
     tail:  ``vitals_line`` for players and dinosaurs; "" for a server animal and for a pack.
 
-    A player name is only printed when the creature referenced its PlayerState. Compass direction and height are not
+    A player name is only printed when the creature referenced its PlayerState. Compass direction is not
     on the minimap label (they are in the Nearby table and ``entity_summary``). Growth, hunger and thirst of other
     creatures are not replicated to us: never printed. ``vitals``: the vitals tier to print (the map view passes the
     one it settled); None works it out from the age. ``group`` > 1: this label stands for that many creatures of one
-    species standing together ("Carnotaurus ×5 - 724 m", the nearest one's distance); it then has no vitals line.
-    ``my_z`` is accepted for the callers that pass it; the label does not use it."""
+    species standing together ("Carnotaurus ×5 - 724 m", the nearest one's distance); it then has no vitals line."""
     e = n.entity
     dist = ("~" if e.pos_source == "spawn" else "") + format_distance(n.distance_m)  # "~": only its spawn position is known
     if e.kind == "ai":
@@ -824,18 +813,17 @@ def gone_text(gone_s: float) -> str:
     return f"gone {int(gone_s // 10) * 10}s" if gone_s < 60.0 else f"gone {int(gone_s // 60)}m"
 
 
-def peer_label_lines(n: Nearby, my_z: float | None = None, vitals: str | None = None, group: int = 1) -> list[str]:
+def peer_label_lines(n: Nearby, vitals: str | None = None, group: int = 1) -> list[str]:
     """Minimap label: the lines of ``entity_label_lines`` (the second one only when there is one)."""
-    return [line for line in entity_label_lines(n, my_z=my_z, vitals=vitals, group=group) if line]
+    return [line for line in entity_label_lines(n, vitals=vitals, group=group) if line]
 
 
-def entity_row(n: Nearby, my_z: float | None = None) -> tuple[str, ...]:
-    """Table cells: name, species, HP, growth, ST, hunger, water, distance, compass direction, 3D distance, height."""
-    e, dz = n.entity, height_delta_m(n, my_z)
+def entity_row(n: Nearby) -> tuple[str, ...]:
+    """Table cells: name, species, HP, growth, ST, hunger, water, distance (horizontal, 2D), compass direction."""
+    e = n.entity
     return (truncate(display_name(e), 24), (e.species + "~" if e.inferred and e.species else e.species) or "-", hp_text(e), _pct(e.growth_pct),
             st_text(e), _pct(e.hunger_pct), _pct(e.thirst_pct),
-            format_distance(n.distance_m), f"{compass_label(n.bearing)} ({n.bearing:.0f}°)", f"{distance_3d_m(n, my_z):.0f} m",
-            "?" if dz is None else f"{format_height(dz)} {'higher' if dz >= 0.5 else 'lower' if dz <= -0.5 else ''}".strip())
+            format_distance(n.distance_m), f"{compass_label(n.bearing)} ({n.bearing:.0f}°)")
 
 
 def unplaced_row(info: dict) -> tuple[str, ...]:
@@ -844,10 +832,10 @@ def unplaced_row(info: dict) -> tuple[str, ...]:
     name = info.get("name") or (NO_NAME if info.get("kind") in ("player", "dino", "unknown") else "?")
     species = info.get("species") or "?"
     return (truncate(name, 24), species, "?", "-", "?", "-", "-", "position unknown",
-            f"{info.get('batches', 0)} state updates", "-", "-")
+            f"{info.get('batches', 0)} state updates")
 
 
-def entity_summary(n: Nearby, my_z: float | None = None) -> str:
+def entity_summary(n: Nearby) -> str:
     """One-line text of a peer (tooltips, logs). Same wording as the minimap label: HP / ST, then where it is."""
     e = n.entity
     sp = f" {e.species}" if e.species else ""
@@ -861,10 +849,8 @@ def entity_summary(n: Nearby, my_z: float | None = None) -> str:
     for tag, v in (("G", e.growth_pct), ("HU", e.hunger_pct), ("TH", e.thirst_pct)):
         if v is not None:
             vit += f" {tag} {v:.0f}%"
-    dz = height_delta_m(n, my_z)
-    height = "" if dz is None else f" {format_height(dz)}"
     return (f"[{e.kind}] {truncate(display_name(e), 24)}{sp}{vit}  "
-            f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°){height}")
+            f"{format_distance(n.distance_m)} {compass_label(n.bearing)} ({n.bearing:.0f}°)")
 
 
 Rect = tuple[float, float, float, float]  # x, y, w, h
@@ -916,9 +902,15 @@ def leader_end(r: Rect, ax: float, ay: float) -> tuple[float, float, float]:
     return nx, ny, math.hypot(nx - ax, ny - ay)
 
 
-def least_overlap(cands: Sequence[Rect], placed: Sequence[Rect], bounds: Rect, accept: Callable[[Rect], bool] | None = None) -> Rect | None:
+AVOID_COST = 5000.0  # px² an arrow centre under a last-resort label counts for: far more than any pile of other labels
+
+
+def least_overlap(cands: Sequence[Rect], placed: Sequence[Rect], bounds: Rect, accept: Callable[[Rect], bool] | None = None,
+                  avoid: Sequence[Rect] = ()) -> Rect | None:
     """The candidate inside ``bounds`` (and accepted) that covers the least area of the rects in ``placed``: the last
-    resort of a label that must be shown (a creature within 500 m) when every free spot is gone."""
+    resort of a label that must be shown (a creature within 500 m) when every free spot is gone. ``avoid``: the middles of
+    the arrows; a candidate that covers one costs ``AVOID_COST`` each, so a label goes over other labels (still readable)
+    before it goes over somebody's arrow."""
     bx, by, bw, bh = bounds
     best, best_cost = None, None
     for r in cands:
@@ -932,6 +924,9 @@ def least_overlap(cands: Sequence[Rect], placed: Sequence[Rect], bounds: Rect, a
             oy = min(r[1] + r[3], o[1] + o[3]) - max(r[1], o[1])
             if ox > 0 and oy > 0:
                 cost += ox * oy
+        for o in avoid:
+            if r[0] < o[0] + o[2] and o[0] < r[0] + r[2] and r[1] < o[1] + o[3] and o[1] < r[1] + r[3]:
+                cost += AVOID_COST
         if best_cost is None or cost < best_cost:
             best, best_cost = r, cost
             if cost == 0.0:
@@ -1008,6 +1003,18 @@ DR_VEL_MIN_COS = 0.5  # the new velocity must be within 60 degrees of the old on
 DR_VEL_MAX_RATIO = 3.0  # ... and not more than this many times faster / slower
 
 DR_FF_GRACE_S = 0.3  # the dot keeps its velocity this long past the horizon: a sample that is a little late must not stop it
+# A creature that stops is not told about again (the server sends changes only), so a dot that holds at the end of its
+# horizon would stay up to two intervals of movement past the place where it stopped. Measured on the recorded captures:
+# up to a gap of two seconds the dead-reckoned dot is closer to the next real position than the last sample is; from
+# three seconds on the last sample is closer. So when the horizon (plus grace) is over and nothing new has come, the dot
+# eases back to the last real sample over this long, and a creature at rest is drawn at exactly its last position.
+DR_RELAX_S = 2.0
+
+
+def relax_factor(age_s: float, horizon_s: float) -> float:
+    """1.0 while the sample is younger than its horizon plus grace; then falling to 0.0 over ``DR_RELAX_S``."""
+    over = age_s - (horizon_s + DR_FF_GRACE_S)
+    return 1.0 if over <= 0.0 else max(0.0, 1.0 - over / DR_RELAX_S)
 
 
 class EntitySmoother:
@@ -1178,7 +1185,8 @@ class EntitySmoother:
         s = self._sample.get(eid)
         if now is None or v is None or s is None:
             return e.x, e.y
-        ahead = min(max(now - s[2], 0.0) + lead, v[2])
+        age = max(now - s[2], 0.0)
+        ahead = min(age + lead, v[2]) * relax_factor(age, v[2])
         return e.x + v[0] * ahead, e.y + v[1] * ahead
 
     def step(self, dt: float, now: float | None = None) -> None:
@@ -1197,7 +1205,7 @@ class EntitySmoother:
                 # (advanced along that velocity, within its horizon) is blended in. It never waits at the end of a
                 # horizon for a late sample and never jumps when the sample arrives: no stop-and-go, no lag at a steady pace.
                 age = max(now - s[2], 0.0)
-                f = min(age, v[2])
+                f = min(age, v[2]) * relax_factor(age, v[2])
                 go = dt if age <= v[2] + DR_FF_GRACE_S else 0.0
                 p[0] += v[0] * go + (e.x + v[0] * f - p[0]) * c
                 p[1] += v[1] * go + (e.y + v[1] * f - p[1]) * c
