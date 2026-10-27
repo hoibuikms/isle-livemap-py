@@ -75,18 +75,22 @@ def test_a_big_and_a_small_species_are_painted_identically(tmp_path):
     assert all(a.pixelColor(x, y) == b.pixelColor(x, y) for x, y in pa)
 
 
-def test_a_dinosaur_is_an_arrow_pointing_north_until_its_heading_is_known(tmp_path):
+def test_a_dinosaur_is_a_round_marker_until_its_heading_is_known_then_an_arrow(tmp_path):
     img, pts = _painted(tmp_path, "Allosaurus", heading=None)
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
     width, height = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
-    assert height > width  # an arrow, not a round dot (a dot is as wide as it is tall)
-    cx = (min(xs) + max(xs)) / 2
-    top = [x for x, y in pts if y == min(ys)]
-    bottom = [x for x, y in pts if y == max(ys)]
-    assert abs(sum(top) / len(top) - cx) < 1.5  # the tip is on the vertical axis: it points north (up)
+    assert abs(width - height) <= 1  # as wide as tall: it does not claim to face anywhere (it used to be an arrow pointing north)
+    cx, cy = img.width() / 2, img.height() / 2
+    assert abs((min(xs) + max(xs)) / 2 - cx) < 1.5 and abs((min(ys) + max(ys)) / 2 - cy) < 1.5  # centred on the coordinate
+    north, pn = _painted(tmp_path, "Allosaurus", heading=0.0)
+    nys = [p[1] for p in pn]
+    nxs = [p[0] for p in pn]
+    assert max(nys) - min(nys) + 1 > max(nxs) - min(nxs) + 1  # known and facing north: an arrow, taller than wide
+    top = [x for x, y in pn if y == min(nys)]
+    bottom = [x for x, y in pn if y == max(nys)]
     assert max(bottom) - min(bottom) > max(top) - min(top)  # the wings are at the back
     east, pe = _painted(tmp_path, "Allosaurus", heading=90.0)
-    assert max(p[0] for p in pe) - min(p[0] for p in pe) + 1 == height  # turned a quarter: the long side is horizontal
+    assert max(p[0] for p in pe) - min(p[0] for p in pe) == max(nys) - min(nys)  # turned a quarter: the long side is horizontal
 
 
 def test_the_arrow_is_purple(tmp_path):

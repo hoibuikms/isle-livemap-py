@@ -474,6 +474,9 @@ class GamePeerSource:
         self._conflicts_seen = 0  # class cache entries dropped so far that were already reported
         self._layouts: dict[int, list] = {}  # unclassified handle -> [state batches of the animal size, all state batches, latched]
         self._anchors: dict[int, tuple[float, float]] = {}  # handle -> position the travel direction is measured from
+        self._facing: dict[int, float] = {}  # handle -> map heading of the last rotation byte decoded with its position
+        self._yaw_votes: dict[int, deque] = {}  # handle -> last comparisons of that facing with the direction of travel (True: disagree)
+        self._yaw_distrust: set[int] = set()  # handles whose rotation byte keeps contradicting their movement: the travel direction is used
         self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
         self._creatures: set[int] = set()  # handles whose creation record carried a maxHealth: a creature, whatever its class
         self._shape: dict[int, list] = {}  # handle -> [state batches, in the pawn size band, animal sized]: kept after it is placed
@@ -544,6 +547,9 @@ class GamePeerSource:
         self._corrected.clear()
         self._layouts.clear()
         self._anchors.clear()
+        self._facing.clear()
+        self._yaw_votes.clear()
+        self._yaw_distrust.clear()
         self._profile.clear()
         self._creatures.clear()
         self._shape.clear()
@@ -565,18 +571,42 @@ class GamePeerSource:
             ids.append(str(self.own_handle))
         self.store.set_owned_self_ids(ids)
 
+    YAW_DISAGREE_DEG = 120.0  # a rotation byte this far from the direction of travel is a disagreement
+    YAW_VOTES = 8  # comparisons kept per creature
+    YAW_DISTRUST_AT = 6  # this many disagreements among the last YAW_VOTES: the rotation byte is not trusted for that creature
+    YAW_TRUST_BELOW = 2  # and trusted again at this many or fewer
+
     def _heading(self, handle: int, x: float, y: float, previous: float | None) -> float | None:
-        """Direction of travel (degrees clockwise from north) once the creature has moved ``HEADING_MIN_MOVE_CM``
-        from its anchor; ``previous`` while it stands still."""
+        """Where the arrow points, degrees clockwise from north: the way the creature faces (the rotation byte that comes
+        with its position, held while it is silent), else the direction of travel once it has moved
+        ``HEADING_MIN_MOVE_CM`` from its anchor, else ``previous``. A creature whose rotation byte persistently points
+        the opposite way to how it moves (``YAW_DISTRUST_AT`` of the last ``YAW_VOTES`` comparisons more than
+        ``YAW_DISAGREE_DEG`` apart) is treated as not carrying a usable rotation and falls back to the direction of travel."""
+        travel = self._travel_bearing(handle, x, y)
+        facing = self._facing.get(handle)
+        if facing is not None and travel is not None:
+            votes = self._yaw_votes.setdefault(handle, deque(maxlen=self.YAW_VOTES))
+            votes.append(abs((facing - travel + 180.0) % 360.0 - 180.0) > self.YAW_DISAGREE_DEG)
+            bad = sum(votes)
+            if len(votes) >= self.YAW_VOTES and bad >= self.YAW_DISTRUST_AT:
+                self._yaw_distrust.add(handle)
+            elif bad <= self.YAW_TRUST_BELOW:
+                self._yaw_distrust.discard(handle)
+        if facing is not None and handle not in self._yaw_distrust:
+            return facing
+        return travel if travel is not None else previous
+
+    def _travel_bearing(self, handle: int, x: float, y: float) -> float | None:
+        """Direction of travel from the anchor once the creature has moved ``HEADING_MIN_MOVE_CM``; None otherwise."""
         anchor = self._anchors.get(handle)
         if anchor is None:
             self._anchors[handle] = (x, y)
-            return previous
+            return None
         moved = math.hypot(x - anchor[0], y - anchor[1])
         if moved < self.HEADING_MIN_MOVE_CM:
-            return previous
+            return None
         self._anchors[handle] = (x, y)
-        return bearing_deg(*anchor, x, y) if moved <= self.HEADING_MAX_STEP_CM else previous
+        return bearing_deg(*anchor, x, y) if moved <= self.HEADING_MAX_STEP_CM else None
 
     def _identity(self, handle: int) -> tuple[str, str, str]:
         """(kind, species, name) of an actor from what its creation record and the export tables say."""
@@ -880,6 +910,9 @@ class GamePeerSource:
         self._corrected.discard(handle)
         self._layouts.pop(handle, None)
         self._anchors.pop(handle, None)
+        self._facing.pop(handle, None)
+        self._yaw_votes.pop(handle, None)
+        self._yaw_distrust.discard(handle)
         self._profile.pop(handle, None)
         self._creatures.discard(handle)
         self._shape.pop(handle, None)
@@ -940,6 +973,9 @@ class GamePeerSource:
             self._corrected.discard(handle)
             self._layouts.pop(handle, None)
             self._anchors.pop(handle, None)
+            self._facing.pop(handle, None)
+            self._yaw_votes.pop(handle, None)
+            self._yaw_distrust.discard(handle)
             self._profile.pop(handle, None)
             self._creatures.discard(handle)
             self._shape.pop(handle, None)
@@ -1028,6 +1064,8 @@ class GamePeerSource:
                 self._profile.pop(handle, None)
                 self._active.pop(handle, None)
                 self._stale.discard(handle)
+                if loc.map_heading is not None and kind != sp.KIND_AI:
+                    self._facing[handle] = loc.map_heading
                 self._emit(handle, loc.x, loc.y, loc.z if loc.z_reliable else None, kind, species, name)
             elif (old := self.store.get(str(handle))) is None:
                 if kind != sp.KIND_AI:
@@ -1136,7 +1174,7 @@ class GamePeerSource:
                     f"server's class tables{via}. Leave the server and join again (rejoin) to identify the rest ({own})")
         seen = (f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}")
         return (f"game: {len(peers)} actors ({known} with species; {seen}; "
-                f"heading from movement; growth, hunger and thirst not available; {own})")
+                f"heading from rotation/movement; growth, hunger and thirst not available; {own})")
 
     def late_join(self) -> bool:
         """True when this connection's class tables were (nearly) never seen (many packets, no class path from them) and

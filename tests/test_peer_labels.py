@@ -134,7 +134,7 @@ def test_status_says_where_heading_comes_from():
     g.packets = 1
     emit(g, 1, 0, 0)
     st = g.status()
-    assert "heading from movement" in st and "not available" in st
+    assert "heading from rotation/movement" in st and "not available" in st
 
 
 # ---------------------------------------------------------------- label placement

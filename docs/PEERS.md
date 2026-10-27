@@ -10,7 +10,7 @@ Start the app with no flags and nearby players appear next to the current player
 
 | Source | Purpose | Selected by | Status text (examples) |
 |---|---|---|---|
-| game | the only user-facing source | default; also `--replay FILE.pcap` | `game: waiting for server traffic`, `game: waiting for actor locations (N pkts, own handle not locked yet)`, `game: N actors (K with species; creation C, exports E, destroyed D; heading from movement; growth, hunger and thirst not available; own handle H)`, `game: unavailable (...)` |
+| game | the only user-facing source | default; also `--replay FILE.pcap` | `game: waiting for server traffic`, `game: waiting for actor locations (N pkts, own handle not locked yet)`, `game: N actors (K with species; creation C, exports E, destroyed D; heading from rotation/movement; growth, hunger and thirst not available; own handle H)`, `game: unavailable (...)` |
 | lab | developer/test only | `--lab-peers [PORT]` | `lab: listening 127.0.0.1:7777 (N peers, ...)`, `lab: unavailable (...)` |
 | synthetic | developer/test only | bare `--replay` | `synthetic peers (N)` |
 
@@ -55,7 +55,7 @@ Tray menu items: "Show other players", "Nearby radius...", "Health / stamina bar
   * a creature whose player name was never sent (the player joined before the app started): `Player ? - <species> - <distance>` / the same second line (`Dino` while the species is not known; every creature that is not a server animal is a player's dinosaur). The placeholder is `geo.NO_NAME`; the Nearby table and the tooltip say `Player ?` too, never `Actor #id`
   * a server animal: `AI - <name> - <distance>`, one line (`AI - Catfish - 120 m`, `AI - Forktail - 1.5 km`, `AI - Animal - 120 m` without a class)
   * a pack of nameless creatures of one species standing together beyond 250 m: `Carnotaurus ×5 - <distance of the nearest>`, one line. A creature with a known name is never part of a pack: its name is not swallowed by a `×N` label.
-  The second line holds only what was read (`geo.vitals_line`, with `hp_text` / `st_text` shared by the label, the Nearby table cells and the tooltip text): **the raw values the game sent, in points**, not a percentage (the bars under the arrow show the ratio). Health is `<current>/<max>`; the maximum is `~1650` while it is only the creation record's (a creature grows after it is created: `Entity.max_src == "creation"`; a full attribute block gives the real one: `"block"`), and `–` when no maximum is known (`HP 1500/–`). Stamina is `<current>/<max>`; the maximum is `–` when the block did not carry it (the 8-slot block leaves it out and no creation record has it), so a stamina value can stand without a maximum (`ST 624/–`), and then its bar stays an empty track because there is no ratio. Values below 10 keep one decimal (a hatchling is `HP 1.6/1.6`, not `2/2`). Without a raw value (the lab feed) the percentage is printed instead (`HP 86%`). Unread values are `–`, a creature nothing was read for has no second line, and an old reading gets a coarse age tag (`[2m+]`). Where the numbers come from: current health, health maximum (block), current stamina and stamina maximum (9-slot block only) are float32 attribute values in points (own pawn, same slots: a hatchling `1.6/1.6`, `79.7/107.9`; recorded adults `2275/2620`, `134/163`); the pair health + stamina that follows between blocks is absolute too. In the recorded sessions the stamina value was known for every pawn-second with a health reading, its maximum for 27-100 % of them, and the health maximum came from a full block for 42-100 % (the rest from the creation record, hence the `~`). Compass direction and height are not on the minimap label; they are in the Nearby table and the tooltip text (`geo.entity_summary`). The label keeps the side of the dot it had (even when a dot has moved under it) while it still fits. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature that has not moved yet points north, one that has moved points the way it went (and keeps that direction while it rests).
+  The second line holds only what was read (`geo.vitals_line`, with `hp_text` / `st_text` shared by the label, the Nearby table cells and the tooltip text): **the raw values the game sent, in points**, not a percentage (the bars under the arrow show the ratio). Health is `<current>/<max>`; the maximum is `~1650` while it is only the creation record's (a creature grows after it is created: `Entity.max_src == "creation"`; a full attribute block gives the real one: `"block"`), and `–` when no maximum is known (`HP 1500/–`). Stamina is `<current>/<max>`; the maximum is `–` when the block did not carry it (the 8-slot block leaves it out and no creation record has it), so a stamina value can stand without a maximum (`ST 624/–`), and then its bar stays an empty track because there is no ratio. Values below 10 keep one decimal (a hatchling is `HP 1.6/1.6`, not `2/2`). Without a raw value (the lab feed) the percentage is printed instead (`HP 86%`). Unread values are `–`, a creature nothing was read for has no second line, and an old reading gets a coarse age tag (`[2m+]`). Where the numbers come from: current health, health maximum (block), current stamina and stamina maximum (9-slot block only) are float32 attribute values in points (own pawn, same slots: a hatchling `1.6/1.6`, `79.7/107.9`; recorded adults `2275/2620`, `134/163`); the pair health + stamina that follows between blocks is absolute too. In the recorded sessions the stamina value was known for every pawn-second with a health reading, its maximum for 27-100 % of them, and the health maximum came from a full block for 42-100 % (the rest from the creation record, hence the `~`). Compass direction and height are not on the minimap label; they are in the Nearby table and the tooltip text (`geo.entity_summary`). The label keeps the side of the dot it had (even when a dot has moved under it) while it still fits. The Nearby table keeps `-` / `?` because its columns need a cell. The heading is the direction of travel measured from successive positions (`GamePeerSource._heading`), not a replicated value: a creature whose heading is not known yet is a round marker; one that has a rotation byte or has moved is an arrow pointing the way it faces or went (kept while it rests). See "Which way an arrow points".
 - **Priority** (`geo.priority_key`, one number used for the dot budget, the label slots and collisions): creatures before server animals; then the distance tier **within 250 m, within 500 m, within 1000 m, further**; inside a tier players before dinosaurs before unidentified creatures; then the nearest. A peer that had a label last frame ranks as 15 % nearer, so two creatures at almost the same distance do not swap labels. Beyond 500 m the labels per tier on the minimap are 4 (1000 m; a crowd of more than 20 creatures cuts it to 2); fish get at most 3 labels and none in a shoal of 20+. **Inside 500 m there is no cap**: see "Every creature within 500 m" below. Beyond the 1000 m view radius players and dinosaurs up to 2.5 km are pointers on the circle edge.
 - **Your own stats** (growth, hunger, thirst, health) are not drawn anywhere on the minimap: there is no panel and no text for the red arrow.
 - Peers in range but outside the view get an edge indicator on the minimap circle.
@@ -101,9 +101,12 @@ The session log has a compact `labels:` line, written every 30 s while creatures
 There are no species, diet or size categories on the marker: every dinosaur of another person (a creature that
 references a PlayerState, a dinosaur whose controller is not known, and a creature whose class is not known at all) is
 the **same purple arrow** as your own red one: the same polygon at 85 % of its size (`geo.PEER_ARROW_SCALE`), purple
-`#a24dff` (`geo.PEER_COLOR`) with a dark 2.2 px outline (`geo.PEER_OUTLINE_W`; yours is 1.5 px, the fish's too) for the 40 most important peers. It points along the direction of travel
-(measured from successive positions; kept while the creature rests) and points north, slightly softer, until the creature
-has moved. The species, the name and the numbers are in the label text only. Your own arrow stays red.
+`#a24dff` (`geo.PEER_COLOR`) with a dark 2.2 px outline (`geo.PEER_OUTLINE_W`; yours is 1.5 px, the fish's too) for the 40 most important peers. It points the way the creature **faces**: the rotation
+byte that comes with its position in the same batch (see "Which way an arrow points" below), held while the creature is silent,
+else the direction of travel measured from successive positions. A creature whose heading is not known yet (it has sent
+no position batch with a rotation and has not moved) is a **round purple marker** of the same colour and outline
+(`geo.NEUTRAL_MARKER_RADIUS_PX`), not an arrow: an arrow that pointed north "until known" claimed a direction it did not have.
+The species, the name and the numbers are in the label text only. Your own arrow stays red.
 
 | Peer | Look |
 |---|---|
@@ -121,7 +124,7 @@ a label or not (`show_vitals_bars`, tray "Health / stamina bars"; not for fish).
 grey track, so every creature has the same two bars. The bars show the ratio of the label's second line on purpose: the
 label gives the figures in points, the bar the reading at a glance. They are painted under the labels, and a label avoids the bar
 of its own creature (the slots under the arrow start below the bars: `place_label(..., below=)`). Tray "Marker colours..." shows the legend
-(`geo.LEGEND_ENTRIES`). Beyond the 150 most important peers of a huge crowd the rest are tiny unrotated purple triangles
+(`geo.LEGEND_ENTRIES`). Beyond the 150 most important peers of a huge crowd the rest are small purple squares (no direction)
 (500 anti-aliased glyphs do not fit a 16 ms frame; the 500-peer paint test takes ~3.6 ms: the arrows are cached polygons
 moved by the painter, and only the 40 most important have an outline).
 
@@ -833,3 +836,33 @@ creatures on their own lines and no longer counts them as misses; `tools/stabili
 Limits: a creature that was already dead when the app started (no join burst, tables missed) is hidden after 8 timer batches (~8 s), not at once;
 a creature that is active but only has a spawn point is hidden after 10 s even if it happens to stand there (a player who
 sits and eats where it entered): it is in the Nearby table as "position unknown", which is the honest statement.
+
+
+## Which way an arrow points
+
+* **Convention.** Headings are degrees clockwise from map north (north is -Y, east is +X). The polygon `geo.ARROW_POINTS` is
+  built pointing up and drawn rotated clockwise by the heading (QPainter rotation is clockwise on screen), so heading 90
+  points right, 180 down. Unreal yaw is east-based and increases clockwise seen from above, so `map heading = yaw + 90`
+  (`decode.map_heading_from_unreal_yaw`). Tests turn the arrow through all eight compass headings, for the peer arrows and
+  for yours (`tests/test_arrow_heading.py`).
+* **Other creatures: the rotation byte.** A state batch that carries a creature's position also carries its rotation: one
+  byte, `decode.YAW_GAP_BITS` = 3 bits after the end of the position vector (7-bit header + 3 x `comp` bits), read as
+  `byte x 360 / 256` (`decode.yaw_after_vector`, delivered as `ActorLocation.yaw_deg` / `.map_heading`). Found by
+  correlating every bit field around the vector with the direction of travel of 1 315 moving fixes (speed 2-25 m/s) of
+  dinosaurs and players in seven recordings (nothing was fitted: the offset is the Unreal convention). Against the bearing
+  of travel: median error 2 degrees, 75 % within 9, 90 % within 21; per recording the median is 0.5-8.5 degrees and 85-97 % of
+  samples are within 25 degrees, for 25-, 26- and 27-bit layouts alike. A wider field (9-12 bits) adds no precision. The
+  facing is not always the direction of travel (a creature turns while it walks), which is why the error is not smaller.
+  No rotation field was found in the batches that carry no position (a search against the last known yaw gave at most
+  45 % hits against about 11 % by chance), so a creature that only turns on the spot is not seen turning: the arrow holds
+  the last facing.
+* **Choice.** `GamePeerSource._heading`: the held facing; else the direction of travel once the creature moved
+  `HEADING_MIN_MOVE_CM`; else nothing (round marker). If a creature's rotation byte points more than
+  `YAW_DISAGREE_DEG` (120) away from how it moves in `YAW_DISTRUST_AT` (6) of the last `YAW_VOTES` (8) comparisons, it is
+  not trusted for that creature (`_yaw_distrust`) and the direction of travel is used; two or fewer disagreements restore it.
+* **Your own arrow: `geo.OwnFacing`.** The movement packets carry the camera yaw. Against your own track while moving
+  faster than 6 m/s the camera yaw was within 3-12 degrees at the median but 31-66 degrees at the 90th percentile, because the
+  camera can look away from where the dinosaur runs. While you move (>= 4 m/s over the last second, until you drop below
+  2 m/s) the arrow follows the bearing of your track; standing still it keeps that direction until the camera has turned 8
+  degrees, then follows the camera; below walking pace it is the camera yaw. A teleport (> 300 m) or a 3 s gap starts over.
+* **Edge pointers** point from the middle of the map towards the creature (they are not creature headings).

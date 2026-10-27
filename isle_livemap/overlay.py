@@ -17,9 +17,9 @@ from .capture import TelemetryPipeline
 from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, is_placeholder_name, species_tier
 from .geo import (
     ARROW_POINTS, CROWDED_ON_SCREEN, PEER_OUTLINE_W,
-    ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, Settings, build_rings, clamp_size_percent,
+    ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, OwnFacing, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
-    ENTITY_STYLE, PEER_ARROW_SCALE, STALE_ALPHA, UNKNOWN_HEADING_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
+    ENTITY_STYLE, NEUTRAL_MARKER_RADIUS_PX, PEER_ARROW_SCALE, STALE_ALPHA, UNKNOWN_HEADING_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
     PEER_STALE_S, PEER_TTL_S, SLOT_SLACK_PX, label_limits, place_label, priority_key, priority_tier, visible_entities,
     marker_extent, marker_radius, peer_style, truncate, _overlaps, display_name, vitals_readings, with_vitals,
     own_marker_stale, own_stale_text,
@@ -71,7 +71,6 @@ def _arrow_polygon(step: int) -> QPolygonF:
 
 
 _OWN_ARROW = QPolygonF([QPointF(x, y) for x, y in ARROW_POINTS])  # drawn around its centroid: the middle of the arrow is the position
-_CROWD_ARROW = QPolygonF([QPointF(0, -3.2), QPointF(2.4, 2.6), QPointF(-2.4, 2.6)])
 
 
 def _qcolor(hex_color: str, alpha: int = 255) -> QColor:
@@ -115,6 +114,7 @@ class MapView(QWidget):
         self.last_error = ""
         self._snap_ok = True
         self.interp = Interpolator()
+        self.own_facing = OwnFacing()  # your arrow follows your travel direction, not the camera, while you move
         self.full_map = False
         self.edit_mode = False
         self.pan = QPointF(0.5, 0.5)  # full-map centre (normalised)
@@ -198,11 +198,13 @@ class MapView(QWidget):
         t = self.pipeline.latest
         if t.position is not None and t.position_at != self._last_pos_at:
             self._last_pos_at = t.position_at
-            self.interp.set_target(t.position.x, t.position.y, t.position.map_heading_degrees, t.position_at)
+            heading = self.own_facing.update(t.position.x, t.position.y, t.position_at, t.position.map_heading_degrees)
+            self.interp.set_target(t.position.x, t.position.y, heading, t.position_at)
         elif t.position is None and self.interp.has_fix:
             # the pipeline was reset (new server, game closed): the old position is not the player's any more, and a
             # marker parked there with "nearby" measured from it is a stuck map. Say "waiting" until a new fix arrives.
             self.interp.has_fix = False
+            self.own_facing.reset()
             self._last_pos_at = 0.0
         self.own_age_s = max(0.0, now - t.position_at) if t.position is not None and t.position_at and self.interp.has_fix else None
         self.interp.step(dt, now)
@@ -868,16 +870,13 @@ class MapView(QWidget):
             self._pen_key = key
         if n.entity.kind == "ai":
             p.drawRect(QRectF(pt.x() - 1.8, pt.y() - 1.8, 3.6, 3.6))
-        else:  # a far peer beyond the glyph budget is still an arrow, only tiny and unrotated
-            x, y = pt.x(), pt.y()
-            p.translate(x, y)
-            p.drawPolygon(_CROWD_ARROW)
-            p.translate(-x, -y)
+        else:  # a far peer beyond the glyph budget: a small square in its colour (it has no direction to show)
+            p.drawRect(QRectF(pt.x() - 2.2, pt.y() - 2.2, 4.4, 4.4))
 
     def _draw_entity_marker(self, p: QPainter, n: Nearby, pt: QPointF, decorate: bool = True) -> None:
         """Peer glyph: every dinosaur / player is the same purple arrow as the local one (no species, diet or size
-        categories, no dots); it points along the direction of travel, north until that is known. Server animals are a
-        small muted diamond. Dim when stale."""
+        categories); it points the way the creature faces (or moves), and is a round marker while that is not known.
+        Server animals are a small muted diamond. Dim when stale."""
         e = n.entity
         st = peer_style(e)
         known = e.heading is not None
@@ -899,9 +898,12 @@ class MapView(QWidget):
             r = marker_radius(e) + 1
             p.drawPolygon(QPolygonF([pt + QPointF(0, -r), pt + QPointF(r, 0), pt + QPointF(0, r), pt + QPointF(-r, 0)]))
             return
+        if not known:  # no direction known: a round marker, not an arrow that would claim to face north
+            p.drawEllipse(pt, NEUTRAL_MARKER_RADIUS_PX, NEUTRAL_MARKER_RADIUS_PX)
+            return
         x, y = pt.x(), pt.y()
         p.translate(x, y)  # a cached polygon moved by the painter: cheaper than building 4 points per arrow and frame
-        p.drawPolygon(_arrow_polygon(round(e.heading / 3.0) % 120 if known else 0))
+        p.drawPolygon(_arrow_polygon(round(e.heading / 3.0) % 120))
         p.translate(-x, -y)
 
     def _draw_edge_indicators(self, p: QPainter, offscreen: list[tuple[Nearby, QPointF]],

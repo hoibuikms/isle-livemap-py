@@ -12,6 +12,7 @@ import os
 import sys
 import uuid
 from bisect import bisect_left
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Sequence
@@ -315,6 +316,58 @@ def own_stale_text(age_s: float) -> str:
     return f"? no moves {age_s:.0f} s"
 
 
+class OwnFacing:
+    """Which way your own arrow points. The movement packets carry the CAMERA yaw, not the way the dinosaur faces: while you
+    run with the camera turned away (recorded: 90 % of fast moving samples within 31-66 degrees, the rest further) the arrow
+    pointed at the camera. So while you move fast the arrow follows your direction of travel; standing still it holds that
+    direction until the camera turns, and then follows the camera. Below walking pace it is the camera yaw."""
+
+    WINDOW_S = 1.0  # the travel direction is measured over this much of the track
+    ENTER_MS = 4.0  # m/s to start following the direction of travel
+    EXIT_MS = 2.0  # and to stop
+    MIN_DIST_M = 2.5
+    CAMERA_TURN_DEG = 8.0  # standing still, the camera turning this far from where it was takes the arrow
+    RESET_GAP_S = 3.0
+    RESET_JUMP_UNITS = 30_000.0  # 300 m: a teleport or a respawn
+
+    def __init__(self) -> None:
+        self._track: deque[tuple[float, float, float]] = deque()
+        self._travel = False
+        self._held: float | None = None
+        self._camera_at_hold: float | None = None
+
+    def reset(self) -> None:
+        self._track.clear()
+        self._travel = False
+        self._held = self._camera_at_hold = None
+
+    def update(self, x: float, y: float, at: float, camera: float) -> float:
+        """The heading to draw, degrees clockwise from north, for the position ``(x, y)`` (cm) at time ``at`` (s)."""
+        tr = self._track
+        if tr and (at - tr[-1][0] > self.RESET_GAP_S or math.hypot(x - tr[-1][1], y - tr[-1][2]) > self.RESET_JUMP_UNITS or at < tr[-1][0]):
+            self.reset()
+        tr.append((at, x, y))
+        while len(tr) > 2 and at - tr[1][0] >= self.WINDOW_S:
+            tr.popleft()
+        t0, x0, y0 = tr[0]
+        dt = at - t0
+        dist = math.hypot(x - x0, y - y0) / UNITS_PER_METER
+        speed = dist / dt if dt >= 0.4 else 0.0
+        if self._travel:
+            self._travel = speed >= self.EXIT_MS
+        else:
+            self._travel = speed >= self.ENTER_MS and dist >= self.MIN_DIST_M
+        if self._travel:
+            self._held = bearing_deg(x0, y0, x, y)
+            self._camera_at_hold = camera
+            return self._held
+        if self._held is not None and self._camera_at_hold is not None \
+                and abs(shortest_arc(self._camera_at_hold, camera)) < self.CAMERA_TURN_DEG:
+            return self._held  # standing still, the camera has not moved: still facing the way it ran
+        self._held = self._camera_at_hold = None
+        return camera
+
+
 class Interpolator:
     """Eases the displayed position/heading toward the latest telemetry so a
     ~20-60 Hz stream is drawn smoothly at 60 fps. Exponential smoothing with a
@@ -495,7 +548,8 @@ ARROW_POINTS = _centred(((0.0, -10.0), (7.0, 8.0), (0.0, 4.0), (-7.0, 8.0)))
 PEER_ARROW_SCALE = 0.85  # peer arrow size relative to the local arrow (same polygon, so it reads as the same marker; a little
 #                          larger than before so that the players stand out from the fish)
 PEER_OUTLINE_W = 2.2  # px: the outline of another player's arrow (the local arrow's is 1.5)
-UNKNOWN_HEADING_ALPHA = 190  # an arrow whose direction of travel is not known yet points north, a little softer
+UNKNOWN_HEADING_ALPHA = 190  # a creature whose heading is not known yet is a round marker, a little softer
+NEUTRAL_MARKER_RADIUS_PX = 5.0  # the round marker of a creature with no known heading (an arrow would claim a direction)
 AI_RADIUS_PX = 3.5
 _OWN_ARROW_FRONT_PX = -min(y for _x, y in ARROW_POINTS)  # the local arrow reaches this far ahead of its centre (10.67 px)
 

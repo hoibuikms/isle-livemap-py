@@ -1275,6 +1275,29 @@ class ActorLocation:
     z: float
     component_bit_count: int
     z_reliable: bool = True
+    yaw_deg: float | None = None  # Unreal yaw (east = 0, clockwise seen from above) that follows the vector in the same batch
+
+    @property
+    def map_heading(self) -> float | None:
+        """The way the creature faces on the map: degrees clockwise from north (``yaw + 90``), None when the batch has no yaw."""
+        return None if self.yaw_deg is None else map_heading_from_unreal_yaw(self.yaw_deg)
+
+
+# A batch that carries a creature's position also carries its rotation: one byte, 3 bits after the end of the vector
+# (the header of the vector is 7 bits, then 3 components of ``comp`` bits). Found by correlating every bit field around
+# the vector with the direction of travel of 1 300+ moving creature fixes in 7 recordings: the byte x 360/256 + 90 is the
+# bearing of travel to a median 2 degrees, 90 % within 21 degrees (the resolution is 1.4 degrees; wider fields add no
+# precision). Not found in the batches that carry no position, so a creature that only turns on the spot is not seen.
+YAW_GAP_BITS = 3
+YAW_BITS = 8
+
+
+def yaw_after_vector(bits: Bits, base: int, n: int, offset: int, comp: int) -> float | None:
+    """Unreal yaw in degrees of the rotation byte after the vector at ``offset`` (batch of ``n`` bits starting at ``base``)."""
+    pos = offset + _HEADER_BITS + 3 * comp + YAW_GAP_BITS
+    if pos + YAW_BITS > n:
+        return None
+    return bits.read(base + pos, YAW_BITS) * 360.0 / (1 << YAW_BITS)
 
 
 def _vector_at(bits: Bits, base: int, n: int, offset: int, min_comp: int,
@@ -1473,7 +1496,9 @@ class ActorLocationTracker:
         self._boot.pop(handle, None)
         self._last[handle] = (t, vec[1], vec[2], vec[3])
         self.bootstrapped += 1
-        return ActorLocation(handle, vec[1], vec[2], vec[3], vec[0])
+        off = next((o for o, v in cands if v is vec), None)
+        yaw = None if off is None else yaw_after_vector(bits, base, n, off, vec[0])
+        return ActorLocation(handle, vec[1], vec[2], vec[3], vec[0], yaw_deg=yaw)
 
     def last_known(self, handle: int) -> tuple[float, float, float] | None:
         last = self._last.get(handle)
@@ -1524,10 +1549,10 @@ class ActorLocationTracker:
                     return None  # a lone coincidence is not a layout
             else:
                 self._trusted.setdefault(header, set()).add(best[1])
-        _, _, vec = best
+        _, off, vec = best
         self._last[handle] = (t, vec[1], vec[2], vec[3])
         self.learned += 1
-        return ActorLocation(handle, vec[1], vec[2], vec[3], vec[0])
+        return ActorLocation(handle, vec[1], vec[2], vec[3], vec[0], yaw_deg=yaw_after_vector(bits, base, n, off, vec[0]))
 
 
 # ---------------------------------------------------------------- vitals of OTHER creatures
