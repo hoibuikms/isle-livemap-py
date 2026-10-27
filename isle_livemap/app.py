@@ -121,6 +121,11 @@ class NearbyPanel(QDialog):
         self.align_btn.clicked.connect(self.align_to_selected)
         self.clear_btn = QPushButton("Clear alignment")
         self.clear_btn.clicked.connect(self.view.pipeline.clear_alignment)
+        self.mark_btn = QPushButton("Mark: creatures are next to me now")
+        self.mark_btn.setToolTip("Writes a marked line into the session log with what the app knows around you at this "
+                                 "moment. Press it when you see creatures near you in the game that the minimap lacks, "
+                                 "then send the log: the moment can be checked against the capture.")
+        self.mark_btn.clicked.connect(self.mark_moment)
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -132,6 +137,7 @@ class NearbyPanel(QDialog):
         buttons = QHBoxLayout()
         buttons.addWidget(self.align_btn)
         buttons.addWidget(self.clear_btn)
+        buttons.addWidget(self.mark_btn)
         lay.addLayout(buttons)
         self.resize(720, 380)
         self.timer = QTimer(self)
@@ -150,6 +156,11 @@ class NearbyPanel(QDialog):
             for r, row in enumerate(rows):
                 for c, text in enumerate(row):
                     self.table.setItem(r, c, QTableWidgetItem(text))
+
+    def mark_moment(self) -> None:
+        """The user sees creatures next to them: log what the app knows around them right now."""
+        mark = getattr(getattr(self.view, "peers", None), "mark_moment", None)
+        self.status.setText(mark() if callable(mark) else "no nearby-players source")
 
     def align_to_selected(self) -> None:
         """Put the own marker where the selected creature is (the user knows it is right next to them)."""

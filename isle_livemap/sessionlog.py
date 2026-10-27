@@ -42,6 +42,7 @@ DEFAULT_FILE_CAP_MB = 200.0
 SNAPSHOT_INTERVAL_S = 10.0
 LABELS_INTERVAL_S = 30.0  # a "labels:" line at least this often while creatures are on the map ...
 LABELS_MIN_GAP_S = 5.0  # ... and when what the labels claim changes, but never more often than this
+FLOWS_INTERVAL_S = 30.0  # a "flows:" line (the UDP flow inventory, see capture.FlowTable) this often and at the end
 LOG_MAX_BYTES = 5 * 1024 * 1024
 MAX_TRACEBACKS_PER_SITE = 5
 
@@ -163,6 +164,9 @@ class SessionLog:
         self._next_snapshot = 0.0
         self._labels_sig: frozenset | None = None
         self._labels_at = -1e9
+        self._nearby_at = -1e9
+        self._flows_at = None  # clock time of the newest "flows:" line (None: none yet)
+        self._flow_hint = ""
         self._jump_at = -1e9  # datagram time of the newest position jump already logged
         self._frame_at = -1e9  # ... and of the newest server-vs-decoded own location disagreement
         self._gap_at = -1e9  # ... and of the newest gap in the own moves
@@ -210,6 +214,7 @@ class SessionLog:
         except Exception:  # noqa: BLE001
             pass
         if self._logger is not None:
+            self._flows(self._clock(), force=True)
             self.snapshot("final")
             self.event("app stop")
             if self._handler is not None:
@@ -300,9 +305,30 @@ class SessionLog:
                 self._next_snapshot = now + self.interval
                 self.snapshot()
             self._own_frame()
+            self._flows(now)
             self._labels(now)
         except Exception:  # noqa: BLE001
             self.on_error("session log tick")
+
+    def _flows(self, now: float, force: bool = False) -> None:
+        """The UDP flow inventory every ``FLOWS_INTERVAL_S`` and at the end, and a line when the "second sizeable flow that is
+        not decoded" hint appears, changes or goes: the one thing a log can say about traffic the decoders never see."""
+        update = getattr(self.pipeline, "update_flow_report", None)
+        if not callable(update):
+            return
+        if not force:
+            if self._flows_at is None:
+                self._flows_at = now  # the first line comes one interval after the start, when there is something to count
+                return
+            if now - self._flows_at < FLOWS_INTERVAL_S:
+                return
+        self._flows_at = now
+        line = update()
+        self.event("%s", line)
+        hint = getattr(self.pipeline, "flow_hint", "")
+        if hint != self._flow_hint:
+            self._flow_hint = hint
+            self.event("flow warning: %s", hint) if hint else self.event("flow warning cleared")
 
     def _own_frame(self) -> None:
         """Position jumps of the own marker and manual alignments: what is needed to judge later whether the own position
@@ -342,6 +368,11 @@ class SessionLog:
         drain = getattr(peers, "drain_events", None)
         for line in drain() if callable(drain) else ():
             self.event("%s", line)
+        report = getattr(peers, "nearby_report", None)
+        if callable(report) and now - self._nearby_at >= LABELS_INTERVAL_S \
+                and (peers.store.entities() or getattr(peers, "own_handle", None) is not None):
+            self._nearby_at = now
+            self.event("%s", report())  # what the stream holds around the player, to judge "nobody is near" from a log
         signature, line = getattr(peers, "labels_signature", None), getattr(peers, "labels_line", None)
         if not callable(signature) or not callable(line):
             return

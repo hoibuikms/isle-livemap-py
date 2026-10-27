@@ -680,3 +680,94 @@ Absolute accuracy of another creature's position is the creation-record agreemen
 3.6 m, so a 50-80 m wide river is 14-22 pixels and an arrow on the bank can be a creature in the river within the update interval
 (0.3-1.5 s at 10-15 m/s) plus the map image's own error. To settle a case: stand next to a named player, note the clock time and
 both in-game map coordinates.
+
+## Creatures next to the player: what the stream holds (ten connections)
+
+Complaint: creatures right next to the player are not on the minimap while players 500-800 m away are. Every recorded
+connection was replayed (`tools/tier_check.py --ledger`, plus ad-hoc scripts that are not kept) and the raw stream was
+searched for the missing creatures. Result: **no decoder or filter defect was found**; the stream simply holds almost no
+creature near the player in these recordings.
+
+* **Where the placed creatures are.** Decoded positions of dinosaurs, players and unclassified creatures by distance from
+  the own position (all ten connections together): 38 within 100 m, 619 within 100-250 m, 966 within 250-500 m, 15 583
+  within 500-1000 m, 5 170 within 1-2 km, 36 138 beyond 2 km. Creatures that have a creation record (spawn point) but
+  never moved show the same: of 77 unplaced creatures with a spawn point, 46 are 500-1000 m away and 4 within 500 m (all
+  in one connection, none within 100 m).
+* **Nothing is dropped on the way.** Parser: 0 unparsed inbound datagrams in five connections, at most 380 tiny ones
+  (under 100 bytes, acknowledgements) in the others. Batch kinds: the batches the decoder calls "unknown" are the own
+  pawn's repeated 105-bit batch, singletons and static repeated objects, not creatures. Creature-shaped handles
+  classified "other": none in seven connections, 4, 1 and 2 short-lived handles in the other three. No distance based exclusion exists in `peers.py`,
+  `geo.py` or `overlay.py` (the only own-body rule is the handle of the earlier own pawn).
+* **No other encoding for the creatures that stay unplaced.** A supervised search took the first 8 s after the creation
+  record of 49 unplaced creatures (they sit at their spawn point then) and looked, at every bit offset, for an x/y pair of
+  any width from 10 to 40 bits at any decimal x power-of-two scale that equals the spawn point. On 64 placed creatures it
+  finds the known layout (26 or 27 bit components, divide by 100) in about half of them (33 and 11 hits); on the unplaced ones it finds nothing
+  consistent (three hits, all on one class and size, which turned out to be a time-dependent field that crosses the
+  spawn value). Their state batches carry no position: a creature that stands still is silent, and one that sends
+  rotation and animation at 3 Hz (recorded: a Carnotaurus player, 383 batches, none with a position) is drawn at its
+  spawn point with `~`.
+* **Update rate does not tell the distance.** Spearman correlation of a creature's state batch rate with its median
+  distance: -0.67 .. +0.2 per connection, +0.12 over all 306 creatures. Nothing honest can be estimated from it, so the
+  app does not draw an estimated range for creatures without a position.
+* **Compact groups sit at the same world coordinates in different sessions.** In three connections a group of 6-15
+  creatures (pairwise median 100-300 m) stood 700-900 m from the player; the group centre was at about (1370, -3150) m
+  in two different sessions on different days (an earlier audit put a static fish cluster at about the same place in two
+  more). Such places look like patrol / spawn sites, not an artefact of the own position: the direction from the player changes as the player moves
+  and the group does not.
+
+What was added so that the next log can answer the question without a replay:
+
+* `GamePeerSource.nearby_report()` / the session log line `nearby:` (every 30 s while there is anything to say): own
+  position, creatures placed within 250 / 500 / 1000 m (spawn-only positions counted apart), the nearest one with its
+  kind and species, server animals within 250 m, and how many creatures are replicated without a position. Distances are
+  the flat 2D ones of the minimap, so the bands are the minimap tiers.
+* **"Mark: creatures are next to me now"** in the Nearby panel: writes the same report into the session log, marked
+  `user mark (creatures are next to the player now)`, and shows it in the panel. Press it while creatures that the
+  minimap lacks are next to the player in the game; the clock time of the mark finds the moment in the capture.
+* Ground truth that would settle it: stand still next to ONE named player for 60 s (the others far away), press the
+  button, and write down the clock time and the player's name.
+
+## The far group is real players, and the server only replicates a ring of about 700-850 m
+
+Two hypotheses for "nothing next to me, 500-800 m away yes" were tested on the recordings (neutral labels as above; `C6` is
+the recording with the most complete tables).
+
+**H-A, the far group is not real players (static server entities): not supported.** In `C6` the group around (1350, -3150) m
+holds 14 named players (PlayerState link, names, 9 species), 11 unnamed dinosaurs and 5 unclassified creatures. Of the 14
+named players 8 move (50 to 452 m of path over their stay), 2 have followed positions but stand still, and 4 have only their
+spawn position (nothing was sent since their creation record, which is what a resting or logged-in player does). No class path
+among the 5 105 handles classified "other" is a pawn: they are PlayerStates (463), corpse smell, plants, fruit, gore, meat, nests and
+level actors. The creatures without a position are the unnamed ones that never moved since their creation record; they stay `~`
+and dimmed, as before. So no classification was changed: nothing in the data says a creature drawn as a player's dinosaur is an
+ambient object. The same place shows up in four recordings on different days; on a map it is a gathering spot, and the own marker
+passes through it in one of them (82 m from its centre, with a creature within 5 m).
+
+**H-B, the nearby creatures arrive on a flow that is not decoded: not supported.** Every flow of every recording (the
+recorder stores the datagrams the pipeline accepted, i.e. the game's own ports): one client port to the server `:7777`
+per connection (in `C5` three, one after the other, never at the same time), plus single 1300-byte datagrams to
+`198.51.100.x:270xx` (the latency probe the pipeline already ignores). No IP fragment, no datagram above 1300 bytes, no second
+sizeable flow. The recorder cannot show UDP on ports the game does not own (it never reaches the pipeline), so that case is
+covered by the new inventory below. `recorded=` equals `in + out` of the counters in every log, so nothing is lost between the pipeline and the file.
+
+**What the data does say.** Creation records place a creature at the point where it becomes relevant for the player. In `C6`
+of the 19 players / dinosaurs created once the own position was known (after the join burst), 17 were created 647-850 m from
+the displayed own position, with a peak at 700-800 m, and the other two at 1003 m and 1166 m (the other recordings show the same
+ring, 600-1100 m, blurred by creatures that were already inside it at the join and by unclassified world actors). Two consequences: the own marker and the creatures are in one frame (a ring
+around the displayed position would not be that sharp otherwise), and **the server does not replicate a player's
+dinosaur that is farther away than roughly 700-850 m**. A creature inside that ring is created at the join or when it
+enters; whatever is closer and not on the map is either in the "position unknown" count or not in the stream at all.
+
+**New diagnostics (`capture.FlowTable`, `describe_flows`).**
+* `TelemetryPipeline.flows` counts every datagram handed to `handle()` per (remote `ip:port`, local port): packets and
+  bytes in each direction. `LiveCapture` also counts the UDP packets the sniffer sees on ports the game does not own (at most 64
+  flows; they are not decoded and not in a recording).
+* The session log line `flows:` (30 s after the start, then every 30 s, and at the end): the decoded flow(s), the other
+  game flows (ignored), and a summary of the UDP on ports the game does not own with the biggest flow.
+* `flow warning:` (and `flow warning cleared`) in the log, and the same text after the status line (` · second game UDP flow
+  ... is not decoded`), when in the last window
+  * a flow of a game port to something that is not the learned server moved 100 packets or 30 KB, or
+  * a flow on a port the game does not own, to or from the learned server's address, moved 100 packets
+    (server traffic the capture neither decodes nor records).
+  Latency probes (one or two datagrams) and other applications' UDP never trigger it. None of the recordings does.
+* If the warning ever shows, the next step is to record all UDP of the game's machine for a minute and look at that flow;
+  nothing is decoded from a second flow today because no recording has one.

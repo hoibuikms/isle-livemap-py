@@ -1066,6 +1066,41 @@ class GamePeerSource:
         return frozenset((r["handle"], r["kind"], r["species"], r["species_tier"], bool(r["name"]), r["hp"] is not None or r["health"] is not None)
                          for r in self.label_rows() if r["kind"] != "ai")
 
+    NEARBY_BANDS_M = (250.0, 500.0, 1000.0)
+
+    def nearby_report(self) -> str:
+        """One line on what the stream holds around the player, by the displayed own position: creatures placed within each
+        band (a spawn-only position counted apart), the nearest one, the server animals within the first band, and the
+        creatures that are replicated but have no position yet. It is what the session log needs to tell "nobody is near"
+        from "somebody is near and the map cannot place them"."""
+        own = self._own_position()
+        ents = [p.entity for p in self.store.entities()]
+        creatures = [e for e in ents if e.kind != "ai"]
+        unplaced = self.unplaced_creatures()
+        if own is None:
+            return f"nearby: own position unknown | creatures placed={len(creatures)} unplaced={len(unplaced)}"
+        rows = sorted(((math.hypot(e.x - own[0], e.y - own[1]) / 100.0, e) for e in creatures), key=lambda r: r[0])
+        bands = []
+        for limit in self.NEARBY_BANDS_M:
+            inside = [e for d, e in rows if d <= limit]
+            spawn = sum(1 for e in inside if e.pos_source == "spawn")
+            bands.append(f"<={limit:.0f}m {len(inside)}" + (f" ({spawn} spawn-only)" if spawn else ""))
+        fish = sum(1 for e in ents if e.kind == "ai" and math.hypot(e.x - own[0], e.y - own[1]) / 100.0 <= self.NEARBY_BANDS_M[0])
+        if rows:
+            d, e = rows[0]
+            nearest = f"nearest {d:.0f}m {e.kind} {e.species or '?'}" + (" (spawn-only)" if e.pos_source == "spawn" else "")
+        else:
+            nearest = "no creature placed"
+        return (f"nearby: own ({own[0] / 100:.0f}, {own[1] / 100:.0f}) m | creatures placed " + ", ".join(bands)
+                + f" | {nearest} | server animals<={self.NEARBY_BANDS_M[0]:.0f}m {fish} | replicated without a position {len(unplaced)}")
+
+    def mark_moment(self) -> str:
+        """The user says creatures are next to them right now: the same report goes to the session log, marked, so the
+        moment can be found and checked against the capture. Returns the report."""
+        report = self.nearby_report()
+        self._events.append("user mark (creatures are next to the player now): " + report.removeprefix("nearby: "))
+        return report
+
     def labels_line(self) -> str:
         """Compact "labels:" line: the creatures that are not fish, nearest first, each with the confidence of what the
         minimap says about it. Names are the game's player names (they are on the minimap too)."""

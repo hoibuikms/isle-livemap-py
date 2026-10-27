@@ -165,6 +165,123 @@ FRAME_CHECKS_KEPT = 20
 # waiting to respawn, a loading screen, a teleport: recorded gaps of 4 s to 24 s, ending 50 m to 1.4 km from where they began).
 MOVE_GAP_S = 3.0
 MOVE_GAPS_KEPT = 20
+# Flow inventory (see FlowTable): a UDP flow that is not the learned server's counts as "sizeable" when it moved this much
+# in one report window. Recorded sessions: the only other game flows are one or two 1300-byte latency probes.
+FLOW_WINDOW_S = 30.0
+FLOW_SIZEABLE_PKTS = 100
+FLOW_SIZEABLE_BYTES = 30_000
+FLOWS_MAX = 128
+UNOWNED_MAX = 64
+
+
+class FlowTable:
+    """Every UDP flow the pipeline is handed, per (remote ``ip:port``, local port): packets and bytes in each direction. A
+    second, separate table counts the UDP packets the sniffer saw on ports the game does NOT own (they never reach the
+    decoders and are not in a recording): with it a log can tell "the game talks to one server" from "something else is
+    on the wire". Thread-safe; bounded; never raises."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rows: dict[tuple[str, int], list] = {}  # key -> [pkts_in, pkts_out, bytes_in, bytes_out, first, last]
+        self._unowned: dict[tuple[str, int, str, int], list] = {}  # (src ip, port, dst ip, port) -> [pkts, bytes, last]
+        self.overflow = 0  # flows not tracked because the table was full
+
+    def note(self, d: Datagram) -> None:
+        if d.direction == INBOUND:
+            key, i = (f"{d.src_ip}:{d.src_port}", d.dst_port), 0
+        elif d.direction == OUTBOUND:
+            key, i = (f"{d.dst_ip}:{d.dst_port}", d.src_port), 1
+        else:
+            return
+        n = len(d.payload)
+        with self._lock:
+            row = self._rows.get(key)
+            if row is None:
+                if len(self._rows) >= FLOWS_MAX:
+                    self.overflow += 1
+                    return
+                row = self._rows[key] = [0, 0, 0, 0, d.observed_at, d.observed_at]
+            row[i] += 1
+            row[2 + i] += n
+            row[5] = d.observed_at
+
+    def note_unowned(self, src_ip: str, sport: int, dst_ip: str, dport: int, nbytes: int, at: float) -> None:
+        key = (src_ip, sport, dst_ip, dport)
+        with self._lock:
+            row = self._unowned.get(key)
+            if row is None:
+                if len(self._unowned) >= UNOWNED_MAX:
+                    self.overflow += 1
+                    return
+                row = self._unowned[key] = [0, 0, at]
+            row[0] += 1
+            row[1] += nbytes
+            row[2] = at
+
+    def rows(self) -> list[dict]:
+        with self._lock:
+            return [{"remote": k[0], "local_port": k[1], "pkts_in": r[0], "pkts_out": r[1], "bytes_in": r[2],
+                     "bytes_out": r[3], "first": r[4], "last": r[5]} for k, r in self._rows.items()]
+
+    def unowned_rows(self) -> list[dict]:
+        with self._lock:
+            return [{"src": f"{k[0]}:{k[1]}", "dst": f"{k[2]}:{k[3]}", "src_ip": k[0], "sport": k[1], "dst_ip": k[2], "dport": k[3],
+                     "pkts": r[0], "bytes": r[1], "last": r[2]} for k, r in self._unowned.items()]
+
+
+def _kb(n: float) -> str:
+    return f"{n / 1_000_000:.1f} MB" if n >= 1_000_000 else f"{n / 1000:.1f} KB"
+
+
+def describe_flows(rows: list[dict], unowned: list[dict], server: str | None,
+                   prev: dict | None = None, window_s: float = FLOW_WINDOW_S) -> tuple[str, str, dict]:
+    """(log line, hint, state for the next call). ``rows`` / ``unowned``: FlowTable.rows() / unowned_rows(); ``prev``: the
+    state returned by the previous call (the window is the difference); ``server``: the learned ``ip:port``.
+
+    hint (empty when there is nothing to say):
+      * a flow of a game-owned port to somewhere that is not the learned server moved FLOW_SIZEABLE_PKTS packets or
+        FLOW_SIZEABLE_BYTES bytes in the window: a second game flow that is not decoded;
+      * a flow on a port the game does not own, to or from the learned server's address, moved FLOW_SIZEABLE_PKTS packets:
+        server traffic on a port the capture ignores (it is neither decoded nor recorded)."""
+    prev = prev or {}
+    before, before_un = prev.get("rows", {}), prev.get("unowned", {})
+    state = {"rows": {}, "unowned": {}}
+    parts, ignored, hints = [], [], []
+    owned_ports = {r["local_port"] for r in rows}
+    server_ip = server.rsplit(":", 1)[0] if server else ""
+    for r in sorted(rows, key=lambda r: -(r["bytes_in"] + r["bytes_out"])):
+        key = (r["remote"], r["local_port"])
+        pk, by = r["pkts_in"] + r["pkts_out"], r["bytes_in"] + r["bytes_out"]
+        state["rows"][key] = (pk, by)
+        dpk, dby = pk - before.get(key, (0, 0))[0], by - before.get(key, (0, 0))[1]
+        text = f"{r['remote']} (local :{r['local_port']}) {r['pkts_in']} in / {r['pkts_out']} out pkts, {_kb(by)}"
+        if r["remote"] == server:
+            parts.append("decoded " + text)
+        else:
+            ignored.append(text)
+            if dpk >= FLOW_SIZEABLE_PKTS or dby >= FLOW_SIZEABLE_BYTES:
+                hints.append(f"second game UDP flow {r['remote']} ({dpk} pkts, {_kb(dby)} in {window_s:.0f} s) is not decoded")
+    other_pk, other_by, biggest = 0, 0, None
+    for u in sorted(unowned, key=lambda u: -u["bytes"]):
+        key = (u["src"], u["dst"])
+        state["unowned"][key] = u["pkts"]
+        other_pk += u["pkts"]
+        other_by += u["bytes"]
+        if biggest is None:
+            biggest = u
+        dpk = u["pkts"] - before_un.get(key, 0)
+        involves_server = server_ip and server_ip in (u["src_ip"], u["dst_ip"])
+        local = u["dport"] if u["src_ip"] == server_ip else u["sport"]
+        if involves_server and local not in owned_ports and dpk >= FLOW_SIZEABLE_PKTS:
+            hints.append(f"server traffic on UDP port {local}, which the game does not own, is not decoded or recorded "
+                         f"({dpk} pkts in {window_s:.0f} s)")
+    line = "flows: " + (" | ".join(parts) if parts else "no decoded flow yet")
+    if ignored:
+        line += " | other game flows (ignored): " + "; ".join(ignored[:4]) + (f"; +{len(ignored) - 4} more" if len(ignored) > 4 else "")
+    if unowned:
+        line += (f" | UDP on ports the game does not own: {len(unowned)} flows, {other_pk} pkts, {_kb(other_by)}"
+                 f" (biggest {biggest['src']} > {biggest['dst']}, {biggest['pkts']} pkts)")
+    return line, "; ".join(hints[:2]), state
 
 
 class TelemetryPipeline:
@@ -206,6 +323,19 @@ class TelemetryPipeline:
         # FRAME_CHECKS_KEPT confirmed server locations that were further than SERVER_FIX_FAR_M from the decoded position
         self.frame_checks: list[tuple[float, float, tuple[float, float, float]]] = []
         self._srv_prev: tuple[float, list[tuple[float, float, float]]] | None = None
+        self.flows = FlowTable()  # every UDP flow handed to handle(), and the UDP seen on ports the game does not own
+        self.flow_hint = ""  # set by update_flow_report(): a second sizeable UDP flow that is not decoded ("" = none)
+        self._flow_state: dict | None = None
+        self._flow_report_at: float | None = None
+
+    def update_flow_report(self, now: float | None = None) -> str:
+        """The "flows:" log line (one line: every flow of the game's ports, decoded or ignored, and the UDP on ports it does not
+        own). Also sets ``flow_hint``. The window of the "sizeable" test is the time since the previous call."""
+        now = time.monotonic() if now is None else now
+        window = FLOW_WINDOW_S if self._flow_report_at is None else max(1.0, now - self._flow_report_at)
+        line, hint, state = describe_flows(self.flows.rows(), self.flows.unowned_rows(), self._server, self._flow_state, window)
+        self._flow_state, self._flow_report_at, self.flow_hint = state, now, hint
+        return line
 
     def set_status(self, status: str) -> None:
         with self._lock:
@@ -285,12 +415,18 @@ class TelemetryPipeline:
         """Count every UDP packet the sniffer sees (before port filtering)."""
         self._counts["udp_total"] += n
 
+    def note_unowned_udp(self, src_ip: str, sport: int, dst_ip: str, dport: int, nbytes: int, at: float) -> None:
+        """A UDP packet on ports no game socket owns (kept in the pre-capture buffer, never decoded, never recorded)."""
+        self.flows.note_unowned(src_ip, sport, dst_ip, dport, nbytes, at)
+
     def counts(self) -> dict:
         return dict(self._counts)
 
     def status_text(self) -> str:
         cur = self.latest
         text = status_text(cur.status, self._counts, cur.position is not None)
+        if self.flow_hint:
+            text += f" · {self.flow_hint}"
         if cur.position is not None and (self._align[0] or self._align[1]):
             dx, dy = self._align[0] / 100.0, self._align[1] / 100.0
             text += f" · aligned {dx:+.0f}, {dy:+.0f} m" + (" (position jumped since: align again?)" if self._align_stale else "")
@@ -387,6 +523,7 @@ class TelemetryPipeline:
                 fn(d)
             except Exception:  # noqa: BLE001
                 self.report_error("datagram observer")
+        self.flows.note(d)
         tap: tuple[list, int | None] | None = None
         reset_taps: list | None = None
         with self._lock:
@@ -702,6 +839,7 @@ class LiveCapture:
             self.pipeline.note_udp()
             now = time.monotonic()
             if self._precap.offer(now, pkt, int(pkt[UDP].sport), int(pkt[UDP].dport)):
+                self._note_unowned(pkt, now)
                 return  # no game socket owns this port yet: kept for the moment one does
             d = datagram_from_scapy(pkt, self._precap.ports, now)
             if d is not None:
@@ -713,6 +851,17 @@ class LiveCapture:
             self.pipeline.note_count("capture_errors")
             if self._packet_errors <= 3:
                 get_logger().exception("sniffer callback failed (%d so far)", self._packet_errors)
+
+    def _note_unowned(self, pkt, now: float) -> None:
+        """Count a UDP packet of a port the game does not own in the flow inventory (never raises)."""
+        try:
+            from scapy.layers.inet import IP, UDP
+
+            ip = pkt[IP] if IP in pkt else None
+            self.pipeline.note_unowned_udp(ip.src if ip else "", int(pkt[UDP].sport), ip.dst if ip else "", int(pkt[UDP].dport),
+                                           len(bytes(pkt[UDP].payload)), now)
+        except Exception:  # noqa: BLE001 - a diagnostic must never cost a packet
+            pass
 
     def _work(self) -> None:
         """Decode worker. Nothing a datagram does may end this loop; if it ends anyway the supervisor starts it again."""
