@@ -771,3 +771,65 @@ enters; whatever is closer and not on the map is either in the "position unknown
   Latency probes (one or two datagrams) and other applications' UDP never trigger it. None of the recordings does.
 * If the warning ever shows, the next step is to record all UDP of the game's machine for a minute and look at that flow;
   nothing is decoded from a second flow today because no recording has one.
+
+## "Players" 650-850 m away that never move: carcasses, and spawn points of active creatures
+
+Report: a player standing right next to the user was drawn at ~600 m / ~800 m, while no creature at all appeared close.
+Hypothesis tested first: **the movement of nearby creatures is delta-encoded** (small quantised steps or a velocity per
+tick, an absolute position only now and then), so the app keeps drawing them at their creation-record spawn point (where
+they entered the 650-850 m relevancy ring) while they walk to the player.
+
+**Delta-encoded movement: not supported.** Evidence, on `C6` (all tables seen) and on the three late-join recordings:
+* *Supervised search.* For the creatures that do have several decoded positions, the displacement between two consecutive
+  fixes was compared with every bit field (all offsets, widths 8-24, signed, any scale) of the state batches in between.
+  The only fields that track it are a 10-12 bit velocity group (three components, 32 bits before the position vector's
+  header in the layouts of Deinosuchus, Diabloceratops and Omniraptor: r = 0.97-0.99 against the speed, on the same offsets
+  for five handles of different species). It sits **next to an absolute position vector in the same batch**, so a batch that
+  has the velocity has the position; nothing carries a velocity or a delta alone.
+* *Position-bearing batches the decoder missed.* By the exact layout (header + size) of the decoded batches, 16 (`C6`), 44, 9
+  and 3 batches in four recordings had a position vector at the learned offset and were not decoded - a few per cent, almost
+  all unclassified creatures about 1 km away. There is no hidden stream of positions.
+* *Every handle, not only creatures.* All state batches of all 515 handles of `C6` (and of two more recordings) were searched
+  for chains of absolute vectors (width >= 22) that continue each other at creature speed. Every chain that the app does not
+  decode is a **single-axis counter** (x grows by about 15 per second, y and z constant): a timer, not a position. Small widths
+  (9-21 bits, scales 1, 10, 100 per metre) on the never-placed pawns give nothing but noise.
+* The never-placed live player of `C6` (a Carnotaurus, 383 batches at 3 Hz for 123 s) exports the montages `StandToSit`,
+  `DragL_Grab`, `Swallow` and `Bite`: it sat and ate where it was created. Its batches carry animation, rotation and attributes.
+
+So a live creature that moves always sends an absolute position, and the ones that are drawn at a spawn point and never move
+are standing still. What was really drawn at 650-850 m as "players" is next.
+
+**Carcasses.** Of the 16 never-placed "players / dinosaurs" in `C6`, 9 (the others rest or sit) send a **~1 Hz state batch of 163, 172 or 179 bits** whose only
+varying content is that timer (a vector whose x grows linearly, y and z constant), no position and no health block; of the 7 of
+them that have a creation record, 6 were created **within 0.0-0.2 m of a `TICorpseSmell` actor** (the seventh 26 m from one);
+those smell actors (325 in the join burst) are the markers of the places where creatures died. A dead creature stays a pawn
+actor, replicated, with a decay timer. The app drew them as player-owned dinosaurs at their spawn point (purple arrows 650-850 m
+from the player, never moving) - the "players" that were far away.
+
+`GamePeerSource` now calls an actor a carcass, and does not draw it (`CORPSE_*`):
+* when its creation record is within `CORPSE_SMELL_CM` (50 cm) of a `TICorpseSmell` actor created earlier (the smell actors
+  come first, in the join burst; the class path comes from the export tables or, when the app started late, from the class cache
+  and the seed, which knows the smell class - but a late start misses the burst, so the next rule is the one that works then); or
+* when its last 8 state batches are mostly (6 of 8) the timer-sized ones and none carried a position or a health block; for a creature
+  that did have a position or a health reading (it may have died in front of us), 12 timer-sized batches in a row. Recorded: no
+  live creature of three recordings had more than 6 in a row; six of the fourth had 9-27 (a pawn that died and lay there).
+A carcass is not in the Nearby table or the "position unknown" count either. It is forgotten when the server destroys the handle
+and a new creation record on the same handle is judged afresh. `nearby:` in the session log ends with `carcasses N`.
+
+**A creature that is only a spawn point and is active.** A creature drawn only at its creation record's spawn point (dimmed, `~`)
+that sends >= 8 state batches inside 10 s for at least 10 s is active: the spawn point is where it entered the relevancy ring,
+not where it is. It is taken off the map and listed as "position unknown" (Nearby table row with `?` distance, the overlay counter,
+`unplaced_creatures`), and it comes back the moment a decoded position arrives. A resting creature that sends a batch now and then
+keeps its dimmed `~` dot. Such a creature can never be in a distance tier or have a label with a spawn distance. `nearby:`
+ends with `active with only a spawn point N`.
+
+Effect on the recordings (creature-seconds drawn, spawn-only, 500-1000 m / 250-500 m): `C6` 1175 -> 121 / 0 -> 0; a second
+recording 1049 -> 724 / 11 -> 11; a third 2661 -> 1860 / 142 -> 95; a fourth 583 -> 385 / 21 -> 21. Decoded (live) positions are
+unchanged in three recordings; in the fourth 169 live creature-seconds disappear (one pawn that lay in a run of 12 timer batches
+after it had been followed, see above). `tools/tier_check.py --ledger` counts carcasses and taken-off
+creatures on their own lines and no longer counts them as misses; `tools/stability_replay.py` counts a deliberate removal
+(`GamePeerSource._hide`) as neither a vanished creature nor a ghost.
+
+Limits: a creature that was already dead when the app started (no join burst, tables missed) is hidden after 8 timer batches (~8 s), not at once;
+a creature that is active but only has a spawn point is hidden after 10 s even if it happens to stand there (a player who
+sits and eats where it entered): it is in the Nearby table as "position unknown", which is the honest statement.

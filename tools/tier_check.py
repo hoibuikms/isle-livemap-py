@@ -523,6 +523,9 @@ def _ledger_eval(res: dict, view, source, live: dict, rel: float, sp) -> None:
         kind, species, _name = source._identity(handle)
         if kind in (sp.KIND_AI, sp.KIND_OTHER):
             continue  # the class path itself says server animal / world object
+        if handle in getattr(source, "_corpses", ()):
+            res["cells"][("carcass", "carcass (a dead creature: not drawn on purpose)")] += 1
+            continue
         eid = str(handle)
         ent = source.store.get(eid)
         if ent is not None:
@@ -542,6 +545,8 @@ def _ledger_eval(res: dict, view, source, live: dict, rel: float, sp) -> None:
             cat = LEDGER_DRAWN if glyph.get(eid) else LEDGER_TRIANGLE
         elif eid in edge:
             cat = LEDGER_EDGE
+        elif ent is None and handle in getattr(source, "_stale", ()):
+            cat = "taken off on purpose: active, only a spawn point (listed as position unknown)"
         elif ent is None:
             cat = "removed while still replicated" if row.ever_in_store else "never reached the store"
             if row.removed_t is None:
@@ -595,7 +600,7 @@ def print_ledger(name: str, res: dict) -> bool:
           f"{len(res['rows'])} actor generations, {sum(1 for r in res['rows'] if r.candidate())} creature candidates")
     ok = True
     for tier, label in enumerate(("<= 250 m", "<= 500 m", "<= 1000 m", "beyond 1000 m")):
-        total = sum(n for (t, c), n in cells.items() if t == tier and not c.startswith("("))
+        total = sum(n for (t, c), n in cells.items() if t == tier and not c.startswith(("(", "taken off")))  # on purpose: not a miss
         if not total:
             continue
         shown = sum(n for (t, c), n in cells.items() if t == tier and c in (LEDGER_DRAWN, LEDGER_TRIANGLE))
@@ -605,6 +610,12 @@ def print_ledger(name: str, res: dict) -> bool:
                 print(f"      {n:6d}  {c}")
         if tier < 2 and shown < 0.99 * total:
             ok = False
+    carcass = cells.get(("carcass", "carcass (a dead creature: not drawn on purpose)"), 0)
+    if carcass:
+        print(f"  carcasses (a dead creature lies where it died; not drawn on purpose): {carcass} creature-seconds")
+    taken_off = sum(n for (t, c), n in cells.items() if c.startswith("taken off"))
+    if taken_off:
+        print(f"  taken off the map on purpose (active, only a spawn point; listed as position unknown): {taken_off} creature-seconds")
     unplaced = cells.get(("none", "no position (never placed)"), 0)
     if unplaced:
         print(f"  replicated but never placed: {unplaced} creature-seconds over {len(res['unplaced_handles'])} actors (distance unknown); "

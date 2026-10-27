@@ -429,6 +429,25 @@ class GamePeerSource:
     HIDDEN_RECENT_S = 240.0  # a hidden creature must have sent state this recently (datagram time): a resting one is quiet for minutes
     PROFILE_MAX = 20_000
 
+    # A dead creature stays in the world as a carcass: a pawn actor that sends a ~1 Hz state batch of 163 / 172 / 179 bits (a timer,
+    # no position, no vitals) and sits exactly where a TICorpseSmell actor was created. Recorded (l): 7 of 7 bodies
+    # created within 0.5 m of a smell actor except one 26 m away; 9 handles with the batch-size signature, none of the
+    # 130 handles that had a decoded position had it. They were drawn as player-owned dinosaurs at their spawn point,
+    # which showed up as "players" 650-850 m away that never moved. A carcass is not drawn.
+    CORPSE_BITS = (163, 172, 179)
+    CORPSE_MIN_BATCHES = 8
+    CORPSE_SHARE = 0.7
+    CORPSE_RUN_ALIVE = 12
+    CORPSE_SMELL_CM = 50.0
+    SMELL_MAX = 8192
+
+    # A creature whose only position is its creation record's spawn point (drawn dimmed, "~") that keeps sending state batches
+    # is active, not resting: the spawn point is where it entered the relevancy range, not where it is. Such a creature is not
+    # drawn at the spawn point; it is counted as "position unknown" and listed in the Nearby table (distance "?").
+    ACTIVE_WINDOW_S = 10.0
+    ACTIVE_MIN_BATCHES = 8
+    ACTIVE_MIN_SPAN_S = 10.0
+
     HEADLINE_HOLD_S = 12.0  # a new headline replaces the shown one only after this long (datagram time): no flapping
 
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
@@ -467,6 +486,13 @@ class GamePeerSource:
         self._resumed: set[int] = set()  # destroyed handles that went on sending state and were taken back (see ``_resume``)
         self._hidden_cache: tuple[float, list] = (-1e9, [])
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
+        self._smells: dict[tuple[int, int], list[tuple[float, float]]] = {}  # 1 m grid cell -> TICorpseSmell positions (cm)
+        self._corpses: set[int] = set()  # handles recognised as carcasses: never drawn
+        self._timer: dict[int, list] = {}  # handle -> [last 8 batches (1 = carcass-sized), run of carcass-sized batches, ever alive]
+        self._active: dict[int, list] = {}  # spawn-only handle -> [first state batch t, recent state batch times]
+        self._stale: set[int] = set()  # creatures taken off the map because they were active but only had a spawn point
+        self.filtered_corpses = 0  # state batches skipped because the actor is a carcass
+        self.stale_spawns = 0  # creatures taken off the map because they were active but only had a spawn point
         self.packets = 0  # inbound datagrams seen
         self.decode_errors = 0  # datagrams whose decoding raised (the rest of the stream is still decoded)
         self._error_t = -1e9  # datagram time of the newest decode error
@@ -524,6 +550,11 @@ class GamePeerSource:
         self._past_own.clear()
         self._zombies.clear()  # the handles of the old connection mean nothing now
         self._resumed.clear()
+        self._smells.clear()
+        self._corpses.clear()
+        self._timer.clear()
+        self._active.clear()
+        self._stale.clear()
         self._hidden_cache = (-1e9, [])
         self._headline = (-1e9, "")
 
@@ -599,6 +630,79 @@ class GamePeerSource:
         return row is not None and row[0] >= self.SHAPE_MIN_BATCHES and row[1] >= row[0] * self.CREATURE_BAND_SHARE \
             and row[2] < row[0] * self.CREATURE_FISH_SHARE
 
+    # -- carcasses and spawn-only creatures ----------------------------------
+    def _register_smell(self, location) -> None:
+        """A TICorpseSmell actor sits exactly where a creature died (they are all created in the join burst, and a body that
+        enters the relevancy range later is created on one)."""
+        x, y = location[0], location[1]
+        if sum(len(v) for v in self._smells.values()) >= self.SMELL_MAX:
+            self._smells.clear()
+        self._smells.setdefault((int(x // 100), int(y // 100)), []).append((x, y))
+
+    def _near_smell(self, location) -> bool:
+        x, y = location[0], location[1]
+        cx, cy = int(x // 100), int(y // 100)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for sx, sy in self._smells.get((cx + dx, cy + dy), ()):
+                    if math.hypot(sx - x, sy - y) <= self.CORPSE_SMELL_CM:
+                        return True
+        return False
+
+    def _hide(self, handle: int) -> None:
+        """Take a creature off the map on purpose (a carcass, or a spawn point it has left): not a server destruction."""
+        self.store.remove(str(handle))
+
+    def _mark_corpse(self, handle: int) -> None:
+        if handle in self._corpses:
+            return
+        self._corpses.add(handle)
+        self._hide(handle)
+        self._profile.pop(handle, None)
+        self._active.pop(handle, None)
+        self._hidden_cache = (-1e9, [])
+
+    def _carcass_signature(self, handle: int, nbits: int) -> bool:
+        """Count one state batch; True once the actor behaves like a carcass: for a creature that never had a decoded position
+        or health block, 6 of its last 8 batches are the timer-sized one; for one that did (it may have died in front of us),
+        its last ``CORPSE_RUN_ALIVE`` batches in a row are, none with a position. Recorded: no live creature of three captures
+        had more than 6 in a row, six of a fourth had 9-27 (a pawn that died and lay there)."""
+        row = self._timer.get(handle)
+        if row is None:
+            if len(self._timer) >= self.PROFILE_MAX:
+                self._timer.clear()
+            row = self._timer[handle] = [deque(maxlen=self.CORPSE_MIN_BATCHES), 0, False]
+        sized = nbits in self.CORPSE_BITS
+        row[0].append(1 if sized else 0)
+        row[1] = row[1] + 1 if sized else 0
+        if row[2]:
+            return row[1] >= self.CORPSE_RUN_ALIVE
+        return len(row[0]) == row[0].maxlen and sum(row[0]) >= self.CORPSE_SHARE * row[0].maxlen
+
+    def _note_alive(self, handle: int) -> None:
+        """This batch carried a decoded position or a health block: it is not a timer batch."""
+        row = self._timer.get(handle)
+        if row:
+            if row[0]:
+                row[0][-1] = 0
+            row[1] = 0
+            row[2] = True
+
+    def _spawn_is_stale(self, handle: int, t: float) -> bool:
+        """True when a creature drawn only at its spawn point has been sending state batches for ``ACTIVE_MIN_SPAN_S`` at
+        ``ACTIVE_MIN_BATCHES`` per ``ACTIVE_WINDOW_S``: it is moving about, so the spawn point is where it entered the
+        relevancy range, not where it is. A resting creature sends a batch now and then and keeps its dimmed spawn dot."""
+        row = self._active.get(handle)
+        if row is None:
+            if len(self._active) >= self.PROFILE_MAX:
+                self._active.clear()
+            row = self._active[handle] = [t, deque()]
+        times = row[1]
+        times.append(t)
+        while times and t - times[0] > self.ACTIVE_WINDOW_S:
+            times.popleft()
+        return len(times) >= self.ACTIVE_MIN_BATCHES and t - row[0] >= self.ACTIVE_MIN_SPAN_S
+
     def _note_unplaced(self, handle: int, nbits: int, t: float) -> None:
         """Profile of a creature-like actor that sent a state batch but has no position on the map."""
         row = self._profile.get(handle)
@@ -624,7 +728,7 @@ class GamePeerSource:
         for handle, (n, band, fish, last) in list(self._profile.items()):  # decoder thread inserts: iterate a copy
             if (n < self.HIDDEN_CREATION_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
                     or handle < self.MIN_DYNAMIC_HANDLE
-                    or handle in self._past_own or self.store.get(str(handle)) is not None):
+                    or handle in self._past_own or handle in self._corpses or self.store.get(str(handle)) is not None):
                 continue
             kind, species, name = self._identity(handle)
             if handle in self._creatures:  # its creation record carried a maxHealth: a creature whatever the class says
@@ -688,6 +792,8 @@ class GamePeerSource:
               source: str = "") -> None:
         """``source``: "" for a decoded position, "spawn" for the creation record's spawn position (a guess about where the
         creature is now). A spawn position never replaces a position that was followed."""
+        if handle in self._corpses:
+            return
         eid = str(handle)
         old = self.store.get(eid)
         if source == "spawn" and old is not None and old.pos_source != "spawn":
@@ -777,6 +883,10 @@ class GamePeerSource:
         self._profile.pop(handle, None)
         self._creatures.discard(handle)
         self._shape.pop(handle, None)
+        self._corpses.discard(handle)
+        self._timer.pop(handle, None)
+        self._active.pop(handle, None)
+        self._stale.discard(handle)
 
     def on_inbound(self, d, own_handle: int | None = None) -> None:
         """Decode one inbound datagram. A failure costs that datagram only, but it is counted and shown (status line,
@@ -833,9 +943,19 @@ class GamePeerSource:
             self._profile.pop(handle, None)
             self._creatures.discard(handle)
             self._shape.pop(handle, None)
+            self._corpses.discard(handle)
+            self._timer.pop(handle, None)
+            self._active.pop(handle, None)
+            self._stale.discard(handle)
             self.locator.note_creation(handle, creation.location, t)
+            path = self.identity.class_path(handle)
+            if creation.location is not None and path and "CorpseSmell" in path:
+                self._register_smell(creation.location)
             kind, species, name = self._identity(handle)
             kind, species, name = self._revive(back, kind, species, name, creation.location, t)
+            if kind not in (sp.KIND_OTHER, sp.KIND_AI) and creation.location is not None and self._near_smell(creation.location):
+                self._corpses.add(handle)  # created exactly where something died: the body
+                continue
             if kind != sp.KIND_OTHER and kind != sp.KIND_UNKNOWN and creation.location is not None:
                 self._emit(handle, *creation.location, kind, species, name, "spawn")  # a guess until a decoded fix confirms it
         bits = Bits(d.payload)
@@ -843,6 +963,9 @@ class GamePeerSource:
         for batch in packet.batches:
             handle = batch.net_ref_handle
             if handle == self.own_handle:
+                continue
+            if handle in self._corpses:
+                self.filtered_corpses += 1
                 continue
             kind, species, name = self._identity(handle)
             if kind == sp.KIND_UNKNOWN and handle in self._zombies:
@@ -862,7 +985,7 @@ class GamePeerSource:
                     # is still a creature when its creation record carries a maxHealth: plants, fruit and items have none.
                     # Its spawn position is drawn at once; waiting for a position update leaves a resting creature unseen.
                     if kind == sp.KIND_UNKNOWN and max_health is not None and handle in spawn_at \
-                            and self.store.get(str(handle)) is None:
+                            and self.store.get(str(handle)) is None and not self._near_smell(spawn_at[handle]):
                         self._emit(handle, *spawn_at[handle], kind, species, name, "spawn")
                 continue
             if bkind != KIND_STATE:
@@ -870,6 +993,10 @@ class GamePeerSource:
             if kind == sp.KIND_UNKNOWN and self._animal_layout(handle, batch.data_bit_count):
                 kind = sp.KIND_AI
             self._note_shape(handle, batch.data_bit_count)
+            if kind != sp.KIND_AI and handle != self.own_handle and self._carcass_signature(handle, batch.data_bit_count):
+                self._mark_corpse(handle)
+                self.filtered_corpses += 1
+                continue
             vit = None
             if kind != sp.KIND_AI and batch.data_bit_count not in self.AI_LAYOUT_BITS:
                 blocks = self.pawn_vitals.blocks
@@ -894,13 +1021,26 @@ class GamePeerSource:
                         # this an actor of the pawn size band (no creation record seen) was placed once and then ignored for
                         # the ~40 s its batches needed to count as creature-like (recorded: 161 m behind when it was next seen).
                         self._creatures.add(handle)
+            if loc is not None or vit is not None:
+                self._note_alive(handle)
             if loc is not None:
                 self.locations += 1
                 self._profile.pop(handle, None)
+                self._active.pop(handle, None)
+                self._stale.discard(handle)
                 self._emit(handle, loc.x, loc.y, loc.z if loc.z_reliable else None, kind, species, name)
             elif (old := self.store.get(str(handle))) is None:
                 if kind != sp.KIND_AI:
                     self._note_unplaced(handle, batch.data_bit_count, t)
+            elif old.pos_source == "spawn" and kind != sp.KIND_AI and self._spawn_is_stale(handle, t):
+                # Drawn only at its spawn point but active for a while: it is no longer there. Not drawn; listed as
+                # "position unknown" (``unplaced_creatures``) until a decoded position puts it back on the map.
+                self._hide(handle)
+                self._stale.add(handle)
+                row = self._shape.get(handle)
+                if row is not None:
+                    self._profile[handle] = [row[0], row[1], row[2], t]
+                self.stale_spawns += 1
             else:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
                 # on the map at its last position instead of letting the TTL remove it.
@@ -1092,7 +1232,8 @@ class GamePeerSource:
         else:
             nearest = "no creature placed"
         return (f"nearby: own ({own[0] / 100:.0f}, {own[1] / 100:.0f}) m | creatures placed " + ", ".join(bands)
-                + f" | {nearest} | server animals<={self.NEARBY_BANDS_M[0]:.0f}m {fish} | replicated without a position {len(unplaced)}")
+                + f" | {nearest} | server animals<={self.NEARBY_BANDS_M[0]:.0f}m {fish} | replicated without a position {len(unplaced)}"
+                + f" | carcasses {len(self._corpses)} | active with only a spawn point {len(self._stale)}")
 
     def mark_moment(self) -> str:
         """The user says creatures are next to them right now: the same report goes to the session log, marked, so the

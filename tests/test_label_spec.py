@@ -122,14 +122,29 @@ def test_own_player_stats_are_not_drawn_on_the_minimap():
 
 
 # ---------------------------------------------------------------- a creature that is created while we listen is drawn at once
-def test_a_creature_with_a_max_health_is_drawn_at_its_spawn_position_even_before_its_class_is_known(join_packets):
+def test_a_creature_with_a_max_health_is_drawn_at_its_spawn_position_even_before_its_class_is_known(join_packets, monkeypatch):
     from test_identity import replay
 
+    from isle_livemap.peers import GamePeerSource
+
+    # handle 73832 of the recorded join was created on a corpse-smell actor (a carcass, see the next test): the carcass rule
+    # is switched off here so that the spawn-position path is tested with the one creature of the recording that never moved
+    monkeypatch.setattr(GamePeerSource, "CORPSE_SMELL_CM", -1.0)
     pk = [r for r in join_packets if r["cap_packet"] <= 3018 or r["cap_packet"] in (5030, 6643)]
     g = replay(pk)
     e = g.store.get("73832")  # a pawn that never moved: its creation record is the only position it ever gives
     assert e is not None and e.kind in ("dino", "player", "unknown")
     assert all(p.entity.kind != "other" for p in g.store.entities())  # plants, fruit and items carry no maxHealth: never drawn
+
+
+def test_a_creature_created_exactly_on_a_corpse_smell_actor_is_a_carcass_and_is_not_drawn(join_packets):
+    from test_identity import replay
+
+    pk = [r for r in join_packets if r["cap_packet"] <= 3018 or r["cap_packet"] in (5030, 6643)]
+    g = replay(pk)
+    # recorded: the Pteranodon 73832 was created 1.4 cm from a TICorpseSmell actor, and never moved or sent a position
+    assert 73832 in g._corpses and g.store.get("73832") is None
+    assert g.filtered_corpses >= 0 and 73832 not in {r["handle"] for r in g.unplaced_creatures()}
 
 
 def test_a_label_keeps_the_side_it_has_or_reports_that_it_no_longer_fits():

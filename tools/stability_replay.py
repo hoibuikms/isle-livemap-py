@@ -132,6 +132,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
     first_record: dict[int, float] = {}
     pipe_errors: list[str] = []
     drops: dict[str, float] = {}  # handle -> sim time of its destruction record
+    hides: dict[str, float] = {}  # handle -> sim time the app took it off the map on purpose (carcass, left spawn point)
     label_log: list[tuple[float, str, str, tuple, tuple]] = []  # (t, id, text, anchor, rect)
     cur = {"id": None, "text": ""}
 
@@ -171,6 +172,13 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
             real_drop(handle)
 
         peers._drop = drop
+        real_hide = peers._hide
+
+        def hide(handle):  # a carcass or a spawn point the creature has left: taken off the map on purpose, the server still replicates it
+            hides[str(handle)] = clock.t
+            real_hide(handle)
+
+        peers._hide = hide
         peers.start()
         view = MapView(pipe, MarkerStore(tmp / "m.json"), Settings(), peers)
         view.timer.stop()
@@ -271,8 +279,10 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
                 if back in gone_at and back in dict(vanished_without_destroy):
                     reappeared.append((back, now - gone_at[back]))
             for gone in displayed_prev - ids:
-                gone_at[gone] = now
-                if gone not in drops or drops[gone] < first_dot.get(gone, 0):
+                deliberate = gone in hides and hides[gone] >= drops.get(gone, -1.0)
+                if not deliberate:
+                    gone_at[gone] = now
+                if (gone not in drops or drops[gone] < first_dot.get(gone, 0)) and hides.get(gone, -1.0) < first_dot.get(gone, 0):
                     vanished_without_destroy.append((gone, now))
             displayed_prev = ids
             pos = pipe.latest.position
@@ -454,6 +464,7 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
     for t, eid, text, anchor, rect in label_log:
         by_id[eid].append((t, text, anchor, rect))
     hops = reversals = toggles = n_labels = flipflops = 0
+    toggle_examples: list = []
     hops_by: dict[str, int] = defaultdict(int)  # which labels hop (the budget is a rate over all of them)
     flip_examples: list = []
     paint_ts = sorted({t for t, *_ in label_log})
@@ -487,10 +498,12 @@ def run(pcap: Path, cache=None, seconds: float | None = None, local_port: int | 
         for a, b in zip(on, on[1:]):
             if b - a == 2:
                 toggles += 1  # labelled, skipped exactly one paint, labelled again
+                if len(toggle_examples) < 6:
+                    toggle_examples.append((eid, round(paint_ts[a], 1)))
     out["label"] = {"placed": n_labels, "slot_hops_per_min": round(hops / minutes, 2),
                     "slot_flipflops_per_min": round(flipflops / minutes, 2),
                     "text_reversals_per_min": round(reversals / minutes, 2), "on_off_toggles_per_min": round(toggles / minutes, 2),
-                    "flipflop_examples": flip_examples,
+                    "flipflop_examples": flip_examples, "toggle_examples": toggle_examples,
                     "hops_by_actor": dict(sorted(hops_by.items(), key=lambda kv: -kv[1])[:5])}
 
     # ---- decode time and the backlog a single worker would have
