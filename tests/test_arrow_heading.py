@@ -134,11 +134,11 @@ def test_a_learned_location_carries_the_yaw_and_the_map_heading():
 
 def test_a_bootstrapped_location_carries_the_yaw_too():
     t = ActorLocationTracker()
-    origin = (130_000.0, -320_000.0, 36_000.0)
+    t._trusted[HDR] = {94}  # the offset another creature's position was learned at for this state header
     a_bits, a_batch = state_batch((130_100.0, -320_000.0, 36_000.0), 0.0)
-    b_bits, b_batch = state_batch((130_160.0, -320_000.0, 36_000.0), 0.0)
-    assert t.bootstrap(a_bits, a_batch, 10.0, origin) is None  # first sample
-    loc = t.bootstrap(b_bits, b_batch, 10.5, origin)  # continues it at walking pace
+    b_bits, b_batch = state_batch((130_160.0, -320_040.0, 36_000.0), 0.0)
+    assert t.bootstrap(a_bits, a_batch, 10.0) is None  # first sample
+    loc = t.bootstrap(b_bits, b_batch, 10.5)  # continues it at walking pace
     assert loc is not None and loc.yaw_deg == pytest.approx(0.0, abs=2.0) and loc.map_heading == pytest.approx(90.0, abs=2.0)
 
 

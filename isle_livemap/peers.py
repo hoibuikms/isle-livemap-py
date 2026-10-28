@@ -812,12 +812,6 @@ class GamePeerSource:
         pos = getattr(latest, "position", None)
         return None if pos is None else (pos.x, pos.y, pos.z)
 
-    def _bootstrap_origin(self) -> tuple[float, float, float] | None:
-        """Where an unanchored creature is searched for: around the local player, but only once the own pawn is locked.
-        Before that the position is a spawn transition (near the world origin, then a jump of kilometres): creatures
-        placed around it were drawn on a false track (recorded session ``vv``, handle 223284)."""
-        return self._own_position() if self.own_handle is not None else None
-
     def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str,
               source: str = "") -> None:
         """``source``: "" for a decoded position, "spawn" for the creation record's spawn position (a guess about where the
@@ -1051,9 +1045,9 @@ class GamePeerSource:
                 # also for a creature that is on the map but whose anchor went stale while it rested: it is followed again
                 # as soon as the same vector offset continues twice (ActorLocationTracker.bootstrap)
                 if self.store.get(str(handle)) is None or creature:
-                    loc = self.locator.bootstrap(bits, batch, t, self._bootstrap_origin())
+                    loc = self.locator.bootstrap(bits, batch, t)
                     if loc is not None and kind == sp.KIND_UNKNOWN:
-                        # It moved like a creature near the player in consecutive batches: it is followed from now on. Without
+                        # It moved like a creature in consecutive batches: it is followed from now on. Without
                         # this an actor of the pawn size band (no creation record seen) was placed once and then ignored for
                         # the ~40 s its batches needed to count as creature-like (recorded: 161 m behind when it was next seen).
                         self._creatures.add(handle)

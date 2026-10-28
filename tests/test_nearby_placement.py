@@ -11,7 +11,7 @@ import pytest
 from isle_livemap.decode import ActorLocationTracker, _vector_at, vector_to_cm
 from isle_livemap.peers import GamePeerSource
 
-from test_pawn_vitals import ME, vector_batch
+from test_pawn_vitals import HDR, ME, auto_batch, vector_batch
 
 
 def _at(dx_m: float, dy_m: float = 0.0):
@@ -21,32 +21,33 @@ def _at(dx_m: float, dy_m: float = 0.0):
 # ---------------------------------------------------------------- bootstrap across a long silence
 def test_two_sparse_batches_a_few_seconds_apart_place_a_resting_creature():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0, ME) is None
+    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0) is None
     # 10.5 s later (more than MAX_GAP): the one candidate of each batch continues the other at walking speed
-    loc = t.bootstrap(*vector_batch(_at(215.0, 4.0)), 20.5, ME)
+    loc = t.bootstrap(*vector_batch(_at(215.0, 4.0)), 20.5)
     assert loc is not None and (loc.x, loc.y) == pytest.approx(_at(215.0, 4.0)[:2])
 
 
 def test_a_long_silence_with_a_jump_is_not_bridged():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0, ME) is None
-    assert t.bootstrap(*vector_batch(_at(700.0)), 20.5, ME) is None  # 500 m in 10 s: another vector, not the creature
+    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0) is None
+    assert t.bootstrap(*vector_batch(_at(700.0)), 20.5) is None  # 500 m in 10 s: another vector, not the creature
     assert t.bootstrapped == 0
 
 
 def test_a_silence_beyond_the_limit_forgets_the_candidate():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0, ME) is None
-    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0 + t.BOOT_LONG_GAP + 5.0, ME) is None
+    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0) is None
+    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0 + t.BOOT_LONG_GAP + 5.0) is None
 
 
 def test_a_creature_whose_anchor_went_stale_is_picked_up_again():
     t = ActorLocationTracker()
+    t._trusted[HDR] = {94}
     t.note_creation(5, _at(200.0), 0.0)
-    assert t.bootstrap(*vector_batch(_at(240.0)), 50.0, ME) is None  # fresh anchor: update() follows it, not the bootstrap
+    assert t.bootstrap(*vector_batch(_at(240.0)), 50.0) is None  # fresh anchor: update() follows it, not the bootstrap
     late = t.ANCHOR_LIFETIME + 30.0
-    assert t.bootstrap(*vector_batch(_at(240.0)), late, ME) is None  # stale: the first candidate is only remembered ...
-    loc = t.bootstrap(*vector_batch(_at(243.0)), late + 1.0, ME)  # ... the second one continues it
+    assert t.bootstrap(*vector_batch(_at(240.0)), late) is None  # stale: the first candidate is only remembered ...
+    loc = t.bootstrap(*vector_batch(_at(243.0)), late + 1.0)  # ... the second one continues it
     assert loc is not None and t.last_known(5)[0] == pytest.approx(_at(243.0)[0])
 
 
@@ -155,39 +156,67 @@ def test_the_state_vector_decoder_uses_that_conversion():
 # ---------------------------------------------------------------- the false-lock guards of the bootstrap
 def test_a_loose_continuation_needs_a_third_consistent_sample_but_a_tight_one_does_not():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0, ME) is None
+    t._trusted[HDR] = {94}
+    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0) is None
     # 40 m in 0.5 s (80 m/s): inside the loose radius, outside the tight one (about 25 m): one more sample is needed
-    assert t.bootstrap(*vector_batch(_at(240.0)), 10.5, ME) is None
-    loc = t.bootstrap(*vector_batch(_at(260.0)), 11.0, ME)  # continues the second sample at walking pace
+    assert t.bootstrap(*vector_batch(_at(240.0)), 10.5) is None
+    loc = t.bootstrap(*vector_batch(_at(260.0)), 11.0)  # continues the second sample at walking pace
     assert loc is not None and (loc.x, loc.y) == pytest.approx(_at(260.0)[:2]) and t.bootstrapped == 1
 
 
 def test_a_loose_match_that_is_not_continued_never_places_the_creature():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0, ME) is None
-    assert t.bootstrap(*vector_batch(_at(240.0)), 10.5, ME) is None
-    assert t.bootstrap(*vector_batch(_at(600.0)), 11.0, ME) is None  # 360 m in 0.5 s: the chain is broken
+    t._trusted[HDR] = {94}
+    assert t.bootstrap(*vector_batch(_at(200.0)), 10.0) is None
+    assert t.bootstrap(*vector_batch(_at(240.0)), 10.5) is None
+    assert t.bootstrap(*vector_batch(_at(600.0)), 11.0) is None  # 360 m in 0.5 s: the chain is broken
     assert t.bootstrapped == 0
 
 
-def test_a_vector_at_the_world_origin_is_not_believed_while_the_player_is_far_from_it():
-    far = (110_000.0, 0.0, 15_000.0)  # 1.1 km from the origin
-    near_origin = (30_000.0, 0.0, 15_000.0)  # 300 m from it, 800 m from the player: inside the search radius
+def _walk(n: int, x0: float, y0: float, z: float = 15_000.0, dx: float = 300.0, dy: float = 200.0):
+    return [(x0 + i * dx, y0 + i * dy, z) for i in range(n)]
+
+
+def test_a_vector_near_the_world_origin_needs_six_walking_samples():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch(near_origin), 10.0, far) is None
-    assert t.bootstrap(*vector_batch((30_100.0, 0.0, 15_000.0)), 10.8, far) is None
-    assert t.bootstrapped == 0 and t.last_known(5) is None
-    spawn = (10_000.0, 0.0, 15_000.0)  # the player is there too: a creature next to them is real
-    assert t.bootstrap(*vector_batch((20_000.0, 0.0, 15_000.0)), 20.0, spawn) is None
-    assert t.bootstrap(*vector_batch((20_100.0, 0.0, 15_000.0)), 20.8, spawn) is not None
+    t._trusted[HDR] = {94}  # even a known offset: near the origin the chain is stricter
+    placed = [t.bootstrap(*auto_batch(v), 10.0 + 0.5 * i) for i, v in enumerate(_walk(7, 30_000.0, 20_000.0))]
+    assert all(p is None for p in placed[:5]) and placed[5] is not None  # the sixth sample places it
+    assert t.bootstrapped == 1
 
 
-def test_creatures_are_only_searched_for_around_a_locked_own_pawn():
+def test_unrelated_state_that_decodes_near_the_origin_is_never_a_creature():
+    t = ActorLocationTracker()
+    t._trusted[HDR] = {94}
+    still = [(-23_000.0, 21_000.0, 27_500.0 + 100.0 * i) for i in range(20)]  # one point, only z ticking over
+    wander = [(-47_700.0 + 25_000.0 * ((-1) ** i), 21_000.0 + 9_000.0 * i, 13_000.0) for i in range(20)]  # 50-100 m/s
+    for vecs in (still, wander):
+        t = ActorLocationTracker()
+        t._trusted[HDR] = {94}
+        assert all(t.bootstrap(*auto_batch(v), 10.0 + 0.5 * i) is None for i, v in enumerate(vecs))
+        assert t.bootstrapped == 0
+
+
+def test_a_constant_or_a_counter_is_not_a_creature_unless_a_layout_is_known():
+    constant = [(-297_000.0, 44_900.0, 20_000.0)] * 12  # the same point again and again
+    counter = [(-297_000.0 + 1_000.0 * i, 44_900.0, 20_000.0 + 50.0 * i) for i in range(12)]  # x ticks, y never changes
+    for vecs in (constant, counter):
+        t = ActorLocationTracker()
+        assert all(t.bootstrap(*auto_batch(v), 10.0 + 0.4 * i) is None for i, v in enumerate(vecs))
+        assert t.bootstrapped == 0
+    t = ActorLocationTracker()
+    t._trusted[HDR] = {94}  # a layout another creature taught: its position may stand still
+    assert t.bootstrap(*auto_batch(constant[0]), 10.0) is None
+    assert t.bootstrap(*auto_batch(constant[1]), 10.4) is not None
+
+
+def test_creatures_are_found_without_any_own_position_or_lock():
+    import inspect
+
+    assert list(inspect.signature(ActorLocationTracker.bootstrap).parameters) == ["self", "bits", "batch", "t"]
     g = source()
-    g._own_position = lambda: ME
-    assert g._bootstrap_origin() is None  # the position before the lock is a spawn transition
-    g.own_handle = 7
-    assert g._bootstrap_origin() == ME
+    assert not hasattr(g, "_bootstrap_origin")  # nothing around the player, and no wait for the own pawn's lock
+    assert g.own_handle is None
 
 
 def test_the_store_keeps_the_packet_time_of_the_last_position():

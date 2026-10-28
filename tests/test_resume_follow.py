@@ -118,6 +118,7 @@ def test_a_reset_forgets_the_destroyed_handles_of_the_old_connection(source):
 # ---------------------------------------------------------------- the creature the bootstrap placed
 def test_a_creature_the_bootstrap_placed_is_followed_from_the_next_batch_on(source, monkeypatch):
     g = source
+    g.locator._trusted[HDR] = {94}  # noqa: SLF001 - another creature's position was learned at this offset of this header
     feed(g, monkeypatch, 5008, east(200.0), 10.0)
     assert g.store.get("5008") is None  # one candidate proves nothing
     feed(g, monkeypatch, 5008, east(210.0), 11.4)  # a second consistent batch: placed

@@ -2,6 +2,7 @@
 
     .venv/bin/python -I tools/tier_check.py SESSION.pcap [more.pcap ...] [--port N] [--check]
     .venv/bin/python -I tools/tier_check.py --labels SESSION.pcap [more.pcap ...] [--port N] [--check] [--png DIR]
+    .venv/bin/python -I tools/tier_check.py --invariance SESSION.pcap [more.pcap ...] [--port N | --all-ports] [--dump DIR] [--check]
     .venv/bin/python -I tools/tier_check.py --ledger SESSION.pcap [more.pcap ...] [--port N | --all-ports] [--seconds N] [--check]
 
 Replays the capture and, once a second, takes every dinosaur / player / unclassified creature within 500 m of the own
@@ -25,6 +26,11 @@ server destruction, and any creature taken off the map while the server still re
 connection of the capture, ``--seconds N`` only the first N seconds, ``--ghost-grace S`` tries another ghost grace.
 ``--check`` exits 1 when fewer than 99 % of the creature-seconds within 500 m are drawn, when a placed creature vanished
 while still replicated, or when the counter announces less than 80 % of the unplaced creatures.
+
+``--invariance``: the position of another creature must come from the packets alone. Replays the capture four times
+(as it runs; with the own position a constant point 6 km away; with the own position shifted by 5 km; with no own position
+and no own handle at all) and compares every position the source puts on the map for another creature: (handle, time, x, y,
+source). ``--check`` exits 1 when any run differs from the first.
 
 ``--labels``: the label guarantee. Replays the capture through the real MapView (offscreen Qt, simulated clock) and once
 a second asks, for every player / dinosaur / unclassified creature within 500 m of the displayed own position: is it
@@ -291,12 +297,23 @@ def main(argv: list[str]) -> int:
     port = int(argv[argv.index("--port") + 1]) if "--port" in argv else None
     secs_arg = argv[argv.index("--seconds") + 1] if "--seconds" in argv else None
     gg_arg = argv[argv.index("--ghost-grace") + 1] if "--ghost-grace" in argv else None
-    paths = [a for a in args if a != str(port) and a != secs_arg and a != gg_arg and (png is None or a != str(png))]
+    dump_arg = argv[argv.index("--dump") + 1] if "--dump" in argv else None
+    paths = [a for a in args if a != str(port) and a != secs_arg and a != gg_arg and a != dump_arg
+             and (png is None or a != str(png))]
     if not paths:
         print(__doc__)
         return 2
     if "--ghost-grace" in argv:  # what-if: another ghost grace (seconds), to compare with the shipped one
         GamePeerSource.GHOST_GRACE_S = GamePeerSource.ghost_grace_s = float(argv[argv.index("--ghost-grace") + 1])
+    if "--invariance" in argv:
+        ok = True
+        for name in paths:
+            ports = local_ports(Path(name)) if "--all-ports" in argv else [port]
+            for pt in ports:
+                label = Path(name).name + ("" if pt is None else f" (port {pt})")
+                dump = Path(argv[argv.index("--dump") + 1]) if "--dump" in argv else None
+                ok &= print_invariance(label, invariance(Path(name), pt, dump))
+        return 1 if "--check" in argv and not ok else 0
     if "--ledger" in argv:
         ok = True
         secs = float(argv[argv.index("--seconds") + 1]) if "--seconds" in argv else None
@@ -630,6 +647,101 @@ def print_ledger(name: str, res: dict) -> bool:
     if res["removed_examples"]:
         print(f"  removed while still replicated (t, handle, dist m, silent s, state batches): {res['removed_examples'][:8]}")
         ok = False
+    return ok
+
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# --invariance: the world position of another creature is decoded from the packets alone
+# --------------------------------------------------------------------------------------------------------------------
+INVARIANCE_FAR = (-450_000.0, 450_000.0, 0.0)  # a point 6 km from anywhere the game is played, in Unreal cm
+INVARIANCE_SHIFT_CM = 500_000.0  # +5 km in x and y
+INVARIANCE_VARIANTS = ("normal", "far", "shift", "nolock")
+
+
+def decoded_fixes(pcap: Path, port: int | None = None, variant: str = "normal") -> tuple[set, set]:
+    """({(handle, t_ms, x_cm, y_cm, source)}, own handles seen) of every position the source puts on the map for another
+    creature, replaying ``pcap`` with the own position / lock state altered:
+
+      normal   the app as it runs
+      far      the own position is a constant point 6 km away
+      shift    the own position is the real one + 5 km in x and y
+      nolock   no own position and no own handle ever (the app before its heartbeat lock, or with a stale lock)
+
+    Only ``GamePeerSource._own_position`` and the own handle the pipeline hands to the source are altered; the packets
+    are the same. A creature's world position must not change with any of them."""
+    clock = _Clock()
+    fixes: set = set()
+    own_handles: set = set()
+    with mock.patch.object(time, "monotonic", clock):
+        pipe = TelemetryPipeline()
+        source = GamePeerSource(pipeline=pipe)
+        real_own = source._own_position
+        if variant == "far":
+            source._own_position = lambda: INVARIANCE_FAR
+        elif variant == "shift":
+            def shifted():
+                p = real_own()
+                return None if p is None else (p[0] + INVARIANCE_SHIFT_CM, p[1] + INVARIANCE_SHIFT_CM, p[2])
+            source._own_position = shifted
+        elif variant == "nolock":
+            source._own_position = lambda: None
+        real_inbound = source.on_inbound
+
+        def inbound(d, own_handle=None):
+            if own_handle is not None:
+                own_handles.add(own_handle)
+            real_inbound(d, None if variant == "nolock" else own_handle)
+
+        source.on_inbound = inbound
+        real_emit = source._emit
+
+        def emit(handle, x, y, z, kind, species, name, source_tag=""):
+            fixes.add((handle, round(source._last_t * 1000.0), round(x, 1), round(y, 1), source_tag))
+            real_emit(handle, x, y, z, kind, species, name, source_tag)
+
+        source._emit = emit
+        source.start()
+        base = None
+        for d in pcap_datagrams(pcap, port):
+            if base is None:
+                base = d.observed_at
+            clock.t = 1000.0 + d.observed_at - base
+            pipe.handle(d)
+        source.stop()
+    return fixes, own_handles
+
+
+def invariance(pcap: Path, port: int | None = None, dump: Path | None = None) -> dict:
+    """{variant: {"fixes": n, "missing": n, "extra": n, "examples": [...]}} against the ``normal`` run, own handles left out.
+    ``dump``: a directory to write the normal run's positions to (json), to compare two versions of the decoder."""
+    base, own = decoded_fixes(pcap, port, "normal")
+    base = {f for f in base if f[0] not in own}
+    if dump is not None:
+        import json
+
+        dump.mkdir(parents=True, exist_ok=True)
+        (dump / f"{pcap.stem}_{port}.json").write_text(json.dumps(sorted(base)))
+    out = {"normal": {"fixes": len(base), "missing": 0, "extra": 0, "examples": [], "handles": len({f[0] for f in base})}}
+    for variant in INVARIANCE_VARIANTS[1:]:
+        got, _ = decoded_fixes(pcap, port, variant)
+        got = {f for f in got if f[0] not in own}
+        missing, extra = sorted(base - got), sorted(got - base)
+        out[variant] = {"fixes": len(got), "missing": len(missing), "extra": len(extra),
+                        "examples": (missing[:2] + extra[:2]), "handles": len({f[0] for f in got})}
+    return out
+
+
+def print_invariance(name: str, res: dict) -> bool:
+    ok = True
+    normal = res["normal"]
+    print(f"{name}: {normal['fixes']} positions of {normal['handles']} other creatures (normal run)")
+    for variant in INVARIANCE_VARIANTS[1:]:
+        r = res[variant]
+        same = r["missing"] == 0 and r["extra"] == 0
+        ok &= same
+        print(f"  {variant:7s} {r['fixes']:6d} positions, {r['missing']:5d} missing, {r['extra']:5d} extra"
+              + ("  -> identical" if same else f"  -> DIFFERS, e.g. {r['examples'][:3]}"))
     return ok
 
 

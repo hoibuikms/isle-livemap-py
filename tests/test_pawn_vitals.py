@@ -152,32 +152,48 @@ def vector_batch(vec, offset=94, comp=26, total=200, handle=5):
     return Bits(w.to_bytes()), IrisBatch(handle, 0, w.nbits, True, False)
 
 
+def auto_batch(vec, **kw):
+    """``vector_batch`` with the component width the vector needs (the decoder only believes a canonical width)."""
+    from isle_livemap.decode import _bits_needed
+
+    return vector_batch(vec, comp=max(_bits_needed(round(v * 100)) for v in vec), **kw)
+
+
 ME = (130_000.0, -320_000.0, 36_000.0)
 
 
-def test_bootstrap_places_an_unanchored_creature_on_its_second_batch_near_the_player():
+def test_bootstrap_places_an_unanchored_creature_on_its_second_batch_at_a_known_offset():
     t = ActorLocationTracker()
-    first = t.bootstrap(*vector_batch((130_000.0 + 20_000.0, -320_000.0, 36_000.0)), 10.0, ME)
+    t._trusted[HDR] = {94}  # another creature's position was learned at this offset of this state header
+    first = t.bootstrap(*vector_batch((150_000.0, -320_000.0, 36_000.0)), 10.0)
     assert first is None  # one candidate proves nothing
-    loc = t.bootstrap(*vector_batch((130_000.0 + 20_100.0, -320_050.0, 36_000.0)), 10.8, ME)
+    loc = t.bootstrap(*vector_batch((150_100.0, -320_050.0, 36_000.0)), 10.8)
     assert loc is not None and (loc.x, loc.y) == pytest.approx((150_100.0, -320_050.0))
     assert t.last_known(5) == pytest.approx((150_100.0, -320_050.0, 36_000.0)) and t.bootstrapped == 1
 
 
-def test_bootstrap_rejects_far_from_the_player_and_jumps_between_batches():
+def test_bootstrap_needs_a_third_sample_at_an_offset_no_layout_is_known_for():
     t = ActorLocationTracker()
-    assert t.bootstrap(*vector_batch((ME[0] + 300_000.0, ME[1], ME[2])), 10.0, ME) is None  # 3 km away
-    assert t.bootstrap(*vector_batch((ME[0] + 300_100.0, ME[1], ME[2])), 10.8, ME) is None
-    assert t.bootstrap(*vector_batch((ME[0] + 20_000.0, ME[1], ME[2])), 11.0, ME) is None
-    assert t.bootstrap(*vector_batch((ME[0] - 40_000.0, ME[1], ME[2])), 11.5, ME) is None  # 600 m in 0.5 s
-    assert t.bootstrap(*vector_batch((ME[0] + 20_000.0, ME[1], ME[2])), 12.0, None) is None  # own position unknown
+    assert t.bootstrap(*vector_batch((150_000.0, -320_000.0, 36_000.0)), 10.0) is None
+    assert t.bootstrap(*vector_batch((150_100.0, -320_050.0, 36_000.0)), 10.8) is None  # two samples agree
+    loc = t.bootstrap(*vector_batch((150_200.0, -320_100.0, 36_000.0)), 11.6)  # the third continues them
+    assert loc is not None and t.bootstrapped == 1
+
+
+def test_bootstrap_rejects_positions_off_the_map_and_jumps_between_batches():
+    t = ActorLocationTracker()
+    t._trusted[HDR] = {94}
+    assert t.bootstrap(*auto_batch((900_000.0, ME[1], ME[2])), 10.0) is None  # 9 km east of the origin: off the playable map
+    assert t.bootstrap(*auto_batch((900_100.0, ME[1] - 50.0, ME[2])), 10.8) is None
+    assert t.bootstrap(*vector_batch((ME[0] + 20_000.0, ME[1], ME[2])), 11.0) is None
+    assert t.bootstrap(*vector_batch((ME[0] - 40_000.0, ME[1] - 500.0, ME[2])), 11.5) is None  # 600 m in 0.5 s
     assert t.bootstrapped == 0 and t.last_known(5) is None
 
 
 def test_bootstrap_leaves_an_anchored_creature_alone():
     t = ActorLocationTracker()
     t.note_creation(5, (ME[0] + 20_000.0, ME[1], ME[2]), 9.0)
-    assert t.bootstrap(*vector_batch((ME[0] + 20_000.0, ME[1], ME[2])), 10.0, ME) is None
+    assert t.bootstrap(*vector_batch((ME[0] + 20_000.0, ME[1], ME[2])), 10.0) is None
 
 
 # ---------------------------------------------------------------- what the label says
