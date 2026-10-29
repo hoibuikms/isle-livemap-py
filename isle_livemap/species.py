@@ -28,7 +28,10 @@ KIND_UNKNOWN = "unknown"  # no class information at all (the creation record was
 
 # First match wins. (substring of the class path, kind).
 CLASS_RULES: tuple[tuple[str, str], ...] = (
+    # A burrow sits under the dinosaur's folder (BP_DryoBurrow, BP_PsittacosaurusBurrow) but is a world object.
+    ("Burrow.Default__", KIND_OTHER),
     ("/Characters/Dinosaurs/", KIND_DINO),
+    ("/GigaSpino/", KIND_DINO),  # the pack that holds Giganotosaurus (and Spinosaurus): /Game/GigaSpino/<Species>/BP_<Species>
     ("/AI/Characters/", KIND_AI),
     ("/Characters/Fishes/", KIND_AI),
 )
@@ -43,6 +46,7 @@ DISPLAY_NAMES: dict[str, str] = {
 # Folder names under /Characters/Dinosaurs/ that are not a species.
 _NOT_SPECIES_FOLDERS = frozenset({"Abilities"})
 DINOSAUR_FOLDER = "/Characters/Dinosaurs/"
+DINOSAUR_FOLDERS = (DINOSAUR_FOLDER, "/GigaSpino/")
 
 
 def clean_class_name(name: str) -> str:
@@ -74,10 +78,13 @@ def kind_of_path(path: str | None) -> str:
 
 def folder_species(path: str | None) -> str | None:
     """Species folder of a ``/Characters/Dinosaurs/<Species>/...`` path (animations, sounds, the class itself)."""
-    if not path or DINOSAUR_FOLDER not in path:
+    if not path or "Burrow.Default__" in path:
         return None
-    folder = path.split(DINOSAUR_FOLDER, 1)[1].split("/", 1)[0]
-    return folder if folder and folder not in _NOT_SPECIES_FOLDERS else None
+    for prefix in DINOSAUR_FOLDERS:
+        if prefix in path:
+            folder = path.split(prefix, 1)[1].split("/", 1)[0]
+            return folder if folder and folder not in _NOT_SPECIES_FOLDERS else None
+    return None
 
 
 def species_of_path(path: str | None) -> str:

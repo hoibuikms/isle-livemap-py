@@ -902,3 +902,76 @@ that tick along one axis). The creatures replicated but never placed went from 3
 The other direction: the own marker comes from the outbound moves (`tracking.py`, `decode.decode_movement`). Nothing in `tracking.py` reads another creature, `capture.py` only
 hands datagrams to the peer source (observer, no feedback), and `_check_server_location` compares the own decode with the server's copy of the own location and never moves the marker
 (`tests/test_position_independence.py::test_the_own_position_is_not_computed_from_other_creatures`).
+
+## Burrows were drawn as dinosaurs, and the Giganotosaurus pack was not drawn (capture `C7`)
+
+A user reported that a player "very close" was shown wrongly and that other players near them did not show. In `C7` (app started before the join, so the export tables were
+seen; a third server) the minimap held 44 "creatures", and 36 of them were burrow actors: `BP_PsittacosaurusBurrow` and `BP_DryoBurrow` sit under
+`/Characters/Dinosaurs/<Species>/`, so the class rule called them dinosaurs. They were drawn as player-owned arrows 1.5-4 km away. At the same time
+the one large pawn that was near the player, a Giganotosaurus (`/Game/GigaSpino/Giganotosaurus/BP_Giganotosaurus`, 673 m away when it came into range), matched no rule and was
+classed as a world object, so it was never drawn. Two changes in `species.py`:
+
+* `("Burrow.Default__", KIND_OTHER)` is the first class rule, and `folder_species` returns None for a burrow, so a burrow is a world object and names no species.
+* `/GigaSpino/` is a dinosaur folder (`DINOSAUR_FOLDERS`), so the pack's pawns (Giganotosaurus, Spinosaurus) are dinosaurs, their animation assets name their species,
+  and `describe(..., has_player_state=True)` makes them players.
+
+A late start has no class path to read. A creature record that names dinosaur assets but has no class path and is small (`creation_bits < 1000`; a pawn's creation batch is
+2 153 bits or more in every recording, a burrow's 230-270) is not a creature: `IdentityTracker.is_object_record`. It is `other` in `peers._identity` and its asset species
+is not offered to the class cache (otherwise a late-start session would save the burrow's protocol id as "Psittacosaurus" and draw burrows as dinosaurs in later sessions).
+
+After the change `C7` shows 7 creatures (it showed 44): two Deinosuchus, the Giganotosaurus, two Triceratops and one unclassified creature, and the nearest is 601 m away. This
+does not explain a player a few metres away: no creature record of `C7` is nearer than about 600 m (the pawn creation records are 65510 and 65564 at 70 s and 154 s, 46048 at 147 s,
+69142 and 75564 at 47 s and 293 s; each was created 650-850 m from the player). If a player really stood next to the user in that session, the server did not replicate him to the
+client, or replicated him in a form that has no creation record in the capture.
+
+Other findings in `C7`, none changed:
+
+* The own handle locked 57 s after the first server packet, but the own pawn did not exist before 49 s (the first own move packet is at 49.2 s; the join screen and the spawn take
+  that long). The lock is the survival heartbeat (about one per second) and needs about 7 s after the pawn exists. Until the first own move there is no own position, so distances
+  are `-`.
+* 154 PlayerState names were decoded and one pawn is linked to a name (`PlayerState` link by the reference marker, which needs exactly one known candidate). The reference
+  position is not fixed in a pawn record: another pawn's PlayerState sits at the same offset with a different byte in front of the marker, and the same 17-bit value (a
+  PlayerState handle) appears in all six pawn records of the session at one bit context, so it is a shared field and not that pawn's link. The link rule was not changed.
+* A Deinosuchus (handle 72872) kept the vitals `12174/12174` and stamina `993` for 200 s without a change, which is far from the other Deinosuchus (`303/307`): the reading is
+  probably not that creature's health.
+
+## Parser coverage, and the packets the capture loses
+
+Question: are creatures missing because part of the server's stream never reaches the decoder (partial bunches, skipped bunches, packets
+the parser rejects)? Every inbound datagram of 13 recordings (13 connections, three servers) was accounted for with a walk that mirrors
+`decode.parse_iris_packet` and records where it stops.
+
+* **No partial bunches.** In all 13 recordings every data-channel bunch is a complete bunch (`bPartial` is never set), so there is nothing to
+  reassemble. `_read_bunch_header` still reads and drops the three partial flags; it is correct for these streams.
+* **The parser reaches everything that carries replication.** 98.9 to 100% of the inbound datagrams parse, and every one that parses ends with
+  `is_complete`. The rejected ones are all 18 bytes (98 of 8914 in capture `C1`, a counter byte and a random tail: keepalive or handshake), or the
+  two handshake datagrams of a connection. None can hold a creation record.
+* **The `decoded` counter is not coverage.** It counts accepted own *outbound* moves (`TelemetryPipeline._counts["decoded"]`), so `in=8914
+  decoded=2733` says nothing about inbound parsing. Inbound understanding is the datagram walk above.
+* **Batches the decoders ignore are not pawns.** In `C1` the "unknown" batches (prefix other than state or creation) belong to 9 handles in
+  total (global objects with 6000-bit states), and the class tables resolve 2943 of 2945 creation records. The world-object classes
+  were checked in the section on burrows and the Giganotosaurus.
+* **A PlayerState does not point at its pawn.** The only packed references in the 154 PlayerStates' batches are shared objects (the same
+  three handles in every one), so there is no back-reference to recover a pawn-to-player link from.
+
+What is lost is in the capture, before the decoder: the game acknowledges every server packet it received in the header of its own packets
+(`decode.parse_packet_notify`: sequence, newest acknowledged sequence, history words). A sequence the game acknowledged and the sniffer
+never delivered is a packet the capture lost, and the server does not send it again.
+
+| Capture | Acknowledged server packets missing from the capture |
+|---|---|
+| `C1` (three servers, 13 connections) | 34 of 8914 (0.4%) |
+| `C2` | 11 of 2099 (0.5%) |
+| `C3` | 22 of 16984 (0.1%) |
+| `C4` | 107 of 8772 (1.2%) |
+| `C5` | 238 of 4729 (5%) |
+| `C6` | 941 of 9737 (9.7%) |
+| `C7` | 55 of 699 (8%) |
+
+The losses are small spikes, not a block at the join, so they cannot hide a whole room of players, but at 5-10% a creation record of a
+nearby player can be gone for good. `capture.LossMeter` counts them live (judged 2 s after the acknowledgement, only for sequences at or after
+the first captured one, wrap-safe): the session log gets a `capture loss: N of M ...` line next to the `flows:` line, a
+`capture loss warning:` line when a window of at least 100 acknowledged packets loses 3% or more (cleared below 1.5%), and the status line
+says `capture missed N% of the game's packets`. The sniffer opens every interface with the filter `udp` and dissects every packet in Python, so a busy
+network (voice, video) is the likeliest cause; narrowing the kernel filter to the game's ports is the fix to try, but it cannot be tested
+without Windows and Npcap, so it was not done.

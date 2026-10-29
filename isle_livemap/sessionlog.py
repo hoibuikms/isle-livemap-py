@@ -167,6 +167,7 @@ class SessionLog:
         self._nearby_at = -1e9
         self._flows_at = None  # clock time of the newest "flows:" line (None: none yet)
         self._flow_hint = ""
+        self._loss_hint = ""
         self._jump_at = -1e9  # datagram time of the newest position jump already logged
         self._frame_at = -1e9  # ... and of the newest server-vs-decoded own location disagreement
         self._gap_at = -1e9  # ... and of the newest gap in the own moves
@@ -329,6 +330,13 @@ class SessionLog:
         if hint != self._flow_hint:
             self._flow_hint = hint
             self.event("flow warning: %s", hint) if hint else self.event("flow warning cleared")
+        loss = getattr(self.pipeline, "update_loss_report", None)
+        if callable(loss):
+            self.event("%s", loss())
+            loss_hint = getattr(self.pipeline, "loss_hint", "")
+            if loss_hint != self._loss_hint:
+                self._loss_hint = loss_hint
+                self.event("capture loss warning: %s", loss_hint) if loss_hint else self.event("capture loss warning cleared")
 
     def _own_frame(self) -> None:
         """Position jumps of the own marker and manual alignments: what is needed to judge later whether the own position

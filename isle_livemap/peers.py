@@ -617,6 +617,8 @@ class GamePeerSource:
             hint = self.identity.species_hint(handle)  # no creation record: only the dinosaur assets of its own batches
             return (sp.KIND_DINO, sp.display_name(hint), "") if hint else (sp.KIND_UNKNOWN, "", "")
         path = self.identity.class_path(handle)
+        if self.identity.is_object_record(handle):
+            return sp.KIND_OTHER, "", ""
         kind, species = sp.describe(path, self.identity.species_hint(handle), info.player_state is not None)
         if kind == sp.KIND_DINO and not species and info.asset_species:
             species = sp.display_name(info.asset_species[0])

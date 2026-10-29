@@ -670,6 +670,38 @@ def _read_bunch_header(r: _Reader) -> tuple[int, int] | None:
     return channel, payload_bits
 
 
+def parse_packet_notify(payload: bytes) -> tuple[int, int, tuple[int, ...]] | None:
+    """(sequence, newest acknowledged sequence, acknowledgement history words) of a datagram's packet-notify header, which
+    both directions carry in front of the bunches. History bit i of the words (word 0 first, LSB first) says whether
+    sequence ``acked - 1 - i`` was received. Only the header is read, never the bunches."""
+    if not payload:
+        return None
+    bits = Bits(payload)
+    packet_end = bits.last_one_before(bits.nbits)
+    if packet_end < 7:
+        return None
+    r = _Reader(bits.big, packet_end)
+    if r.serialized_int(4) is None or r.serialized_int(8) is None:
+        return None
+    handshake = r.bits(1)
+    if handshake is None or handshake != 0 or not r.skip(8):
+        return None
+    bunches_end = bits.last_one_before(packet_end)
+    if bunches_end <= r.pos:
+        return None
+    r.limit = bunches_end
+    header = r.bits(32)
+    if header is None:
+        return None
+    words = []
+    for _ in range((header & 0xF) + 1):
+        w = r.bits(32)
+        if w is None:
+            return None
+        words.append(w)
+    return (header >> 18) & 0x3FFF, (header >> 4) & 0x3FFF, tuple(words)
+
+
 def parse_iris_packet(payload: bytes) -> IrisPacket | None:
     """Read the UE 5.5 Iris replication envelope; exposes batch boundaries."""
     if not payload:
@@ -896,6 +928,7 @@ class ActorInfo:
     player_state: int | None = None  # handle of the PlayerState the record references (pawns)
     name: str | None = None  # PlayerState records only: the player name
     ref_candidates: tuple[int, ...] = ()  # pawns: handles that look like a PlayerState reference (resolved when known)
+    creation_bits: int = 0  # size of the creation batch: a pawn's is thousands of bits, a burrow's a few hundred
 
 
 class IdentityTracker:
@@ -1077,6 +1110,16 @@ class IdentityTracker:
                     self._handle_stage[b.net_ref_handle] = stage
             self._learn_asset_class(b.net_ref_handle)
 
+    OBJECT_RECORD_BITS = 1000  # a pawn's creation batch is >= 2000 bits in every recording; a burrow's is 230-270
+
+    def is_object_record(self, handle: int) -> bool:
+        """True for an actor whose class path was never exported but whose small creation record names dinosaur assets: a
+        burrow or nest that sits under a dinosaur's folder (the join tables were missed), not a creature."""
+        info = self.actors.get(handle)
+        bits = getattr(info, "creation_bits", 0)
+        return (info is not None and 0 < bits < self.OBJECT_RECORD_BITS and bool(info.asset_species)
+                and not self.class_path(handle))
+
     def _learn_asset_class(self, handle: int) -> None:
         """Offer the class cache the species an actor's own assets name, once, for an actor whose class path no table gave:
         a later session that misses the join tables then names that protocol id (marked "~" there)."""
@@ -1084,7 +1127,7 @@ class IdentityTracker:
             return
         info = self.actors.get(handle)
         folder = self.handle_species(handle)
-        if info is None or info.archetype_handle is None or not folder:
+        if info is None or info.archetype_handle is None or not folder or self.is_object_record(handle):
             return
         if self.object_path(info.archetype_handle) is not None or self.class_cache.source(info.protocol_id) is not None:
             return  # a table or an earlier entry already says it
@@ -1163,7 +1206,7 @@ class IdentityTracker:
                 continue
             self.creations += 1
             info = ActorInfo(creation.net_ref_handle, creation.archetype_handle, creation.location, creation.protocol_id,
-                             self._folders_of(b.exports))
+                             self._folders_of(b.exports), creation_bits=b.data_bit_count)
             self.actors[info.handle] = info  # a reused handle replaces the old record
             self._asset_learned.discard(info.handle)
             self._learn_asset_class(info.handle)  # its own batches may already have named the species

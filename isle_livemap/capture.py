@@ -30,7 +30,7 @@ from typing import Callable, Iterable
 from .ifaces import (
     collect_interfaces, derive_capture_status, get_logger, outbound_ip, select_interfaces, should_fallback_to_all,
 )
-from .decode import MovementCandidate, find_server_locations
+from .decode import MovementCandidate, find_server_locations, parse_packet_notify
 from .tracking import MovementTracker, Vitals, VitalsObservation, VitalsTracker
 
 GAME_PROCESS_NAME = "TheIsleClient-Win64-Shipping"  # without .exe
@@ -172,6 +172,86 @@ FLOW_SIZEABLE_PKTS = 100
 FLOW_SIZEABLE_BYTES = 30_000
 FLOWS_MAX = 128
 UNOWNED_MAX = 64
+
+
+# Capture loss (see LossMeter): the game acknowledges every server packet it received in the header of its own outgoing
+# packets, so a sequence the game acknowledged and the sniffer never delivered is a packet the capture lost (an overrun
+# Npcap buffer, a busy machine). The server does not send it again; whatever it carried is missing for good.
+LOSS_GRACE_S = 2.0  # an acknowledged sequence may still be on its way to us (capture order): judged this late
+LOSS_KEEP_S = 90.0  # the 14-bit sequence wraps after ~16000 packets: older entries are forgotten
+LOSS_HINT_RATE = 0.03  # window loss at which the status warns
+LOSS_HINT_CLEAR = 0.015
+LOSS_HINT_MIN_ACKED = 100  # ... judged over at least this many acknowledged packets
+
+
+class LossMeter:
+    """Server packets the game acknowledged that the capture never saw. Not thread-safe: the pipeline calls it under its lock."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._seen: dict[int, float] = {}  # server packet sequence -> capture time
+        self._first: int | None = None  # first sequence captured: acknowledgements of older ones say nothing about us
+        self._done: dict[int, float] = {}  # sequences already counted (or discarded) -> time
+        self._pending: collections.deque[tuple[float, int]] = collections.deque()  # (time acknowledged, sequence)
+        self.acked = 0  # acknowledged sequences judged so far
+        self.lost = 0  # ... of which the capture never saw
+        self._win = (0, 0)  # (acked, lost) at the previous report
+        self.hint = ""
+        self._latest = 0.0  # newest datagram time seen: the clock the grace is judged on (live: monotonic, replay: capture time)
+
+    def note_inbound(self, seq: int, at: float) -> None:
+        if self._first is None:
+            self._first = seq
+        self._seen[seq] = at
+        self._latest = max(self._latest, at)
+
+    def note_ack(self, acked: int, history: tuple[int, ...], at: float) -> None:
+        self._latest = max(self._latest, at)
+        if self._first is None:
+            return
+        self._add(acked, at)
+        bit = 0
+        for word in history:
+            for i in range(32):
+                if (word >> i) & 1:
+                    self._add((acked - 1 - bit) & 0x3FFF, at)
+                bit += 1
+
+    def _add(self, seq: int, at: float) -> None:
+        if ((seq - self._first) & 0x3FFF) >= 0x2000 or seq in self._done:  # older than the capture, or counted already
+            return
+        self._done[seq] = at
+        self._pending.append((at, seq))
+
+    def settle(self, now: float) -> None:
+        """Judge every acknowledgement older than the grace: seen, or lost."""
+        while self._pending and now - self._pending[0][0] >= LOSS_GRACE_S:
+            _, seq = self._pending.popleft()
+            self.acked += 1
+            if seq not in self._seen:
+                self.lost += 1
+        horizon = now - LOSS_KEEP_S
+        if len(self._seen) > 2048:
+            for table in (self._seen, self._done):
+                for k in [k for k, t in table.items() if t < horizon]:
+                    del table[k]
+
+    def report(self, now: float | None = None) -> tuple[str, float, int]:
+        """(log line, loss rate of the window since the previous report, acknowledged packets in that window). Also sets ``hint``."""
+        self.settle(self._latest if now is None else now)
+        wa, wl = self.acked - self._win[0], self.lost - self._win[1]
+        self._win = (self.acked, self.lost)
+        rate = wl / wa if wa else 0.0
+        total = self.lost / self.acked if self.acked else 0.0
+        if wa >= LOSS_HINT_MIN_ACKED and rate >= LOSS_HINT_RATE:
+            self.hint = f"capture missed {rate * 100:.0f}% of the game's packets"
+        elif self.hint and (wa < LOSS_HINT_MIN_ACKED or rate < LOSS_HINT_CLEAR):
+            self.hint = ""
+        line = (f"capture loss: {self.lost} of {self.acked} server packets the game acknowledged are missing from the capture "
+                f"({total * 100:.1f}%); last window {wl} of {wa} ({rate * 100:.1f}%)")
+        return line, rate, wa
 
 
 class FlowTable:
@@ -324,6 +404,7 @@ class TelemetryPipeline:
         self.frame_checks: list[tuple[float, float, tuple[float, float, float]]] = []
         self._srv_prev: tuple[float, list[tuple[float, float, float]]] | None = None
         self.flows = FlowTable()  # every UDP flow handed to handle(), and the UDP seen on ports the game does not own
+        self.loss = LossMeter()  # server packets the game acknowledged that the capture never delivered
         self.flow_hint = ""  # set by update_flow_report(): a second sizeable UDP flow that is not decoded ("" = none)
         self._flow_state: dict | None = None
         self._flow_report_at: float | None = None
@@ -336,6 +417,26 @@ class TelemetryPipeline:
         line, hint, state = describe_flows(self.flows.rows(), self.flows.unowned_rows(), self._server, self._flow_state, window)
         self._flow_state, self._flow_report_at, self.flow_hint = state, now, hint
         return line
+
+    def _note_inbound_seq(self, d: Datagram) -> None:
+        header = parse_packet_notify(d.payload)
+        if header is not None:
+            self.loss.note_inbound(header[0], d.observed_at)
+
+    def _note_ack(self, d: Datagram) -> None:
+        header = parse_packet_notify(d.payload)
+        if header is not None:
+            self.loss.note_ack(header[1], header[2], d.observed_at)
+
+    def update_loss_report(self, now: float | None = None) -> str:
+        """The "capture loss:" log line; also refreshes ``loss_hint``. ``now`` defaults to the newest datagram time."""
+        with self._lock:
+            line, _, _ = self.loss.report(now)
+        return line
+
+    @property
+    def loss_hint(self) -> str:
+        return self.loss.hint
 
     def set_status(self, status: str) -> None:
         with self._lock:
@@ -392,6 +493,7 @@ class TelemetryPipeline:
         with self._lock:
             self._movement.reset()
             self._vitals.reset()
+            self.loss.reset()
             self._srv_prev = None
             self._server = None
             self._rival = None
@@ -427,6 +529,8 @@ class TelemetryPipeline:
         text = status_text(cur.status, self._counts, cur.position is not None)
         if self.flow_hint:
             text += f" · {self.flow_hint}"
+        if self.loss.hint:
+            text += f" · {self.loss.hint}"
         if cur.position is not None and (self._align[0] or self._align[1]):
             dx, dy = self._align[0] / 100.0, self._align[1] / 100.0
             text += f" · aligned {dx:+.0f}, {dy:+.0f} m" + (" (position jumped since: align again?)" if self._align_stale else "")
@@ -547,11 +651,13 @@ class TelemetryPipeline:
                     if n >= SERVER_SWITCH_DATAGRAMS and d.observed_at - self._server_seen >= SERVER_SWITCH_SILENCE_S:
                         self._server, self._server_seen, self._rival = dest, d.observed_at, None
                         self._vitals.reset()
+                        self.loss.reset()
                         vit, vit_at = None, 0.0
                         self._align, self._align_stale, self._raw, self._srv_prev = (0.0, 0.0), False, None, None
                         reset_taps = list(self._reset_observers)
                     else:
                         return None  # a stray datagram: not game traffic of the learned server
+                self._note_ack(d)
                 sample = self._movement.track(d.payload, d.observed_at)
                 if sample is not None:
                     self._counts["decoded"] += 1
@@ -562,6 +668,7 @@ class TelemetryPipeline:
             elif d.direction == INBOUND:
                 self._counts["inbound"] += 1
                 if f"{d.src_ip}:{d.src_port}" == self._server:
+                    self._note_inbound_seq(d)
                     obs: VitalsObservation | None = self._vitals.track(d.payload, d.observed_at)
                     if obs is not None:
                         vit, vit_at, changed = obs.vitals, d.observed_at, True
