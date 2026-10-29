@@ -69,6 +69,7 @@ class PeerSnapshot:
     status: str = ""
     enabled: bool = False
     unplaced: int = 0  # creatures the server replicates to us but that have no position yet (they may be close)
+    late: bool = False  # the app started after the join: the creation records of the creatures already there were never seen
 
 
 class PeerSource(Protocol):
@@ -224,14 +225,14 @@ class PeerStore:
         with self._lock:
             return self._version
 
-    def snapshot(self, status: str = "", enabled: bool = True, unplaced: int = 0) -> PeerSnapshot:
+    def snapshot(self, status: str = "", enabled: bool = True, unplaced: int = 0, late: bool = False) -> PeerSnapshot:
         with self._lock:
             self._expire(self.clock())
             if self._cached is None:
                 self._cached = tuple(sorted(self._seen.values(), key=lambda p: p.entity.id))
             sn = self._snap
-            if sn is None or sn.status != status or sn.enabled != enabled or sn.unplaced != unplaced:
-                sn = self._snap = PeerSnapshot(self._cached, self._version, status, enabled, unplaced)
+            if sn is None or sn.status != status or sn.enabled != enabled or sn.unplaced != unplaced or sn.late != late:
+                sn = self._snap = PeerSnapshot(self._cached, self._version, status, enabled, unplaced, late)
             return sn
 
 
@@ -477,7 +478,7 @@ class GamePeerSource:
         self._facing: dict[int, float] = {}  # handle -> map heading of the last rotation byte decoded with its position
         self._yaw_votes: dict[int, deque] = {}  # handle -> last comparisons of that facing with the direction of travel (True: disagree)
         self._yaw_distrust: set[int] = set()  # handles whose rotation byte keeps contradicting their movement: the travel direction is used
-        self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t]
+        self._profile: dict[int, list] = {}  # unplaced handle -> [state batches, in the pawn size band, animal sized, last t, first t]
         self._creatures: set[int] = set()  # handles whose creation record carried a maxHealth: a creature, whatever its class
         self._shape: dict[int, list] = {}  # handle -> [state batches, in the pawn size band, animal sized]: kept after it is placed
         self._past_own: set[int] = set()  # earlier own pawns (respawn): the old body is not "another creature"
@@ -488,6 +489,9 @@ class GamePeerSource:
         self._zombies: dict[int, tuple] = {}
         self._resumed: set[int] = set()  # destroyed handles that went on sending state and were taken back (see ``_resume``)
         self._hidden_cache: tuple[float, list] = (-1e9, [])
+        self._hidden_all: tuple | None = None  # (the rows of unplaced_creatures, len(_stale), hidden_players)
+        self._banner_kind = ""  # what the minimap banner shows: "" | "late" | "unknown" (see _track_banner)
+        self._banner_logged: tuple[str, float] = ("", -1e9)  # (kind last written to the session log, datagram time)
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
         self._smells: dict[tuple[int, int], list[tuple[float, float]]] = {}  # 1 m grid cell -> TICorpseSmell positions (cm)
         self._corpses: set[int] = set()  # handles recognised as carcasses: never drawn
@@ -562,7 +566,9 @@ class GamePeerSource:
         self._active.clear()
         self._stale.clear()
         self._hidden_cache = (-1e9, [])
+        self._hidden_all = None
         self._headline = (-1e9, "")
+        self._track_banner(force="")  # a new connection: the banner of the old one is gone
 
     def _sync_owned(self) -> None:
         """The own pawn and its earlier bodies are not other creatures: none of them is ever put on the map."""
@@ -693,6 +699,7 @@ class GamePeerSource:
         self._profile.pop(handle, None)
         self._active.pop(handle, None)
         self._hidden_cache = (-1e9, [])
+        self._hidden_all = None
 
     def _carcass_signature(self, handle: int, nbits: int) -> bool:
         """Count one state batch; True once the actor behaves like a carcass: for a creature that never had a decoded position
@@ -741,7 +748,7 @@ class GamePeerSource:
         if row is None:
             if len(self._profile) >= self.PROFILE_MAX:
                 self._profile.clear()
-            row = self._profile[handle] = [0, 0, 0, t]
+            row = self._profile[handle] = [0, 0, 0, t, t]
         row[0] += 1
         row[1] += self.CREATURE_BAND[0] <= nbits <= self.CREATURE_BAND[1]
         row[2] += nbits in self.AI_LAYOUT_BITS
@@ -751,13 +758,17 @@ class GamePeerSource:
         """Creatures that are replicated to us (state batches until recently, no destruction record) but that the map cannot
         place: their creation record, and with it their position, was never seen and they have not moved since (or the
         position layout could not be learned). One dict per creature, most state batches first: handle, kind, species,
-        name, batches, silent_s. Recomputed once a second; safe to call from the UI thread."""
+        name, batches, silent_s, and for the Nearby table rate (state batches per second), since_s (how long it has been
+        known), hp / st (the health and stamina as far as they were read, "" when not). Recomputed once a second; safe to
+        call from the UI thread."""
         if self._last_t - self._hidden_cache[0] < 1.0:
             return self._hidden_cache[1]
         from . import species as sp
 
         rows = []
-        for handle, (n, band, fish, last) in list(self._profile.items()):  # decoder thread inserts: iterate a copy
+        for handle, prof in list(self._profile.items()):  # decoder thread inserts: iterate a copy
+            n, band, fish, last = prof[0], prof[1], prof[2], prof[3]
+            first = prof[4] if len(prof) > 4 else last
             if (n < self.HIDDEN_CREATION_BATCHES or self._last_t - last > self.HIDDEN_RECENT_S or handle == self.own_handle
                     or handle < self.MIN_DYNAMIC_HANDLE
                     or handle in self._past_own or handle in self._corpses or self.store.get(str(handle)) is not None):
@@ -770,15 +781,55 @@ class GamePeerSource:
             else:  # no class: it must behave like a creature (the size profile of a pawn's state batches, see ``_creature_like``)
                 ok = kind == sp.KIND_UNKNOWN and self._creature_like(handle)
             if ok:
-                rows.append({"handle": handle, "kind": kind, "species": species, "name": "" if is_placeholder_name(name) else name,
-                             "batches": n, "silent_s": max(self._last_t - last, 0.0)})
+                rows.append(self._hidden_row(handle, kind, species, name, n, first, last))
         rows.sort(key=lambda r: (-r["batches"], r["handle"]))
         self._hidden_cache = (self._last_t, rows)
+        self._hidden_all = None
         return rows
 
+    def _hidden_row(self, handle: int, kind: str, species: str, name: str, n: int, first: float, last: float) -> dict:
+        vit = self._vitals.get(handle)
+        hp = st = ""
+        if vit is not None:
+            ent = Entity(str(handle), kind, "", species, 0.0, 0.0, **self._vitals_fields(handle, vit))
+            hp = hp_text(ent) if (ent.health is not None or ent.health_pct is not None) else ""
+            st = st_text(ent) if (ent.stamina is not None or ent.stamina_pct is not None) else ""
+        span = max(last - first, 1.0)
+        return {"handle": handle, "kind": kind, "species": species, "name": "" if is_placeholder_name(name) else name,
+                "batches": n, "silent_s": max(self._last_t - last, 0.0), "rate": n / span,
+                "since_s": max(self._last_t - first, 0.0), "hp": hp, "st": st}
+
+    def hidden_players(self) -> list[dict]:
+        """Everything the map cannot place although the server replicates it to us and it behaves like a creature: the
+        creatures of ``unplaced_creatures`` plus those taken off the map because they were active with only a spawn point
+        (``_stale``; they are normally in the first list too). One row per handle; the Nearby table, the banner on the
+        minimap and the counter all use this one list."""
+        rows = self.unplaced_creatures()
+        cached = self._hidden_all
+        if cached is not None and cached[0] is rows and cached[1] == len(self._stale):
+            return cached[2]
+        have = {r["handle"] for r in rows}
+        extra = []
+        for handle in list(self._stale):  # decoder thread discards: iterate a copy
+            if handle in have or self.store.get(str(handle)) is not None:
+                continue
+            kind, species, name = self._identity(handle)
+            prof = self._profile.get(handle)
+            n, last = (prof[0], prof[3]) if prof else (0, self._last_t)
+            first = prof[4] if prof and len(prof) > 4 else last
+            extra.append(self._hidden_row(handle, kind, species, name, n, first, last))
+        out = rows + sorted(extra, key=lambda r: r["handle"]) if extra else rows
+        self._hidden_all = (rows, len(self._stale), out)
+        return out
+
     def hidden_creatures(self) -> int:
-        """How many creatures ``unplaced_creatures`` lists."""
-        return len(self.unplaced_creatures())
+        """How many creatures ``hidden_players`` lists."""
+        return len(self.hidden_players())
+
+    def late_start(self) -> bool:
+        """The app attached after the join: this connection's class tables were (nearly) never seen. Whatever the server
+        sent once, at the join, is missing: the creatures that were already there (and rest) have no position."""
+        return self.pipeline is not None and not self.error and self.packets >= self.LATE_JOIN_PACKETS and self.identity.tables_missed()
 
     def headline(self) -> str:
         """The few words the overlay can show (its status line is elided to about 30 characters): what the user
@@ -1073,7 +1124,7 @@ class GamePeerSource:
                 self._stale.add(handle)
                 row = self._shape.get(handle)
                 if row is not None:
-                    self._profile[handle] = [row[0], row[1], row[2], t]
+                    self._profile[handle] = [row[0], row[1], row[2], t, t]
                 self.stale_spawns += 1
             else:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
@@ -1169,7 +1220,10 @@ class GamePeerSource:
             return (f"game: {len(peers)} actors, {unknown} unidentified: the app started after you joined and missed the "
                     f"server's class tables{via}. Leave the server and join again (rejoin) to identify the rest ({own})")
         seen = (f"creation {self.creation_records}, exports {self.export_batches}, destroyed {self.destruction_records}")
-        return (f"game: {len(peers)} actors ({known} with species; {seen}; "
+        # A late start leaves the map incomplete whatever it shows: say so in the status instead of reading as complete.
+        incomplete = ("INCOMPLETE (started after the join, players already there may be missing, rejoin): "
+                      if self.late_start() else "")
+        return (f"game: {incomplete}{len(peers)} actors ({known} with species; {seen}; "
                 f"heading from rotation/movement; growth, hunger and thirst not available; {own})")
 
     def late_join(self) -> bool:
@@ -1304,8 +1358,35 @@ class GamePeerSource:
         more = f" +{len(shown) - self.LABELS_LISTED} more" if len(shown) > self.LABELS_LISTED else ""
         return f"labels: creatures={len(shown)} fish={fish} | " + (" | ".join(parts) or "none") + more
 
+    BANNER_LOG_GAP_S = 5.0  # a banner that appears and goes again within this is written to the log once, not twice
+
+    def banner_kind(self) -> str:
+        """What the banner on the minimap says (``geo.banner_lines``): "late" (the app started after the join), "unknown"
+        (tables seen, but creatures with no position) or "" (nothing to say)."""
+        if self.late_start():
+            return "late"
+        return "unknown" if self.hidden_creatures() else ""
+
+    def _track_banner(self, force: str | None = None) -> None:
+        """Write the banner to the session log when it appears and when it goes (datagram time, at most one change per
+        ``BANNER_LOG_GAP_S``), so a log shows what the user was told and when."""
+        kind = self.banner_kind() if force is None else force
+        self._banner_kind = kind
+        logged, at = self._banner_logged
+        if kind == logged or self._last_t - at < self.BANNER_LOG_GAP_S and force is None:
+            return
+        self._banner_logged = (kind, self._last_t)
+        n = self.hidden_creatures()
+        if kind == "late":
+            self._events.append(f"banner shown: LATE START: {n} player(s) hidden - leave and rejoin the server")
+        elif kind == "unknown":
+            self._events.append(f"banner shown: {n} creature(s): position unknown")
+        elif logged:
+            self._events.append("banner cleared")
+
     def snapshot(self) -> PeerSnapshot:
-        return self.store.snapshot(self.status(), True, self.hidden_creatures())
+        self._track_banner()
+        return self.store.snapshot(self.status(), True, self.hidden_creatures(), self.late_start())
 
 
 # ----------------------------------------------------------------- factory

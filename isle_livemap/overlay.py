@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QWidget
 from .capture import TelemetryPipeline
 from .confidence import SPECIES_INFERRED, SPECIES_UNKNOWN, LabelConfidence, is_placeholder_name, species_tier
 from .geo import (
-    ARROW_POINTS, CROWDED_ON_SCREEN, PEER_OUTLINE_W,
+    ARROW_POINTS, CROWDED_ON_SCREEN, PEER_OUTLINE_W, banner_lines,
     ASSET_DIR, MAP_HEIGHT, MAP_WIDTH, UNITS_PER_METER, WORLD_SCALE, X_OFFSET, Y_OFFSET, Interpolator, MarkerStore, OwnFacing, Settings, build_rings, clamp_size_percent,
     compass_label, format_distance, load_zones, project_unclamped, unproject,
     ENTITY_STYLE, NEUTRAL_MARKER_RADIUS_PX, PEER_ARROW_SCALE, STALE_ALPHA, UNKNOWN_HEADING_ALPHA, EntitySmoother, Nearby, edge_anchor, peer_label_lines,
@@ -90,6 +90,9 @@ class MapView(QWidget):
         self._peers_version = -1
         self.peer_status = ""
         self.peer_unplaced = 0  # creatures the server replicates to us that have no position yet (see peers.PeerSnapshot.unplaced)
+        self.peer_late = False  # the app started after the join (peers.PeerSnapshot.late)
+        self._banner_t0: float | None = None  # monotonic time the banner appeared (it pulses for its first BANNER_PULSE_S only)
+        self._banner_cache: tuple | None = None  # (key, lines, pill rect, text rect)
         self.own_age_s: float | None = None  # seconds since the last accepted own move (None: no fix)
         self.record_status = ""  # set by App once a second while --record is active
         self._marker_tools: dict[tuple, tuple[QPen, QColor]] = {}
@@ -217,6 +220,7 @@ class MapView(QWidget):
             if snap is not None:
                 self.peer_status = snap.status if snap.enabled else ""
                 self.peer_unplaced = snap.unplaced if snap.enabled else 0
+                self.peer_late = bool(snap.late) if snap.enabled else False
                 # the source decides how long silence is tolerated (game: deltas only, so idle actors go quiet)
                 self.ents.ttl = getattr(self.peers, "ttl_s", PEER_TTL_S)
                 self._stale_s = getattr(self.peers, "stale_s", PEER_STALE_S)
@@ -233,6 +237,12 @@ class MapView(QWidget):
         else:
             self.peer_status = ""
             self.peer_unplaced = 0
+            self.peer_late = False
+        if self.peer_late or self.peer_unplaced:
+            if self._banner_t0 is None:
+                self._banner_t0 = time.monotonic()
+        else:
+            self._banner_t0 = None  # the condition cleared: the banner is gone at once, and pulses again if it comes back
         self.ents.prune(now)
         self.ents.step(dt, now)
 
@@ -291,7 +301,7 @@ class MapView(QWidget):
                           self._draw_player, self._draw_debug_positions):
                 self._paint_layer(layer, p)
             p.setClipping(False)
-            for layer in (self._draw_border, self._draw_peer_status, self._draw_record_status, self._draw_unplaced):
+            for layer in (self._draw_border, self._draw_peer_status, self._draw_record_status, self._draw_banner):
                 self._paint_layer(layer, p)
         finally:
             p.end()  # an unbalanced painter would blank every later frame
@@ -566,9 +576,10 @@ class MapView(QWidget):
         for shown, row in ((self.peer_status, 0), (self.record_status, 1)):
             if shown:
                 placed.append(((self.width() - room) / 2, top + 14 * row, room, 16.0))
-        if self.peer_unplaced:
-            ur = self._unplaced_rect()
-            placed.append((ur.x(), ur.y(), ur.width(), ur.height()))
+        if self.peer_unplaced or self.peer_late:
+            ur = self._banner_layout()[1]
+            if ur is not None:
+                placed.append((ur.x(), ur.y(), ur.width(), ur.height()))
         if not self.full_map and self.interp.has_fix:  # no label covers your own arrow
             me = self._player_screen()
             placed.append((me.x() - 13.0, me.y() - 15.0, 26.0, 30.0))
@@ -973,25 +984,77 @@ class MapView(QWidget):
         text = QFontMetricsF(p.font()).elidedText(self.peer_status, Qt.TextElideMode.ElideRight, room)
         p.drawText(QRectF(0, 6 if self.full_map else 18, self.width(), 16), Qt.AlignmentFlag.AlignHCenter, text)
 
-    UNPLACED_H = 16.0
+    BANNER_FONT_PT = 8
+    BANNER_ICON_W = 20.0  # room for the warning triangle at the left of the pill
+    BANNER_PAD = 4.0
+    BANNER_LINE_H = 13.0
+    BANNER_PULSE_S = 10.0  # the border pulses this long after the banner appears, then it is steady
+    BANNER_COLOR = QColor(255, 150, 40)
 
-    def _unplaced_rect(self) -> QRectF:
-        room = self.width() * (0.9 if self.full_map else 0.62)
-        return QRectF((self.width() - room) / 2, self.height() - (22.0 if self.full_map else 36.0), room, self.UNPLACED_H)
+    def _banner_font(self) -> QFont:
+        f = QFont("Segoe UI", self.BANNER_FONT_PT)
+        f.setBold(True)
+        return f
 
-    def _draw_unplaced(self, p: QPainter) -> None:
-        """A line "3 creatures: position unknown": replicated to us (the server thinks they are relevant to you, so they are not far) but
-        never seen moving and without a creation record: the map cannot say where they are. Better told than left out."""
-        n = self.peer_unplaced
-        if not n:
+    def _banner_layout(self) -> tuple[list[str], QRectF | None, QRectF | None]:
+        """(lines, pill rectangle, text rectangle) of the banner for the current size and state; ([], None, None) when there
+        is nothing to say. The text is shortened until every line fits the chord of the circle at the pill's bottom edge
+        (measured with the font that draws it), never elided with an ellipsis."""
+        key = (self.peer_late, self.peer_unplaced, self.width(), self.height(), self.full_map)
+        c = self._banner_cache
+        if c is not None and c[0] == key:
+            return c[1], c[2], c[3]
+        w, h = float(self.width()), float(self.height())
+        fm = QFontMetricsF(self._banner_font())
+        if self.full_map:
+            bottom_margin, room = 14.0, w * 0.9
+        else:
+            bottom_margin = 46.0  # high enough that the circle is wide there: the longer wording fits on two lines
+            r = min(w, h) / 2.0
+            chord = 2.0 * math.sqrt(max(r * r - (r - bottom_margin) ** 2, 0.0))  # width of the circle where the pill's bottom edge is
+            room = min(w * 0.9, chord * 0.92)
+        text_room = room - self.BANNER_ICON_W - 2 * self.BANNER_PAD
+        lines = banner_lines(self.peer_late, self.peer_unplaced, fm.horizontalAdvance, text_room)
+        if not lines:
+            self._banner_cache = (key, [], None, None)
+            return [], None, None
+        tw = max(fm.horizontalAdvance(t) for t in lines)
+        pw = min(room, tw + self.BANNER_ICON_W + 2 * self.BANNER_PAD + 2.0)
+        ph = len(lines) * self.BANNER_LINE_H + 2 * self.BANNER_PAD
+        pill = QRectF((w - pw) / 2.0, h - bottom_margin - ph, pw, ph)
+        text = QRectF(pill.x() + self.BANNER_ICON_W + self.BANNER_PAD, pill.y() + self.BANNER_PAD,
+                      pw - self.BANNER_ICON_W - 2 * self.BANNER_PAD, ph - 2 * self.BANNER_PAD)
+        self._banner_cache = (key, lines, pill, text)
+        return lines, pill, text
+
+    def _draw_banner(self, p: QPainter) -> None:
+        """"LATE START: 3 players hidden - leave and rejoin the server" (the app started after the join: the creatures that
+        were already there never sent their creation record, so the map cannot place them) or "3 creatures: position unknown"
+        (replicated to us, so not far, but no position). Orange pill with a warning triangle; the border pulses for the first
+        ``BANNER_PULSE_S`` seconds, then it is steady. Gone the moment the condition clears."""
+        lines, pill, text = self._banner_layout()
+        if not lines or pill is None or text is None:
             return
-        p.setFont(QFont("Segoe UI", 8))
-        p.setPen(QColor(255, 170, 90))
-        r = self._unplaced_rect()
-        # a creature the app never saw created has no position until the server sends its creation record again: a rejoin does
-        what = f"{n} creature{'s' if n != 1 else ''}: " + ("no position - rejoin" if "rejoin" in self.peer_status.lower() else "position unknown")
-        text = QFontMetricsF(p.font()).elidedText(what, Qt.TextElideMode.ElideRight, r.width())
-        p.drawText(r, Qt.AlignmentFlag.AlignHCenter, text)
+        age = 1e9 if self._banner_t0 is None else time.monotonic() - self._banner_t0
+        glow = 255 if age >= self.BANNER_PULSE_S else int(150 + 105 * (0.5 + 0.5 * math.sin(age * 2.0 * math.pi * 0.8)))
+        border = QColor(self.BANNER_COLOR)
+        border.setAlpha(glow)
+        p.setPen(QPen(border, 1.6))
+        p.setBrush(QColor(24, 12, 2, 225))
+        p.drawRoundedRect(pill, 6.0, 6.0)
+        # warning triangle with an exclamation mark
+        cx, cy = pill.x() + self.BANNER_ICON_W / 2.0 + 1.0, pill.center().y()
+        tri = QPolygonF([QPointF(cx, cy - 6.5), QPointF(cx + 7.0, cy + 5.5), QPointF(cx - 7.0, cy + 5.5)])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.BANNER_COLOR)
+        p.drawPolygon(tri)
+        p.setFont(self._banner_font())
+        p.setPen(QColor(30, 14, 0))
+        p.drawText(QRectF(cx - 7.0, cy - 5.0, 14.0, 11.0), Qt.AlignmentFlag.AlignCenter, "!")
+        p.setPen(QColor(255, 196, 120))
+        for i, line in enumerate(lines):
+            p.drawText(QRectF(text.x(), text.y() + i * self.BANNER_LINE_H, text.width() + 4.0, self.BANNER_LINE_H),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, line)
 
     def _draw_record_status(self, p: QPainter) -> None:
         if not self.record_status:

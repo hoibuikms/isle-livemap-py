@@ -975,3 +975,38 @@ the first captured one, wrap-safe): the session log gets a `capture loss: N of M
 says `capture missed N% of the game's packets`. The sniffer opens every interface with the filter `udp` and dissects every packet in Python, so a busy
 network (voice, video) is the likeliest cause; narrowing the kernel filter to the game's ports is the fix to try, but it cannot be tested
 without Windows and Npcap, so it was not done.
+
+## The banner on the minimap: "players are hidden, rejoin"
+
+A late start (the app attached after the join) leaves the map incomplete in a way the player cannot see: the server describes
+every creature around a player once, at the join, so a creature that was already there and rests never sent a creation record
+or a position. It stays off the map. The old notice for this was a line of about 30 characters at the top edge, elided,
+easy to miss.
+
+- **Banner (`MapView._draw_banner`, `geo.banner_lines`).** An orange pill with a warning triangle, inside the circle near the
+  bottom (46 px above the bottom edge, where the circle is wide enough; the full map uses the whole width). Late start:
+  `LATE START: 3 players hidden - leave and rejoin the server`, or `LATE START: players may be hidden` when none is counted.
+  Tables seen but creatures without a position: `3 creatures: position unknown`. The text is measured with the font that
+  draws it and **shortened, never elided**: one line, then two lines, then abbreviations (`LATE START: 3 hidden` /
+  `Rejoin the server`), the count kept down to the narrowest sensible width. The border pulses for the first 10 s after the
+  banner appears and is steady afterwards; the banner is gone the frame the condition clears, and pulses again if it returns.
+  Labels keep clear of it.
+- **What is counted (`GamePeerSource.hidden_players`).** Creatures the server replicates to us (state batches within the last
+  240 s, no destruction record) that behave like a creature and have no position (`unplaced_creatures`), plus those taken
+  off the map for being active with only a spawn point (`_stale`), once per handle. The counter, the banner and the Nearby
+  table all use this one list. `late` (`late_start`) is `PeerSnapshot.late`: many packets and almost no class from this
+  connection's tables.
+- **Nearby table.** A separator row `Hidden: no position (N)` (bold, orange, spanning the row), then one row per hidden
+  creature: name (`Player ?` when never sent), species, health and stamina as far as read (`–` otherwise), `position unknown`,
+  and `N state updates, R/s, known T`. `T` counts from the first state batch seen; for a creature taken off the map it counts
+  from the moment it was taken off.
+- **Tray menu.** `How to see all players…` explains the order: start the app first, wait for `waiting for server traffic`,
+  then join or rejoin the server. Restarting the app does not help; only joining again does.
+- **Status line.** After a late start the detail reads `game: INCOMPLETE (started after the join, players already there may
+  be missing, rejoin): ...`, so it cannot be read as a complete picture.
+- **Session log.** `banner shown: LATE START: N player(s) hidden - leave and rejoin the server` / `banner shown: N
+  creature(s): position unknown` / `banner cleared`, at most one change per 5 s of datagram time so a count that flips is
+  written once.
+- **Limits.** The banner says that players are hidden, not where they are: no position exists in the stream. It cannot be
+  cleared by restarting the app. The count is of creatures that behave like creatures (the size profile of a pawn's state
+  batches); a resting creature that never sent a state batch since the app attached is not in it.

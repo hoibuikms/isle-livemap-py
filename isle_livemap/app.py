@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
 
 from .capture import TelemetryPipeline
 from .geo import (
-    LEGEND_ENTRIES, MARKER_KINDS, SIZE_MAX, SIZE_MIN, MarkerStore, Settings, entity_row, format_distance, unplaced_row,
-    parse_radii,
+    HOW_TO_SEE_ALL_STEPS, HOW_TO_SEE_ALL_TITLE, HOW_TO_SEE_ALL_WHY, LEGEND_ENTRIES, MARKER_KINDS, SIZE_MAX, SIZE_MIN,
+    MarkerStore, Settings, format_distance, nearby_table_rows, parse_radii,
 )
 from .overlay import MapView
 
@@ -146,16 +146,25 @@ class NearbyPanel(QDialog):
     def refresh(self) -> None:
         self.status.setText(self.view.peer_status or "no nearby-players source")
         self._near = list(self.view.nearby())
-        rows = [entity_row(n) for n in self._near]
-        unplaced = getattr(getattr(self.view, "peers", None), "unplaced_creatures", None)
-        if callable(unplaced):  # replicated to us, no position yet: listed below the located ones, so that nobody is silently missing
-            rows += [unplaced_row(info) for info in unplaced()]
+        peers = getattr(self.view, "peers", None)
+        hidden_fn = getattr(peers, "hidden_players", None) or getattr(peers, "unplaced_creatures", None)
+        # replicated to us, no position yet: a "Hidden: no position" section below the located ones, so that nobody is silently missing
+        rows, headers = nearby_table_rows(self._near, hidden_fn() if callable(hidden_fn) else (), len(self.COLUMNS))
         if rows != self._rows:
             self._rows = rows
+            self.table.clearSpans()
             self.table.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 for c, text in enumerate(row):
-                    self.table.setItem(r, c, QTableWidgetItem(text))
+                    item = QTableWidgetItem(text)
+                    if r in headers:
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                        item.setForeground(QColor(255, 170, 90))
+                    self.table.setItem(r, c, item)
+                if r in headers:
+                    self.table.setSpan(r, 0, 1, len(self.COLUMNS))
 
     def mark_moment(self) -> None:
         """The user sees creatures next to them: log what the app knows around them right now."""
@@ -255,6 +264,7 @@ class App(QObject):
             ("Zoom to peer radius", lambda: self.view.zoom_to_radius(self.settings.peer_radius_m)),
             ("Size…", self.ask_size), ("Range rings…", self.ask_rings), ("Species label…", self.ask_species),
             ("Nearby radius…", self.ask_peer_radius), ("Marker colours…", self.show_legend),
+            (HOW_TO_SEE_ALL_TITLE + "…", self.show_how_to_see_all),
         ):
             a = QAction(text, menu)
             a.triggered.connect(fn)
@@ -330,6 +340,12 @@ class App(QObject):
         box = QMessageBox(QMessageBox.Icon.NoIcon, "Marker colours",
                           f"<table>{rows}</table><p>Dot size follows the species. An arrow means the creature is moving. "
                           "A bar under a dot is its health (green to red) and stamina (blue) when the game has sent them.</p>")
+        box.exec()
+
+    def show_how_to_see_all(self) -> None:
+        steps = "".join(f"<li>{t}</li>" for t in HOW_TO_SEE_ALL_STEPS)
+        box = QMessageBox(QMessageBox.Icon.Information, HOW_TO_SEE_ALL_TITLE,
+                          f"<p>To see every player around you:</p><ol>{steps}</ol><p>{HOW_TO_SEE_ALL_WHY}</p>")
         box.exec()
 
     def ask_species(self) -> None:

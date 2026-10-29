@@ -880,13 +880,86 @@ def entity_row(n: Nearby) -> tuple[str, ...]:
             format_distance(n.distance_m), f"{compass_label(n.bearing)} ({n.bearing:.0f}°)")
 
 
+HIDDEN_SECTION = "Hidden: no position"
+
+
+def hidden_header_row(n: int, columns: int) -> tuple[str, ...]:
+    """The Nearby table's separator row above the creatures that have no position (``unplaced_row``s)."""
+    return (f"{HIDDEN_SECTION} ({n})",) + ("",) * (columns - 1)
+
+
+def _age_text(seconds: float) -> str:
+    s = max(int(seconds), 0)
+    return f"{s}s" if s < 120 else f"{s // 60}m"
+
+
 def unplaced_row(info: dict) -> tuple[str, ...]:
-    """Nearby-table cells of a creature the server replicates to us but that has no position yet (``peers.unplaced_creatures``):
-    who it is, as far as known, and why there is no distance."""
+    """Nearby-table cells of a creature the server replicates to us but that has no position yet (``peers.hidden_players``):
+    who it is, as far as known, its health and stamina as far as they were read, and why there is no distance. The last
+    cell is how busy it is (state updates per second) and for how long it has been known."""
     name = info.get("name") or (NO_NAME if info.get("kind") in ("player", "dino", "unknown") else "?")
     species = info.get("species") or "?"
-    return (truncate(name, 24), species, "?", "-", "?", "-", "-", "position unknown",
-            f"{info.get('batches', 0)} state updates")
+    rate, since = info.get("rate"), info.get("since_s")
+    busy = f"{info.get('batches', 0)} state updates"
+    if rate is not None:
+        busy += f", {rate:.1f}/s"
+    if since is not None:
+        busy += f", known {_age_text(since)}"
+    return (truncate(name, 24), species, info.get("hp") or NO_VALUE, "-", info.get("st") or NO_VALUE, "-", "-",
+            "position unknown", busy)
+
+
+def nearby_table_rows(near: Sequence[Nearby], hidden: Sequence[dict], columns: int) -> tuple[list[tuple[str, ...]], list[int]]:
+    """(rows, indexes of the section header rows) of the Nearby table: the creatures on the map, nearest first, then a
+    "Hidden: no position (N)" section with the creatures the server replicates to us that the map cannot place."""
+    rows = [entity_row(n) for n in near]
+    headers: list[int] = []
+    if hidden:
+        headers.append(len(rows))
+        rows.append(hidden_header_row(len(hidden), columns))
+        rows += [unplaced_row(info) for info in hidden]
+    return rows, headers
+
+
+HOW_TO_SEE_ALL_TITLE = "How to see all players"
+HOW_TO_SEE_ALL_STEPS = (
+    "Start Isle LiveMap first.",
+    "Wait until the minimap says \u201cwaiting for server traffic\u201d.",
+    "Then join the server, or leave it and join again (rejoin).",
+)
+HOW_TO_SEE_ALL_WHY = (
+    "The server describes every creature around you once, when you join. An app that starts after that never sees "
+    "those descriptions, so players who were already there (and are resting) have no position on the map. "
+    "Restarting the app does not help; only joining the server again does."
+)
+
+
+# ------------------------------------------------------------------ banner: "players are hidden, rejoin"
+def banner_lines(late: bool, hidden: int, width: Callable[[str], float], room: float) -> list[str]:
+    """The text of the banner drawn on the minimap, as one or two lines that each fit ``room`` (``width`` measures a string
+    with the font that draws it). It is shortened (never elided with an ellipsis): the first variant that fits wins.
+
+    ``late``: the app started after the join, so the server's creation records of the creatures that were already there
+    were never seen; ``hidden``: creatures that are replicated to us but have no position on the map. Neither: no banner."""
+    if not late and hidden <= 0:
+        return []
+    if late:
+        who = f"{hidden} player{'s' if hidden != 1 else ''} hidden" if hidden > 0 else "players may be hidden"
+        short = f"{hidden} hidden" if hidden > 0 else "some hidden"
+        variants = [
+            [f"LATE START: {who} - leave and rejoin the server"],
+            [f"LATE START: {who}", "Leave and rejoin the server"],
+            [f"LATE START: {short}", "Rejoin the server"],
+            [f"LATE: {short}", "Rejoin"],
+            ["LATE START", "Rejoin"],
+        ]
+    else:
+        noun = f"{hidden} creature{'s' if hidden != 1 else ''}"
+        variants = [[f"{noun}: position unknown"], [noun, "position unknown"], [f"{hidden} hidden", "no position"], [f"{hidden}", "hidden"]]
+    for lines in variants:
+        if max(width(t) for t in lines) <= room:
+            return lines
+    return variants[-1]
 
 
 def entity_summary(n: Nearby) -> str:

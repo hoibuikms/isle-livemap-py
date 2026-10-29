@@ -105,8 +105,8 @@ def test_a_label_never_lands_on_the_line_that_says_how_many_are_unplaced(tmp_pat
     view.resize(360, 360)
     view.peers = CountingPeers([], unplaced=2)
     tick_twice(view)
-    r = view._unplaced_rect()
-    assert r.bottom() <= view.height() and r.width() > 100
+    r = view._banner_layout()[1]
+    assert r is not None and r.bottom() <= view.height() and r.width() > 100
 
 
 # ---------------------------------------------------------------- the server destroys a creature: a ghost that says so
