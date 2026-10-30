@@ -111,7 +111,7 @@ def test_a_label_never_lands_on_the_line_that_says_how_many_are_unplaced(tmp_pat
 
 # ---------------------------------------------------------------- the server destroys a creature: a ghost that says so
 def test_a_ghost_is_held_45_seconds_and_knows_how_long_it_has_been_gone():
-    assert GamePeerSource.GHOST_GRACE_S == 45.0
+    assert GamePeerSource.GHOST_GRACE_S == 180.0  # (the smoother below is given 45 s explicitly)
     s = EntitySmoother(ttl_s=600.0)
     s.missing_grace_s, s.ghost_grace_s, s.ghost_kinds, s.ghost_age_s = 1.5, 45.0, frozenset(("player", "dino")), 45.0
     s.update([dino("d"), dino("f", kind="ai", species="Longear")], now=0.0)
@@ -162,6 +162,27 @@ def test_the_view_hands_the_ghost_age_to_the_label_and_the_marker_fades(tmp_path
     view.tick()
     ghosts = [n for n in view.nearby() if n.entity.id == "d"]
     assert ghosts and ghosts[0].gone_s is not None and ghosts[0].stale
+
+
+def test_a_ghost_is_dropped_when_the_same_named_player_is_back_under_a_new_handle(tmp_path):
+    from dataclasses import replace as _replace
+
+    view = make_view(tmp_path)
+    view.resize(360, 360)
+    src = GamePeerSource(clock=Clock())
+    old = _replace(dino("old", view.interp.x + 20_000.0, view.interp.y), kind="player", name="Rex Fan")
+    view.peers = FakePeers([PeerEntity(old, time.monotonic())])
+    view.peers.ttl_s, view.peers.gone_grace_s, view.peers.ghost_grace_s = src.ttl_s, src.gone_grace_s, src.ghost_grace_s
+    view.peers.ghost_kinds, view.peers.stale_s = src.ghost_kinds, src.stale_s
+    tick_twice(view)
+    view.peers.set([])  # the server destroyed it
+    tick_twice(view)
+    view.tick()
+    assert [n.entity.id for n in view.nearby()] == ["old"]  # a ghost, 3 minutes of grace
+    new = _replace(old, id="new", x=old.x + 500.0)
+    view.peers.set([PeerEntity(new, time.monotonic())])
+    tick_twice(view)
+    assert [n.entity.id for n in view.nearby()] == ["new"]  # one arrow for the player, not a ghost and a live one
 
 
 # ---------------------------------------------------------------- a creature that rests for minutes

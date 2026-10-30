@@ -18,6 +18,9 @@ DEINOSUCHUS = "/Game/TheIsle/Core/Characters/Dinosaurs/Deinosuchus/BP_Deinosuchu
 
 
 class FakePipeline:
+    class latest:  # noqa: N801 - the own player has a position
+        position = type("Pos", (), {"x": 0.0, "y": 0.0, "z": 0.0})()
+
     def add_observer(self, *a):
         pass
 
@@ -118,6 +121,8 @@ def test_headline_with_tables_seen_reports_creatures_that_have_no_position():
 
 def test_headline_says_nobody_nearby_only_when_that_is_known():
     seen = source(tables_seen=True)
+    assert seen.headline() == ""  # the map has only just been empty: the server may still be describing the surroundings
+    seen._last_t += seen.NOBODY_GRACE_S  # noqa: SLF001
     assert seen.headline() == "No other players nearby"
     late = source()  # the tables were missed: sleeping creatures cannot be placed, so nobody-nearby is not known
     assert late.headline() == "Started late: rejoin to see all"
@@ -125,6 +130,31 @@ def test_headline_says_nobody_nearby_only_when_that_is_known():
     assert seen.headline() == "No other players nearby"  # a change waits HEADLINE_HOLD_S so the line does not flicker
     seen._last_t += seen.HEADLINE_HOLD_S  # noqa: SLF001
     assert seen.headline() == ""
+
+
+def test_headline_does_not_claim_nobody_is_near_while_your_own_position_is_unknown():
+    g = source(tables_seen=True)
+    g.pipeline.latest = type("Latest", (), {"position": None})()  # dead, loading or not yet spawned
+    g._last_t += 60.0  # noqa: SLF001
+    assert g.headline() == "Waiting for your position"
+    g.pipeline.latest = FakePipeline.latest
+    g._last_t += g.HEADLINE_HOLD_S  # noqa: SLF001
+    assert g.headline() == ""  # position known again: the empty-map clock starts now
+    g._last_t += g.HEADLINE_HOLD_S  # noqa: SLF001
+    assert g.headline() == "No other players nearby"
+
+
+def test_a_player_appearing_restarts_the_empty_map_clock():
+    g = source(tables_seen=True)
+    g.headline()
+    g._last_t += g.NOBODY_GRACE_S - 1.0  # noqa: SLF001
+    g.store.update(Entity("9", "player", "Someone", "Deinosuchus", 1.0, 2.0))
+    assert g.headline() == ""
+    g.store.remove("9")
+    g._last_t += 2.0  # noqa: SLF001 - the player left just before the grace would have run out
+    assert g.headline() == ""
+    g._last_t += g.NOBODY_GRACE_S  # noqa: SLF001
+    assert g.headline() == "No other players nearby"
 
 
 def test_headline_is_one_constant_message_while_the_tables_are_missing():
@@ -151,6 +181,8 @@ def test_headline_with_the_tables_seen_does_not_flicker_between_two_values():
     assert g.headline() == "1 creature: no position yet"
     g._profile.clear()  # noqa: SLF001
     g._hidden_cache = (-1e9, 0)  # noqa: SLF001
+    g._last_t += g.HEADLINE_HOLD_S  # noqa: SLF001
+    assert g.headline() == ""  # the map has been empty only briefly
     g._last_t += g.HEADLINE_HOLD_S  # noqa: SLF001
     assert g.headline() == "No other players nearby"
 

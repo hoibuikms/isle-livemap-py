@@ -396,7 +396,10 @@ class GamePeerSource:
     # Measured (three recordings): a player-sized creature stays relevant for a median of 31-43 s before the server destroys
     # it, and of 131 handles that came back, 18 % did so within 12 s and 34 % within 30 s. A ghost is dimmed more with
     # every second and says on its label how long ago the server destroyed it ("gone 23s").
-    GHOST_GRACE_S = 45.0
+    # The server only replicates a player that is within about 150 m of you (in the ``ee`` recording every one appeared 144-151 m
+    # away) and destroys it when it leaves that range; those that came back were away for 30-235 s. So the arrow is kept
+    # for 3 minutes at the last position, fainter every 40 s and labelled "gone 2m", instead of vanishing after 45 s.
+    GHOST_GRACE_S = 180.0
     ghost_grace_s = GHOST_GRACE_S
     ghost_kinds = frozenset(("player", "dino", "unknown"))
 
@@ -463,6 +466,7 @@ class GamePeerSource:
     # since the first packet (recorded: the banner flashed for 5 s at every join).
     LATE_JOIN_GRACE_S = 15.0
 
+    NOBODY_GRACE_S = 10.0  # "No other players nearby" is said only after the map has been empty this long (datagram time): the server needs a moment to describe the surroundings after a respawn or a rejoin
     HEADLINE_HOLD_S = 12.0  # a new headline replaces the shown one only after this long (datagram time): no flapping
 
     STATUS_NO_PIPELINE = "game: unavailable (no capture pipeline attached)"
@@ -507,6 +511,7 @@ class GamePeerSource:
         self._banner_kind = ""  # what the minimap banner shows: "" | "late" | "unknown" (see _track_banner)
         self._banner_logged: tuple[str, float] = ("", -1e9)  # (kind last written to the session log, datagram time)
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
+        self._empty_since: float | None = None  # datagram time from which no player / dinosaur has been on the map
         self._smells: dict[tuple[int, int], list[tuple[float, float]]] = {}  # 1 m grid cell -> TICorpseSmell positions (cm)
         self._corpses: set[int] = set()  # handles recognised as carcasses: never drawn
         self._timer: dict[int, list] = {}  # handle -> [last 8 batches (1 = carcass-sized), run of carcass-sized batches, ever alive]
@@ -588,6 +593,7 @@ class GamePeerSource:
         self._hidden_cache = (-1e9, [])
         self._hidden_all = None
         self._headline = (-1e9, "")
+        self._empty_since = None
         self._track_banner(force="")  # a new connection: the banner of the old one is gone
 
     def _sync_owned(self) -> None:
@@ -899,15 +905,25 @@ class GamePeerSource:
         peers = self.store.entities()
         unknown = sum(1 for p in peers if p.entity.kind == "unknown")
         hidden = self.hidden_creatures()
+        if hidden or self.identity.tables_missed():
+            self._empty_since = None  # creatures are there (or may be): the map is not known to be empty
         if self.identity.tables_missed():
             # One constant message for as long as this lasts. It used to say "Rejoin server: N hidden" / "to identify" /
             # "Started late" depending on a count that flipped between 0 and 1 every few seconds.
             return "Started late: rejoin to see all"
         if hidden:
             return f"{hidden} creature{'s' if hidden > 1 else ''}: no position yet"
-        if not unknown and not any(p.entity.kind in ("dino", "player") for p in peers):
-            return "No other players nearby"
-        return ""
+        if unknown or any(p.entity.kind in ("dino", "player") for p in peers):
+            self._empty_since = None
+            return ""
+        if self._own_position() is None:
+            # Without your own position nothing can be near you: "nobody nearby" would be a guess (a dead or loading player
+            # also gets no creatures replicated). Say what is missing instead.
+            self._empty_since = None
+            return "Waiting for your position"
+        if self._empty_since is None:
+            self._empty_since = self._last_t
+        return "No other players nearby" if self._last_t - self._empty_since >= self.NOBODY_GRACE_S else ""
 
     def _own_position(self) -> tuple[float, float, float] | None:
         latest = getattr(self.pipeline, "latest", None)

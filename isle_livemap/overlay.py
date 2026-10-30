@@ -30,7 +30,7 @@ from .peers import status_is_warning
 BASE_SIZE = 360  # minimap edge in px at 100 %
 BASE_VIEW_FRACTION = 0.2  # minimap shows 20 % of map width at zoom 1
 KIND_COLORS = {"waypoint": "#ffd34d", "nest": "#ff9a52", "water": "#4db8ff", "dinosaur": "#ff6b6b", "other": "#c8c8c8"}
-GHOST_FADE_STEP_S, GHOST_FADE_STEPS = 10.0, 4  # a ghost gets fainter every 10 s, in 4 steps (45 s grace)
+GHOST_FADE_STEP_S, GHOST_FADE_STEPS = 40.0, 4  # a ghost gets fainter every 40 s, in 4 steps (180 s grace)
 RADIUS_STICKY_FACTOR = 1.04  # a creature that was inside the view radius stays inside until 4 % beyond it
 KIND_GLYPH = {"waypoint": "◆", "nest": "⌂", "water": "≈", "dinosaur": "☠", "other": "●"}
 EDGE_INSET_PX = 7  # edge indicators sit this far inside the minimap circle
@@ -263,6 +263,9 @@ class MapView(QWidget):
         if ghosts:  # the server destroyed these; they are held at their last position and say for how long
             gone = {eid: self.ents.gone_s(eid, now) for eid in ghosts}
             out = [replace(n, gone_s=gone[n.entity.id]) if gone.get(n.entity.id) is not None else n for n in out]
+            live_names = {n.entity.name for n in out if n.gone_s is None and not is_placeholder_name(n.entity.name)}
+            # a player who came back under a new handle (died, rejoined) is on the map again: the old arrow is not a second one
+            out = [n for n in out if n.gone_s is None or n.entity.name not in live_names]
         return out
 
     def view(self) -> tuple[float, float, float]:
