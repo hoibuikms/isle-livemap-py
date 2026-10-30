@@ -54,7 +54,8 @@ CROWD_GLYPHS = 150  # full glyphs for the most important this many peers; the re
 LABEL_ATTEMPTS_PER_LABEL = 3  # placement tries per allowed label, so a crowd cannot cost 500 text measurements
 SMALL_FONT_PT = 7  # labels of the 250 - 500 m band (the 8 pt of the nearest tier is easier to read where it matters most)
 LAST_RESORT_PER_FRAME = 6  # labels per frame that may take the least-overlapping spot when every free one is gone
-LEADER_ALPHA = 150
+LEADER_ALPHA = 235  # the line from a displaced label to its marker: it has to be found at a glance on forest and water
+LEADER_WIDTH = 1.6
 LABEL_STALE_ALPHA = 185  # a label of a stale / spawn-only creature stays readable (its arrow is the dimmed part)
 SEARCH_BUDGET = 10  # guaranteed labels per frame that may search the whole list of spots; the rest of a crowd reuse the spot they had
 FORCED_REVIEW_S = 1.0  # a label that sits on a spot overlapping others looks for a better one only every this many seconds
@@ -678,7 +679,7 @@ class MapView(QWidget):
                 continue
             is_ai = n.entity.kind == "ai"
             tier = priority_tier(n.distance_m)
-            below = BAR_BOX_H + 3.0 if bars_on and not is_ai else 0.0  # the slots under the arrow start below its bars
+            below = BAR_BOX_H + 1.5 if bars_on and not is_ai else 0.0  # the slots under the arrow start below its bars
             short_only = False
             if guaranteed:
                 if guaranteed_used >= guaranteed_max:
@@ -771,7 +772,7 @@ class MapView(QWidget):
             band = min(band_total, guaranteed_max)
             self._draw_all_bars(p, by_priority, skip, max(BAR_MAX if creatures <= CROWD_GLYPHS else BAR_CROWDED, band))
         if leader_ops:  # thin lines from a displaced label to its marker, under the pills and the arrows
-            p.setPen(QPen(QColor(200, 160, 255, LEADER_ALPHA), 1.0))
+            p.setPen(QPen(QColor(215, 185, 255, LEADER_ALPHA), LEADER_WIDTH))
             for ax_, ay_, nx_, ny_ in leader_ops:
                 p.drawLine(QPointF(ax_, ay_), QPointF(nx_, ny_))
         cur_font = font
