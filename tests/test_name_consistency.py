@@ -136,15 +136,17 @@ def at(view, i, metres, degrees, name="", **kw):
     return peer(view, i, metres * math.cos(a), metres * math.sin(a), name=name, **kw)
 
 
-def test_a_player_with_a_known_name_keeps_a_one_line_label_when_the_distance_tier_is_full(tmp_path, clock):
+def test_a_player_beyond_the_label_tier_cap_is_still_labelled_inside_the_nearby_radius(tmp_path, clock):
+    """The 500-1000 m tier caps at 4 labels, but the guarantee follows the nearby radius (1000 m): six nameless players and a
+    named one at 990 m all keep a label (it used to be the named one only; the nameless had to wait for a free label)."""
     view, fp = view_with(tmp_path, clock)
-    crowd = [at(view, i, 600.0 + i * 10.0, 40.0 * i) for i in range(1, 7)]  # six nameless players fill the 1000 m tier (4 labels)
-    named = at(view, 9, 990.0, 300.0, name="P1")  # the furthest of them all
+    crowd = [at(view, i, 600.0 + i * 10.0, 40.0 * i) for i in range(1, 7)]
+    named = at(view, 9, 990.0, 300.0, name="P1")
     fp.set([*crowd, named])
     advance(view, clock, 0.3)
     view.grab()
-    assert "9" in view._labelled
-    fp.set([*crowd, at(view, 9, 990.0, 300.0)])  # without the name it has to wait for a free label
+    assert {"1", "2", "3", "4", "5", "6", "9"} <= view._labelled
+    view.settings.peer_radius_m = 700.0  # a smaller radius: the player at 990 m is a pointer on the edge, not a dot
     advance(view, clock, 0.3)
     view.grab()
     assert "9" not in view._labelled
@@ -161,6 +163,7 @@ def test_inside_500_m_every_creature_has_a_label_whether_its_name_is_known_or_no
 
 def test_the_bars_hang_under_every_player_and_dinosaur_with_a_grey_track_where_nothing_is_known(tmp_path, clock):
     view, fp = view_with(tmp_path, clock)
+    view.settings.show_vitals_bars = True  # off by default: the label carries the numbers and percentages
     fp.set([at(view, 1, 150.0, 0.0, name="P1", hp=100.0), at(view, 2, 150.0, 90.0, name="P2", hp=None)])
     advance(view, clock, 0.3)
     calls: list[tuple[str, int]] = []
@@ -176,3 +179,12 @@ def test_the_bars_hang_under_every_player_and_dinosaur_with_a_grey_track_where_n
     greys = [c for c in calls if c[0] == "#969696"]
     assert tracks and tracks[0][1] == 2  # a dark track behind the bars of both creatures
     assert greys and sum(n for _, n in greys) == 3  # P1's stamina, P2's health and stamina: nothing known, an empty grey track
+
+
+def test_every_nameless_player_inside_the_nearby_radius_is_labelled_not_only_four(tmp_path, clock):
+    view, fp = view_with(tmp_path, clock)
+    assert view.settings.peer_radius_m == 1000.0
+    fp.set([at(view, i, 560.0 + i * 55.0, 40.0 * i) for i in range(1, 8)])  # seven, 615 .. 945 m
+    advance(view, clock, 0.3)
+    view.grab()
+    assert {str(i) for i in range(1, 8)} <= view._labelled

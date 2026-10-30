@@ -28,13 +28,13 @@ def E(eid, kind="dino", x=0.0, y=0.0, **kw):
 def test_player_label_is_name_species_distance_then_health_and_stamina_in_points():
     e = E("1", "player", name="Rex Fan", species="Deinosuchus", health_pct=86.0, stamina_pct=66.0, health=1419.0, max_health=1650.0,
           stamina=330.0, max_stamina=500.0, max_src="block")
-    assert peer_label_lines(Nearby(e, 0.0, 0.0, 724.0, 45.0)) == ["Rex Fan - Deinosuchus - 724 m", "HP 1419/1650  ST 330/500"]
+    assert peer_label_lines(Nearby(e, 0.0, 0.0, 724.0, 45.0)) == ["Rex Fan - Deinosuchus - 724 m", "HP 1419/1650 (86%)  ST 330/500 (66%)"]
 
 
 def test_a_dinosaur_without_a_player_name_has_the_same_two_line_shape():
     e = E("2", species="Carnotaurus", health_pct=100.0, stamina_pct=50.0, health=900.0, max_health=900.0, stamina=250.0,
           max_stamina=500.0, max_src="block")
-    assert peer_label_lines(Nearby(e, 0.0, 0.0, 120.0, 0.0)) == ["Player ? - Carnotaurus - 120 m", "HP 900/900  ST 250/500"]
+    assert peer_label_lines(Nearby(e, 0.0, 0.0, 120.0, 0.0)) == ["Player ? - Carnotaurus - 120 m", "HP 900/900 (100%)  ST 250/500 (50%)"]
 
 
 def test_unknown_values_are_dino_and_dashes_never_guesses():
@@ -46,7 +46,7 @@ def test_unknown_values_are_dino_and_dashes_never_guesses():
 
 def test_an_old_reading_keeps_its_values_and_gets_an_age_tag():
     e = E("4", health_pct=70.0, stamina_pct=20.0, health=700.0, max_health=1000.0, stamina=100.0, max_stamina=500.0, max_src="block")
-    assert vitals_line(e, VITALS_STALE, 130.0) == "HP 700/1000  ST 100/500 [2m+]"
+    assert vitals_line(e, VITALS_STALE, 130.0) == "HP 700/1000 (70%)  ST 100/500 (20%) [2m+]"
     assert vitals_line(E("4"), VITALS_STALE, 130.0) == ""  # nothing was ever read: no line at all
 
 
@@ -160,13 +160,13 @@ def test_a_label_keeps_the_side_it_has_or_reports_that_it_no_longer_fits():
 # ---------------------------------------------------------------- real values: where the maxima come from
 def test_a_maximum_that_is_only_the_creation_records_is_marked_with_a_tilde():
     e = E("8", health_pct=86.0, health=2274.0, max_health=2606.0, max_src="creation")
-    assert vitals_line(e, "known", None) == "HP 2274/~2606  ST –"  # the creature may have grown since: the maximum is approximate
-    assert vitals_line(replace(e, max_src="block"), "known", None) == "HP 2274/2606  ST –"
+    assert vitals_line(e, "known", None) == "HP 2274/~2606 (86%)  ST –"  # the creature may have grown since: the maximum is approximate
+    assert vitals_line(replace(e, max_src="block"), "known", None) == "HP 2274/2606 (86%)  ST –"
 
 
 def test_a_stamina_value_without_its_maximum_is_still_shown():
     e = E("9", health_pct=86.0, stamina_pct=None, health=2274.0, max_health=2620.0, stamina=624.0, max_src="block")
-    assert vitals_line(e, "known", None) == "HP 2274/2620  ST 624/–"  # the 8-slot block carries no maximum stamina
+    assert vitals_line(e, "known", None) == "HP 2274/2620 (86%)  ST 624/–"  # the 8-slot block carries no maximum stamina
 
 
 def test_a_health_value_without_any_maximum_is_still_shown():
@@ -176,7 +176,7 @@ def test_a_health_value_without_any_maximum_is_still_shown():
 
 def test_small_values_keep_a_decimal_so_a_hatchling_is_not_rounded_away():
     e = E("11", health_pct=100.0, stamina_pct=74.0, health=1.6, max_health=1.6, stamina=79.7, max_stamina=107.9, max_src="block")
-    assert vitals_line(e, "known", None) == "HP 1.6/1.6  ST 80/108"
+    assert vitals_line(e, "known", None) == "HP 1.6/1.6 (100%)  ST 80/108 (74%)"
     assert points_text(9.96) == "10" and points_text(9.94) == "9.9"  # the rounding boundary never prints "10.0"
 
 
@@ -187,4 +187,11 @@ def test_the_table_and_the_tooltip_use_the_same_values_as_the_label():
     row = entity_row(n)
     assert row[2] == "1419/1650" and row[4] == "330/500"
     assert "HP 1419/1650" in entity_summary(n) and "ST 330/500" in entity_summary(n)
-    assert vitals_line(e, "known", None) == "HP 1419/1650  ST 330/500"
+    assert vitals_line(e, "known", None) == "HP 1419/1650 (86%)  ST 330/500 (66%)"
+
+
+def test_the_growth_stage_leads_the_vitals_line_and_stands_alone_without_vitals():
+    e = Entity(id="1", kind="player", name="Rex Fan", species="Deinosuchus", x=0.0, y=0.0, stage="Juvenile",
+               health=1419.0, max_health=1650.0, stamina=330.0, max_stamina=500.0, health_pct=86.0, stamina_pct=66.0)
+    assert vitals_line(e, "known", None) == "Juvenile  HP 1419/1650 (86%)  ST 330/500 (66%)"
+    assert vitals_line(replace(e, health=None, stamina=None, max_health=None, max_stamina=None, health_pct=None, stamina_pct=None), "none", None) == "Juvenile"

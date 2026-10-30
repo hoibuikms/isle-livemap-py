@@ -295,6 +295,9 @@ def test_a_label_tolerates_a_few_pixels_where_a_new_one_would_not_fit():
 def test_a_peer_that_has_a_label_keeps_it_over_a_newcomer_at_almost_the_same_distance(tmp_path, clock, monkeypatch):
     from test_peers_ui import peer
 
+    import isle_livemap.geo as geo
+
+    monkeypatch.setattr("isle_livemap.overlay.is_guaranteed", lambda n, was=False, radius_m=0.0: geo.is_guaranteed(n, was))  # the fixed 500 m guarantee: this test is about the ranking beyond it
     monkeypatch.setattr("isle_livemap.geo.LABEL_CAPS_MINIMAP", (0, 0, 2, 0))  # two labels in the 1000 m tier (the inner tiers are guaranteed), so a newcomer has to take one over
 
     def at(i, metres, degrees):

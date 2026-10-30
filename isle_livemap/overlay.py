@@ -424,9 +424,10 @@ class MapView(QWidget):
         # same distance
         before = self._labelled
         guar_prev = self._guar_prev
+        nearby_radius_m = self.settings.peer_radius_m  # (``radius`` below becomes the pixel radius of the view)
 
         def guar(n):
-            return (not self.full_map) and is_guaranteed(n, n.entity.id in guar_prev)
+            return (not self.full_map) and is_guaranteed(n, n.entity.id in guar_prev, nearby_radius_m)
 
         by_priority = sorted(on_screen, key=lambda it: priority_key(it[0], it[0].entity.id in before))
         ai_on_screen = sum(1 for it in by_priority if it[0].entity.kind == "ai")

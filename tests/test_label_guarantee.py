@@ -158,3 +158,11 @@ def test_the_last_resort_goes_over_labels_before_it_goes_over_an_arrow():
     arrows = [(125.0, 13.0, 6.0, 6.0)]
     assert least_overlap([over_a_label, over_an_arrow], labels, bounds) == over_an_arrow  # without the arrows it only counts labels
     assert least_overlap([over_a_label, over_an_arrow], labels, bounds, avoid=arrows) == over_a_label
+
+
+def test_the_guarantee_follows_the_nearby_radius_but_never_drops_below_500_m():
+    def at(d):
+        return Nearby(Entity("p", "player", "P", "Deinosuchus", 0.0, 0.0), 0.0, 0.0, d, 0.0)
+    assert not is_guaranteed(at(800.0)) and is_guaranteed(at(800.0), radius_m=1000.0)  # a player 800 m away with a 1000 m radius
+    assert not is_guaranteed(at(1100.0), radius_m=1000.0)
+    assert is_guaranteed(at(450.0), radius_m=200.0)  # a small radius does not take the old 500 m away

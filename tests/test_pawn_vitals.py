@@ -216,7 +216,7 @@ def test_label_tail_carries_health_and_stamina():
     assert head == "Player ? - Allosaurus - 100 m" and tail == "HP 86%  ST 33%"  # no raw value: the percentages
     sized = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=86.0, stamina_pct=33.4, health=1419.0, max_health=1650.0,
                    stamina=334.0, max_stamina=1000.0, max_src="block")
-    assert entity_label_lines(Nearby(sized, 0.0, 0.0, 100.0, 90.0))[1] == "HP 1419/1650  ST 334/1000"
+    assert entity_label_lines(Nearby(sized, 0.0, 0.0, 100.0, 90.0))[1] == "HP 1419/1650 (86%)  ST 334/1000 (33%)"
     bare = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0)
     tail = entity_label_lines(Nearby(bare, 0.0, 0.0, 100.0, 90.0))[1]
     assert tail == ""  # never read: no second line, nothing guessed
@@ -243,4 +243,4 @@ def test_peer_entity_fields_say_where_the_health_maximum_came_from():
 def test_label_shows_a_creation_maximum_with_a_tilde_and_a_missing_stamina_maximum_with_a_dash():
     e = Entity("7", "dino", "Actor #7", "Allosaurus", 0.0, 0.0, health_pct=88.2, health=2300.0, max_health=2606.0, stamina=600.0,
                max_src="creation")
-    assert entity_label_lines(Nearby(e, 0.0, 0.0, 100.0, 90.0))[1] == "HP 2300/~2606  ST 600/–"
+    assert entity_label_lines(Nearby(e, 0.0, 0.0, 100.0, 90.0))[1] == "HP 2300/~2606 (88%)  ST 600/–"

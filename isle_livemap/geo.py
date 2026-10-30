@@ -244,7 +244,7 @@ class Settings:
     # other players (packet-sourced, see peers.py)
     peer_radius_m: float = 1000.0
     peer_self_ids: list[str] = field(default_factory=list)  # extra ids that are "me" (e.g. a second client); settings-file only
-    show_vitals_bars: bool = True  # a thin health / stamina bar under the dot of a creature whose vitals are known
+    show_vitals_bars: bool = False  # a thin health / stamina bar under the dot of a creature whose vitals are known (off: the label has the numbers and the percentages)
     show_players: bool = True
     show_ai: bool = True  # server-controlled animals (fish) from the game source; settings-file only, no tray item
     # automatic session recording (live capture only; see sessionlog.py). Settings-file only.
@@ -747,17 +747,23 @@ def with_vitals(e: Entity, h: tuple | None, s: tuple | None) -> Entity:
         stamina_pct=s[0] if s else None, stamina=s[1] if s else None, max_stamina=s[2] if s else None)
 
 
+def _with_pct(text: str, raw: float | None, pct: float | None) -> str:
+    """``text`` (``1419/1650``) followed by the percentage in brackets; without a raw value ``text`` already is the percentage."""
+    return text if raw is None or pct is None else f"{text} ({pct:.0f}%)"
+
+
 def vitals_line(e: Entity, tier: str, vitals_age_s: float | None) -> str:
-    """Second line of a creature's label: ``HP <current>/<max>  ST <current>/<max>`` (points, as the game sent them; the
-    bars under the arrow show the ratio). Only values that were read are printed, a missing one is an en dash (never a
-    guess), and a creature nothing was read for has no second line. A reading older than ``confidence.VITALS_FRESH_S``
-    gets a coarse age tag."""
+    """Second line of a creature's label: ``<stage>  HP <current>/<max> (<pct>%)  ST <current>/<max> (<pct>%)`` (points, as
+    the game sent them, and the share of the maximum; there are no bars under the arrow by default). Only values that were
+    read are printed, a missing one is an en dash (never a guess), and a creature nothing was read for has no vitals. The
+    growth stage (Hatchling / Juvenile / Subadult / Adult) comes first when an animation asset stated it. A reading older
+    than ``confidence.VITALS_FRESH_S`` gets a coarse age tag."""
     if vitals_readings(e) == (None, None):
-        return ""
-    text = f"HP {hp_text(e)}  ST {st_text(e)}"
+        return e.stage
+    text = (f"HP {_with_pct(hp_text(e), e.health, e.health_pct)}  ST {_with_pct(st_text(e), e.stamina, e.stamina_pct)}")
     if tier == VITALS_STALE:
         text += f" [{age_tag(vitals_age_s)}]"
-    return text
+    return f"{e.stage}  {text}" if e.stage else text
 
 
 def entity_label_lines(n: Nearby, name_max: int = 16, vitals: str | None = None, group: int = 1) -> tuple[str, str]:
@@ -851,12 +857,13 @@ GUARANTEED_STICKY_FACTOR = 1.04  # a creature that was guaranteed a moment ago s
 GHOST_GUARANTEE_S = 0.0  # a creature the server destroyed has no guaranteed label (its dimmed arrow stays): its label takes a free spot, never one over a live creature
 
 
-def is_guaranteed(n: Nearby, was: bool = False) -> bool:
-    """A player-owned creature (player, dinosaur, unclassified creature) within ``GUARANTEED_RADIUS_M`` on the minimap:
+def is_guaranteed(n: Nearby, was: bool = False, radius_m: float = GUARANTEED_RADIUS_M) -> bool:
+    """A player-owned creature (player, dinosaur, unclassified creature) within ``radius_m`` on the minimap (the nearby radius
+    of the settings, at least ``GUARANTEED_RADIUS_M``):
     always drawn, always labelled with its name and species. ``was``: it was guaranteed in the previous frame. A ghost
     (the server destroyed it) keeps the guarantee for ``GHOST_GUARANTEE_S`` seconds (none): its dimmed arrow stays, its
     label takes a free spot, and the labels of live creatures are never pushed over an arrow to make room for it."""
-    return (n.entity.kind in PLAYER_KINDS and n.distance_m <= GUARANTEED_RADIUS_M * (GUARANTEED_STICKY_FACTOR if was else 1.0)
+    return (n.entity.kind in PLAYER_KINDS and n.distance_m <= max(radius_m, GUARANTEED_RADIUS_M) * (GUARANTEED_STICKY_FACTOR if was else 1.0)
             and (n.gone_s is None or n.gone_s <= GHOST_GUARANTEE_S))
 
 

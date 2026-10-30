@@ -464,7 +464,7 @@ def test_peer_entity_carries_vitals_species_and_name(join_packets):
     assert e.max_src == "block" and e.max_t is not None and e.stamina is not None and e.max_stamina  # a full block: real maxima
     near = visible_entities([(e, e.x + 50_000, e.y)], e.x, e.y, 1_000.0)  # 500 m east of the viewer
     head, tail = peer_label_lines(near[0])
-    assert head.endswith(" - Pteranodon - 500 m") and tail.startswith("HP 12/") and "  ST 243/" in tail  # the points the game sent, not a percentage
+    assert head.endswith(" - Pteranodon - 500 m") and "HP 12/" in tail and "  ST 243/" in tail  # the points the game sent, not a percentage
 
 
 # ---------------------------------------------------------------- GamePeerSource: only creatures reach the map

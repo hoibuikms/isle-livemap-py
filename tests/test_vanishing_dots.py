@@ -57,6 +57,9 @@ def test_a_player_beyond_the_view_radius_is_a_pointer_on_the_circle_edge(tmp_pat
 
 # ---------------------------------------------------------------- a pack shares one label
 def test_dinosaurs_of_one_species_standing_together_share_one_label(tmp_path, monkeypatch):
+    import isle_livemap.geo as geo
+
+    monkeypatch.setattr("isle_livemap.overlay.is_guaranteed", lambda n, was=False, radius_m=0.0: geo.is_guaranteed(n, was))  # the fixed 500 m guarantee: this test is about the ranking beyond it
     seen = []
     real = overlay.peer_label_lines
 

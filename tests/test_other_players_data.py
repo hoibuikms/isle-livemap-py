@@ -278,11 +278,11 @@ def test_the_health_bar_is_always_under_the_arrow_labelled_or_not_and_can_be_swi
     import isle_livemap.overlay as overlay
 
     bar = (20, 240, 85)  # full health: green
-    view, img = render(tmp_path, one_dino(100.0))  # labelled: the bar is there as well
+    view, img = render(tmp_path, one_dino(100.0), show_vitals_bars=True)  # labelled: the bar is there as well
     sx, sy = _screen(view, 15_000.0)
     assert colour_near(img, sx, sy + 9, bar, r=5, tol=45)
     monkeypatch.setattr(overlay, "label_limits", lambda *a, **k: ((0, 0, 0, 0), 0))  # no room for labels: the bar is still there
-    view2, img2 = render(tmp_path, one_dino(100.0))
+    view2, img2 = render(tmp_path, one_dino(100.0), show_vitals_bars=True)
     assert colour_near(img2, sx, sy + 9, bar, r=5, tol=45)
     view3, img3 = render(tmp_path, one_dino(100.0), show_vitals_bars=False)
     assert not colour_near(img3, sx, sy + 9, bar, r=5, tol=45)
