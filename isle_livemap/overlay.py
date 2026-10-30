@@ -679,7 +679,7 @@ class MapView(QWidget):
                 continue
             is_ai = n.entity.kind == "ai"
             tier = priority_tier(n.distance_m)
-            below = BAR_BOX_H + 1.5 if bars_on and not is_ai else 0.0  # the slots under the arrow start below its bars
+            below = BAR_BOX_H + 3.0 if bars_on and not is_ai else 0.0  # the slots under the arrow start below its bars
             short_only = False
             if guaranteed:
                 if guaranteed_used >= guaranteed_max:

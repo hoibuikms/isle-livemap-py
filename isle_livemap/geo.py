@@ -1002,7 +1002,7 @@ def label_slots(ax: float, ay: float, w: float, h: float, bounds: Rect, below: f
 
 _SPREAD_DIRS = ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0), (0.866, 0.5), (-0.866, 0.5), (0.866, -0.5), (-0.866, -0.5),
                 (0.5, 0.866), (-0.5, 0.866), (0.5, -0.866), (-0.5, -0.866))  # down, up, right, left, then every 30 degrees
-SPREAD_RINGS_PX = (16.0, 28.0, 42.0, 58.0, 80.0)  # how far from the marker the labels of a crowd are spread (nearest edge of the label)
+SPREAD_RINGS_PX = (20.0, 36.0, 54.0, 76.0, 104.0)  # how far from the marker the labels of a crowd are spread (nearest edge of the label)
 SPREAD_COUNT = len(SPREAD_RINGS_PX) * len(_SPREAD_DIRS)
 LEADER_MIN_PX = 14.0  # a label whose nearest edge is further than this from its marker gets a leader line
 
