@@ -78,10 +78,10 @@ def test_peers_in_view_are_listed_and_rendered(tmp_path):
     assert [n.entity.id for n in got] == ["1", "2"] and view.peer_status == "fake: ok"
     img = view.grab().toImage()
     assert not img.isNull()
-    # the marker is the purple peer arrow: blue clearly above red, green low at the peer's pixel
+    # the marker is the deep red peer arrow: red clearly above green and blue at the peer's pixel
     x, y = px(view, got[0].x, got[0].y)
     c = img.pixelColor(x, y)
-    assert c.blue() > 150 and c.red() > 100 and c.green() < 120
+    assert c.red() > 130 and c.red() > c.green() + 80 and c.red() > c.blue() + 60
 
 
 def test_local_arrow_is_drawn_over_a_peer_at_the_same_spot(tmp_path):
@@ -103,7 +103,7 @@ def test_stale_peer_is_dimmed_and_expired_peer_is_gone(tmp_path):
     img = view.grab().toImage()
     fresh = img.pixelColor(*px(view, got["1"].x, got["1"].y))
     dim = img.pixelColor(*px(view, got["2"].x, got["2"].y))
-    assert fresh.blue() > dim.blue()
+    assert fresh.red() - fresh.green() > dim.red() - dim.green()  # the dimmed arrow is less saturated
     later = time.monotonic() + 2.0  # peer 2 is now 5.5 s old: removed
     assert "2" not in {n.entity.id for n in view.nearby(now=later)}
 
@@ -119,13 +119,13 @@ def test_off_view_peer_gets_edge_indicator_and_beyond_radius_gets_nothing(tmp_pa
     pt = px(view, n.x, n.y)
     assert ((pt[0] - view.width() / 2) ** 2 + (pt[1] - view.height() / 2) ** 2) ** 0.5 > view.width() / 2  # off view
     # indicator sits straight north of the centre, on the circle edge: compare with the same frame without peers
-    def purple_near_top(view):
+    def deep_red_near_top(view):
         img = view.grab().toImage()
         return sum(1 for xx in range(view.width() // 2 - 10, view.width() // 2 + 10) for yy in range(0, 20)
-                   if (c := img.pixelColor(xx, yy)).blue() > 200 and c.green() < 120 and c.red() > 110)
+                   if (c := img.pixelColor(xx, yy)).red() > 110 and c.green() < 70 and c.blue() < 80 and c.red() > c.blue() + 60)
 
-    with_peer = purple_near_top(view)
-    without = purple_near_top(make_view(tmp_path, settings=Settings(zoom=4.0)))
+    with_peer = deep_red_near_top(view)
+    without = deep_red_near_top(make_view(tmp_path, settings=Settings(zoom=4.0)))
     assert with_peer >= without + 8, (with_peer, without)
 
 

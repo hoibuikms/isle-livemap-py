@@ -49,10 +49,20 @@ def test_a_player_beyond_the_view_radius_is_a_pointer_on_the_circle_edge(tmp_pat
         return [E("9", "player", view.interp.x + 150_000.0, view.interp.y, species="Deinosuchus", name="P1")]
 
     view, img = render(tmp_path, far_player, peer_radius_m=1000.0)
-    cyan = tuple(int(ENTITY_STYLE["player"].color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-    assert colour_near(img, view.width() - overlay.EDGE_INSET_PX - 3, view.height() / 2, cyan, r=7, tol=60)
-    nothing, img2 = render(tmp_path, lambda v: [E("9", "ai", v.interp.x + 150_000.0, v.interp.y, species="Longear")], peer_radius_m=1000.0)
-    assert not colour_near(img2, nothing.width() - overlay.EDGE_INSET_PX - 3, nothing.height() / 2, cyan, r=7, tol=60)  # fish do not clutter the edge
+    fish, img2 = render(tmp_path, lambda v: [E("9", "ai", v.interp.x + 150_000.0, v.interp.y, species="Longear")], peer_radius_m=1000.0)
+    empty, img3 = render(tmp_path, lambda v: [], peer_radius_m=1000.0)
+
+    def changed(a, b, w, h):  # pixels around the edge anchor that differ between two frames of the same map
+        x0, y0 = w - overlay.EDGE_INSET_PX - 3, h / 2
+        n = 0
+        for yy in range(int(y0) - 12, int(y0) + 13):
+            for xx in range(int(x0) - 12, int(x0) + 13):
+                ca, cb = a.pixelColor(xx, yy), b.pixelColor(xx, yy)
+                n += abs(ca.red() - cb.red()) + abs(ca.green() - cb.green()) + abs(ca.blue() - cb.blue()) > 60
+        return n
+
+    assert changed(img, img3, view.width(), view.height()) >= 8  # the pointer of a player beyond the radius is on the edge
+    assert changed(img2, img3, empty.width(), empty.height()) <= 2  # fish do not clutter the edge
 
 
 # ---------------------------------------------------------------- a pack shares one label

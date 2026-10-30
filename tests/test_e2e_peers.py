@@ -35,7 +35,7 @@ OWN_FIX = (442_020.33, -162_148.37)
 # recorded vectors are raw / 128 cm (decode.STATE_VECTOR_SCALE); read with the /100 of the move packets they were 752-838 m
 # away, NNW, which is the 650-850 m "ring" of every nearby creature in the live captures.
 NEAR_IDS = {"105810", "105148"}
-CYAN = (162, 77, 255)  # geo.ENTITY_STYLE["player"].color: the purple of another player's dinosaur (name kept from the cyan days)
+CYAN = (164, 16, 28)  # geo.ENTITY_STYLE["player"].color: the deep red of another player's dinosaur (name kept from the cyan days)
 ORANGE = (143, 166, 179)  # geo.ENTITY_STYLE["ai"].color (muted grey-blue): the recorded actors only ever send the 155/158 bit animal state
 
 

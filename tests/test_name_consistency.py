@@ -188,3 +188,21 @@ def test_every_nameless_player_inside_the_nearby_radius_is_labelled_not_only_fou
     advance(view, clock, 0.3)
     view.grab()
     assert {str(i) for i in range(1, 8)} <= view._labelled
+
+
+def test_a_crowd_within_250_m_keeps_every_name_readable_by_dropping_to_one_line_before_labels_overlap(tmp_path, clock):
+    """ee: players 100 m north of you in a bunch (eight here), their two-line labels (250 px wide in a 360 px circle) covered each other,
+    so a name read as missing. With no room for two lines a label now keeps just name, species and distance."""
+    view, fp = view_with(tmp_path, clock)
+    view.trace_frames = True
+    fp.set([at(view, i, 100.0 + 5.0 * i, -88.0 + 3.0 * i, name=f"Player{i}", hp=100.0) for i in range(1, 9)])
+    advance(view, clock, 0.5)
+    view.grab()
+    labels = view.frame_trace["labels"]
+    assert {str(i) for i in range(1, 9)} <= set(labels)
+    rects = [labels[str(i)][1] for i in range(1, 9)]
+    for a in range(len(rects)):
+        for b in range(a + 1, len(rects)):
+            ra, rb = rects[a], rects[b]
+            overlap = ra[0] < rb[0] + rb[2] and rb[0] < ra[0] + ra[2] and ra[1] < rb[1] + rb[3] and rb[1] < ra[1] + ra[3]
+            assert not overlap, (a + 1, b + 1)

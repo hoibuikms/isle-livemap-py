@@ -490,7 +490,7 @@ class MapView(QWidget):
         def place_guaranteed(pt, lines, small, tier, below, prefer, slot, eid, now, bold):
             """A label that must be shown (a creature within 500 m on the minimap). In order: the spot it had; the usual spots and
             the spread-out ones, clear of other labels and of arrows, then clear of other labels only; one line instead of two
-            (250 - 500 m band only); at last the spot that covers the least of the others (or, past ``SEARCH_BUDGET`` searches
+            (any distance); at last the spot that covers the least of the others (or, past ``SEARCH_BUDGET`` searches
             in a frame, the spot it had even if it overlaps). Returns (rect, lines)."""
             ax, ay = pt.x(), pt.y()
             fm_l = fm_small if small else fm
@@ -546,7 +546,7 @@ class MapView(QWidget):
                 r_ = place_label(ax, ay, w_, h_, placed + dots, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)
                 if r_ is None:
                     r_ = place_label(ax, ay, w_, h_, placed + cores, bounds, in_circle, prefer, slot, in_circle_loose, extra=extra_, below=below)  # clear of other labels and of every arrow centre
-                if r_ is None and tier == 1 and len(lines) > 1:  # between 250 and 500 m one line says who / what it is
+                if r_ is None and len(lines) > 1:  # no room for two lines: one line says who / what it is (name, species, distance) before a label may overlap another
                     lines = lines[:1]
                     self._compact_until[eid] = now + COMPACT_HOLD_S
                     w_, h_ = size(lines)

@@ -195,3 +195,21 @@ def test_the_growth_stage_leads_the_vitals_line_and_stands_alone_without_vitals(
                health=1419.0, max_health=1650.0, stamina=330.0, max_stamina=500.0, health_pct=86.0, stamina_pct=66.0)
     assert vitals_line(e, "known", None) == "Juvenile  HP 1419/1650 (86%)  ST 330/500 (66%)"
     assert vitals_line(replace(e, health=None, stamina=None, max_health=None, max_stamina=None, health_pct=None, stamina_pct=None), "none", None) == "Juvenile"
+
+
+def test_distances_are_strictly_2d_height_never_counts():
+    from isle_livemap.geo import visible_entities
+
+    flat = Entity(id="1", kind="player", name="A", species="Allosaurus", x=0.0, y=0.0, z=0.0)
+    high = replace(flat, id="2", z=90_000.0)  # 900 m above the other one
+    near = visible_entities([(flat, 30_000.0, 0.0), (high, 30_000.0, 0.0)], 0.0, 0.0, 1000.0)
+    assert [n.distance_m for n in near] == [300.0, 300.0]
+
+
+def test_a_player_at_990_m_is_inside_the_default_one_kilometre_radius():
+    from isle_livemap.geo import Settings, visible_entities
+
+    assert Settings().peer_radius_m == 1000.0
+    e = Entity(id="1", kind="player", name="A", species="Allosaurus", x=0.0, y=0.0)
+    assert len(visible_entities([(e, 99_000.0, 0.0)], 0.0, 0.0, Settings().peer_radius_m)) == 1
+    assert visible_entities([(e, 101_000.0, 0.0)], 0.0, 0.0, Settings().peer_radius_m) == []

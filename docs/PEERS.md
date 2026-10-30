@@ -101,7 +101,7 @@ The session log has a compact `labels:` line, written every 30 s while creatures
 There are no species, diet or size categories on the marker: every dinosaur of another person (a creature that
 references a PlayerState, a dinosaur whose controller is not known, and a creature whose class is not known at all) is
 the **same purple arrow** as your own red one: the same polygon at 85 % of its size (`geo.PEER_ARROW_SCALE`), purple
-`#a24dff` (`geo.PEER_COLOR`) with a dark 2.2 px outline (`geo.PEER_OUTLINE_W`; yours is 1.5 px, the fish's too) for the 40 most important peers. It points the way the creature **faces**: the rotation
+`#a4101c` (`geo.PEER_COLOR`, deep red; your own arrow is the brighter `#ff4040`) with a dark 2.2 px outline (`geo.PEER_OUTLINE_W`; yours is 1.5 px, the fish's too) for the 40 most important peers. It points the way the creature **faces**: the rotation
 byte that comes with its position in the same batch (see "Which way an arrow points" below), held while the creature is silent,
 else the direction of travel measured from successive positions. A creature whose heading is not known yet (it has sent
 no position batch with a rotation and has not moved) is a **round purple marker** of the same colour and outline

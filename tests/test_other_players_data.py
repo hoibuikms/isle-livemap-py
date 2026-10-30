@@ -222,7 +222,7 @@ def test_a_creature_that_never_moved_has_no_arrow():
 
 
 # ---------------------------------------------------------------- colours
-def test_every_dinosaur_and_player_is_one_purple_style_animals_muted():
+def test_every_dinosaur_and_player_is_one_deep_red_style_animals_muted():
     assert peer_style(entity(kind="player", species="Deinosuchus")) is ENTITY_STYLE["player"]
     assert peer_style(entity(species="Allosaurus")) is peer_style(entity(species="Triceratops~")) is ENTITY_STYLE["player"]
     assert peer_style(entity(species="")) is peer_style(entity(kind="unknown", species="")) is ENTITY_STYLE["player"]
@@ -264,7 +264,7 @@ def one_dino(health):
 def test_a_dinosaur_is_drawn_in_the_one_peer_colour_whatever_its_species(tmp_path):
     view, img = render(tmp_path, one_dino(None))
     sx, sy = _screen(view, 15_000.0)
-    assert colour_near(img, sx, sy, (162, 77, 255), r=7, tol=70)  # purple, not the diet pink it used to be
+    assert colour_near(img, sx, sy, (164, 16, 28), r=7, tol=70)  # deep red, not the diet pink it used to be
 
 
 def _screen(view, dx_cm):

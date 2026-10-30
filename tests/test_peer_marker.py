@@ -22,7 +22,7 @@ def test_species_size_and_diet_categories_are_gone():
         assert not hasattr(sp, name)
 
 
-def test_every_dinosaur_and_player_has_one_purple_arrow_style():
+def test_every_dinosaur_and_player_has_one_deep_red_arrow_style():
     styles = {id(peer_style(ent(s, kind=k))) for s in ("Tyrannosaurus", "Troodon", "", "Deinosuchus~") for k in ("dino", "player", "unknown")}
     assert len(styles) == 1
     st = peer_style(ent("Tyrannosaurus"))
@@ -93,11 +93,11 @@ def test_a_dinosaur_is_a_round_marker_until_its_heading_is_known_then_an_arrow(t
     assert max(p[0] for p in pe) - min(p[0] for p in pe) == max(nys) - min(nys)  # turned a quarter: the long side is horizontal
 
 
-def test_the_arrow_is_purple(tmp_path):
+def test_the_arrow_is_deep_red_not_the_bright_red_of_the_local_arrow(tmp_path):
     img, pts = _painted(tmp_path, "Allosaurus", heading=0.0)
-    r, g, b = (lambda c: (c.red(), c.green(), c.blue()))(img.pixelColor(*pts[len(pts) // 2]))
-    assert b > r > g or b > g  # a purple / violet fill, not the red of the local arrow
-    assert not (r > 200 and g < 100 and b < 100)
+    r, g, b = max(((c.red(), c.green(), c.blue()) for c in (img.pixelColor(*pt) for pt in pts)), key=lambda t: t[0] - t[1] - t[2])  # the fill (the outline is darker)
+    assert r > 100 and g < 70 and b < 80 and r > b + 60  # a deep red fill
+    assert not (r > 200 and g < 100 and b < 100)  # not the bright red of the local arrow
 
 
 def test_a_label_is_kept_clear_of_the_arrow(tmp_path):

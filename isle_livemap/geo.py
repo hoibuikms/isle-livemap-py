@@ -504,11 +504,11 @@ class EntityStyle:
     label_color: str = ""  # colour of the label text (the arrow's own colour when empty)
 
 
-PEER_COLOR = "#a24dff"  # every dinosaur / player of another person: one purple arrow, whatever the species
+PEER_COLOR = "#a4101c"  # every dinosaur / player of another person: one deep red arrow (yours is the brighter #ff4040), whatever the species
 PEER_LABEL_COLOR = "#cfa8ff"  # the same purple, lighter: the bold name of a player reads on forest, rock and water alike
 ENTITY_STYLE = {
     "self": EntityStyle("#ff4040", "#000000", 10.0, "arrow"),  # local player: red arrow, biggest, drawn last
-    "player": EntityStyle(PEER_COLOR, "#12002b", 4.0, "arrow", PEER_LABEL_COLOR),  # another person's dinosaur: the same arrow, purple, smaller
+    "player": EntityStyle(PEER_COLOR, "#ffd9dc", 4.0, "arrow", PEER_LABEL_COLOR),  # another person's dinosaur: the same arrow, deep red with a light outline (a dark one would vanish on forest and water), smaller
     "ai": EntityStyle("#8fa6b3", "#0b1318", 5.0, "diamond"),  # server animals (fish): muted, they are background
 }
 # Entity kinds from the game source (species.py): "player" (a creature that references a PlayerState), "dino" (a
@@ -518,7 +518,7 @@ PLAYER_KINDS = ("player", "dino", "unknown")
 ENTITY_STYLE.update({k: ENTITY_STYLE["player"] for k in PLAYER_KINDS if k not in ENTITY_STYLE})
 LEGEND_ENTRIES = (
     ("You", ENTITY_STYLE["self"].color, "red arrow"),
-    ("Another player's dinosaur", ENTITY_STYLE["player"].color, "purple arrow (same shape as yours)"),
+    ("Another player's dinosaur", ENTITY_STYLE["player"].color, "deep red arrow (same shape as yours)"),
     ("Animal / fish", ENTITY_STYLE["ai"].color, "small grey diamond"),
 )
 
