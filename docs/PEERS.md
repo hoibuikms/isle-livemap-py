@@ -1010,3 +1010,45 @@ easy to miss.
 - **Limits.** The banner says that players are hidden, not where they are: no position exists in the stream. It cannot be
   cleared by restarting the app. The count is of creatures that behave like creatures (the size profile of a pawn's state
   batches); a resting creature that never sent a state batch since the app attached is not in it.
+
+## Pawns that stand still: the spawn point is the position
+
+A user reported a named player who was "right next to me" and drawn hundreds of metres away. In the recording (labelled C1 here;
+the earlier sessions C2 and C3 hold the same pawn) that player's Spinosaurus sent **1 738 state batches in 9 minutes (3 Hz)
+and never a position**, was taken off the map after 10 s by the "active with only a spawn point" rule, and its handle was the
+same 1.5 hours earlier in another session: it never moved. The rule's premise (a creature that keeps sending state has left its
+spawn point) is wrong for a pawn that stands still and only animates (idle player, sleeping or eating dinosaur).
+
+- **What tells a mover from a pawn at rest (`GamePeerSource.MOVE_HEADER_MASK = 0x248`).** The first 33 bits of a state batch are
+  its header (which members are dirty). Every batch that carried a position in 13 recordings has bits `0x248` set (headers
+  `…348` and `…2c8`); headers of animation / stance state (`…108`, `…128`, `…028`) never do. A pawn that moves keeps sending
+  the movement header; a pawn that stands still sends it only as part of its **initial state** (up to 10.6 s after it appears,
+  no position in it). So a movement-bearing batch **later than `MOVE_GRACE_S` = 15 s** after the pawn was first seen means it
+  moved (`_moved`).
+- **Rules (`_spawn_is_stale`, `_is_at_rest`).** A spawn-only creature is taken off the map ("position unknown") only if it has
+  *moved* and is active (8 batches in 10 s for 10 s). A spawn-only creature that has sent no movement-bearing batch for
+  `REST_AFTER_S` = 30 s is **at rest**: its creation position is exact, so its source becomes `"rest"` (`Entity.pos_source`):
+  drawn like a followed position (solid, no `~` in the distance) and never replaced by a spawn point. A decoded position
+  replaces it. The `nearby:` log line marks the nearest one `(at rest)`.
+- **Effect** (creature-seconds on the map, before then after): C1 stale removals 3 to 0 (that player now stays until the server
+  destroys him, 575 s instead of 249 s); C2 1 to 0; C3 1 to 0.
+- **What this does not change.** The player's position is still where his creation record says; his distance from the user is
+  the distance between two server positions. In C1 the user's own marker agrees with the server's own copy of the user's
+  position to 1 m at every check (7 of 7), also at the stops, and the pawn's spawn point lay 480-580 m from the user's stops.
+
+### The player reference with a variant marker
+
+A pawn's creation record references its PlayerState behind an 8-bit marker (`_PS_REF_MARKER`, 163). One recorded Giganotosaurus
+(C2) had 139 where all 40+ other references have 163: two of the eight bits are not constant. `IdentityTracker` now also collects
+**loose candidates** (`ref_candidates_loose`): 2 or 3 byte handles behind a marker equal to 163 in the six constant bits, between
+bits 400 and 1100 of the record. They are used only when no strict candidate is a known PlayerState, and only when exactly one is.
+Across 9 recordings it adds one link (that Giganotosaurus, for the same player that links in another session with the strict
+marker) and changes none.
+
+### "Late start" needs the tables to have had time
+
+At every join the first 100 packets arrive within a second, before the class tables are processed, so the banner claimed "late
+start" for about 5 s. `LATE_JOIN_GRACE_S` = 15 s of datagram time since the first packet of the connection must pass first
+(`late_start`, `late_join` and the headline). A reset starts it again. The Steam address the game contacts before the join
+(`...:27035`) is learned as the server for ~15 s; the switch to the real server came 64 ms before its first packet, so no game
+packet is lost (checked).

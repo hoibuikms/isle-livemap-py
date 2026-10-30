@@ -27,10 +27,14 @@ SMELL = "/Game/TheIsle/Core/TICorpseSmell.Default__TICorpseSmell"
 ALLO = "/Game/TheIsle/Core/Characters/Dinosaurs/Allosaurus/BP_Allosaurus.Default__BP_Allosaurus_C"
 
 
-def feed_bits(g: GamePeerSource, monkeypatch, handle: int, nbits: int, t: float) -> None:
-    """One state batch of ``nbits`` zero bits (no position vector in it) from ``handle``."""
+MOVING = GamePeerSource.MOVE_HEADER_MASK  # a state header with the movement member dirty (see GamePeerSource.MOVE_HEADER_MASK)
+
+
+def feed_bits(g: GamePeerSource, monkeypatch, handle: int, nbits: int, t: float, header: int = 0) -> None:
+    """One state batch of ``nbits`` bits (no position vector in it) from ``handle``; ``header`` is the 33-bit state header."""
     w = BitWriter()
-    w.write(0, nbits)
+    w.write(header, 33)
+    w.write(0, nbits - 33)
     packet = IrisPacket(1, True, True, [IrisBatch(handle, 0, nbits, True, False)])
     monkeypatch.setattr(decode, "parse_iris_packet", lambda p: packet)
     g._on_inbound(Datagram(t, "10.0.0.2", 7777, "192.168.0.10", 50_000, w.to_bytes(), INBOUND))  # noqa: SLF001
@@ -125,30 +129,79 @@ def test_a_creature_that_moved_needs_a_long_run_of_timer_batches_before_it_is_ca
 
 
 # ---------------------------------------------------------------- stale spawn point
-def test_a_creature_drawn_only_at_its_spawn_point_that_keeps_sending_state_is_taken_off_the_map_and_listed(source, monkeypatch):
+def test_a_creature_drawn_only_at_its_spawn_point_that_moved_and_keeps_sending_state_is_taken_off_the_map_and_listed(source, monkeypatch):
     g = source
     g._last_t = 5.0  # noqa: SLF001
     g._creatures.add(9200)  # noqa: SLF001 - its creation record carried a maxHealth
     g._emit(9200, *east(750.0), "unknown", "", "", "spawn")  # noqa: SLF001
-    for i in range(10):
-        feed_bits(g, monkeypatch, 9200, 220, 10.0 + i)  # 1 Hz for 10 s
-    assert g.store.get("9200") is not None  # eight batches inside 10 s, but not yet 10 s of it
-    feed_bits(g, monkeypatch, 9200, 220, 20.0)
+    for i in range(16):
+        feed_bits(g, monkeypatch, 9200, 220, 10.0 + i, MOVING)  # 1 Hz, the movement member dirty: its initial state (grace)
+    assert g.store.get("9200") is not None and g.stale_spawns == 0  # inside the grace the header says nothing
+    feed_bits(g, monkeypatch, 9200, 220, 26.0, MOVING)  # 16 s after it appeared: this one is movement
     assert g.store.get("9200") is None and g.stale_spawns == 1
-    feed_bits(g, monkeypatch, 9200, 220, 21.0)
+    feed_bits(g, monkeypatch, 9200, 220, 27.0, MOVING)
     rows = {r["handle"]: r for r in g.unplaced_creatures()}
     assert 9200 in rows and rows[9200]["batches"] >= 10  # listed as "position unknown": the Nearby table shows "?"
 
 
-def test_a_resting_creature_that_sends_a_batch_now_and_then_keeps_its_dimmed_spawn_dot(source, monkeypatch):
+def test_a_pawn_that_stands_still_and_only_animates_stays_where_it_was_created(source, monkeypatch):
+    """Recorded: a Spinosaurus sent 1 738 state batches (3 Hz) in 9 minutes and never a movement-bearing one after its first
+    seconds; its handle was the same 1.5 hours earlier in another session. It is where its creation record says."""
+    g = source
+    g._last_t = 5.0  # noqa: SLF001
+    g._creatures.add(9210)  # noqa: SLF001
+    g._emit(9210, *east(750.0), "player", "Spinosaurus", "P1", "spawn")  # noqa: SLF001
+    for i in range(6):
+        feed_bits(g, monkeypatch, 9210, 70, 5.0 + i * 0.3, MOVING)  # its initial state: movement member dirty, no position
+    for i in range(200):
+        feed_bits(g, monkeypatch, 9210, 190, 8.0 + i * 0.33)  # animation / stance state at 3 Hz for a minute
+    e = g.store.get("9210")
+    assert e is not None and e.pos_source == "rest" and e.kind == "player"
+    assert (e.x, e.y) == pytest.approx(east(750.0)[:2])
+    assert g.stale_spawns == 0 and 9210 not in {r["handle"] for r in g.unplaced_creatures()}
+    assert "(at rest)" in g.nearby_report()
+
+
+def test_the_initial_state_of_a_pawn_does_not_count_as_movement(source, monkeypatch):
+    g = source
+    g._last_t = 5.0  # noqa: SLF001
+    g._creatures.add(9211)  # noqa: SLF001
+    g._emit(9211, *east(750.0), "unknown", "", "", "spawn")  # noqa: SLF001
+    for i in range(30):
+        feed_bits(g, monkeypatch, 9211, 220, 10.0 + i * 0.5, MOVING)  # 0.5 s .. 15 s after it appeared
+    assert 9211 not in g._moved and g.store.get("9211") is not None  # noqa: SLF001
+    feed_bits(g, monkeypatch, 9211, 220, 25.5, MOVING)  # first one after the grace
+    assert 9211 in g._moved  # noqa: SLF001
+
+
+def test_a_rest_is_replaced_by_a_decoded_position_and_a_spawn_does_not_replace_a_rest(source, monkeypatch):
+    g = source
+    g._last_t = 5.0  # noqa: SLF001
+    g._creatures.add(9212)  # noqa: SLF001
+    g._emit(9212, *east(750.0), "unknown", "", "", "spawn")  # noqa: SLF001
+    for i in range(80):
+        feed_bits(g, monkeypatch, 9212, 220, 10.0 + i)
+    assert g.store.get("9212").pos_source == "rest"
+    g._emit(9212, *east(900.0), "unknown", "", "", "spawn")  # noqa: SLF001 - a creation record on the handle again would reset it elsewhere
+    assert g.store.get("9212").pos_source == "rest" and g.store.get("9212").x == pytest.approx(east(750.0)[0])
+    g.locator.note_creation(9212, east(750.0), 90.0)
+    feed(g, monkeypatch, 9212, east(752.0), 91.0)  # it walks: a decoded position
+    e = g.store.get("9212")
+    assert e.pos_source == "" and (e.x, e.y) == pytest.approx(east(752.0)[:2])
+
+
+def test_a_resting_creature_that_sends_a_batch_now_and_then_keeps_its_spawn_dot_and_becomes_a_rest(source, monkeypatch):
     g = source
     g._last_t = 5.0  # noqa: SLF001
     g._creatures.add(9201)  # noqa: SLF001
     g._emit(9201, *east(750.0), "unknown", "", "", "spawn")  # noqa: SLF001
-    for i in range(12):
-        feed_bits(g, monkeypatch, 9201, 220, 10.0 + i * 5.0)  # one batch every 5 s for a minute
+    for i in range(5):
+        feed_bits(g, monkeypatch, 9201, 220, 10.0 + i * 5.0)  # one batch every 5 s for 25 s
+    assert g.store.get("9201").pos_source == "spawn"  # not yet 30 s since it appeared
+    for i in range(5, 12):
+        feed_bits(g, monkeypatch, 9201, 220, 10.0 + i * 5.0)
     e = g.store.get("9201")
-    assert e is not None and e.pos_source == "spawn" and g.stale_spawns == 0
+    assert e is not None and e.pos_source == "rest" and g.stale_spawns == 0
 
 
 def test_a_decoded_position_puts_a_taken_off_creature_back_on_the_map(source, monkeypatch):
@@ -156,11 +209,11 @@ def test_a_decoded_position_puts_a_taken_off_creature_back_on_the_map(source, mo
     g._last_t = 5.0  # noqa: SLF001
     g._creatures.add(9202)  # noqa: SLF001
     g._emit(9202, *east(750.0), "unknown", "", "", "spawn")  # noqa: SLF001
-    for i in range(12):
-        feed_bits(g, monkeypatch, 9202, 220, 10.0 + i)
+    for i in range(20):
+        feed_bits(g, monkeypatch, 9202, 220, 10.0 + i, MOVING)
     assert g.store.get("9202") is None
-    g.locator.note_creation(9202, east(750.0), 22.0)
-    feed(g, monkeypatch, 9202, east(752.0), 23.0)  # a position at last: where it really is
+    g.locator.note_creation(9202, east(750.0), 31.0)
+    feed(g, monkeypatch, 9202, east(752.0), 32.0)  # a position at last: where it really is
     e = g.store.get("9202")
     assert e is not None and e.pos_source == "" and (e.x, e.y) == pytest.approx(east(752.0)[:2])
     assert 9202 not in {r["handle"] for r in g.unplaced_creatures()}
@@ -186,3 +239,16 @@ def test_a_reset_forgets_carcasses_smells_and_activity(source, monkeypatch):
     assert g._corpses and g._smells  # noqa: SLF001
     g.on_reset()
     assert not g._corpses and not g._smells and not g._timer and not g._active  # noqa: SLF001
+    assert not g._first_seen and not g._moved and g._first_packet_t is None  # noqa: SLF001
+
+
+# ---------------------------------------------------------------- how a rest is drawn
+def test_a_rest_is_drawn_solid_and_its_distance_has_no_tilde_while_a_spawn_point_is_dimmed_with_one():
+    from isle_livemap.geo import Entity, Nearby, entity_label_lines
+
+    def nearby(source: str) -> Nearby:
+        return Nearby(Entity("1", "player", "P1", "Spinosaurus", 0.0, 0.0, pos_source=source), 0.0, 0.0, 480.0, 0.0)
+
+    assert nearby("spawn").stale and not nearby("rest").stale and not nearby("").stale
+    assert "~" in entity_label_lines(nearby("spawn"))[0]
+    assert "~" not in entity_label_lines(nearby("rest"))[0] and "480 m" in entity_label_lines(nearby("rest"))[0]

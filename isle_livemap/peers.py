@@ -448,6 +448,20 @@ class GamePeerSource:
     ACTIVE_WINDOW_S = 10.0
     ACTIVE_MIN_BATCHES = 8
     ACTIVE_MIN_SPAN_S = 10.0
+    # ... but only when it has MOVED. A pawn that stands still (an idle player, a sleeping or eating dinosaur) keeps sending
+    # animation state at 3 Hz and never a position: recorded: one Spinosaurus sent 1 738 state batches in 9 minutes and its
+    # handle was the same 1.5 hours earlier in another session: it never moved, its spawn point is where it is. What tells the two apart is the
+    # state header: every batch that carried a position in 13 recordings has the bits ``MOVE_HEADER_MASK`` set (the movement
+    # member of the state is dirty), and a pawn that moves keeps sending it, while the initial state of any pawn has it for the
+    # first ``MOVE_GRACE_S`` seconds (recorded: up to 10.6 s) with no position in it.
+    MOVE_HEADER_MASK = 0x248
+    MOVE_GRACE_S = 15.0
+    # A spawn-only creature that has sent no movement-bearing batch for this long after it was first seen is at rest: its spawn
+    # point is exact ("rest": drawn like a followed position, no "~").
+    REST_AFTER_S = 30.0
+    # The class tables arrive within seconds of a join; a "late start" is only claimed once this much datagram time has passed
+    # since the first packet (recorded: the banner flashed for 5 s at every join).
+    LATE_JOIN_GRACE_S = 15.0
 
     HEADLINE_HOLD_S = 12.0  # a new headline replaces the shown one only after this long (datagram time): no flapping
 
@@ -497,6 +511,9 @@ class GamePeerSource:
         self._corpses: set[int] = set()  # handles recognised as carcasses: never drawn
         self._timer: dict[int, list] = {}  # handle -> [last 8 batches (1 = carcass-sized), run of carcass-sized batches, ever alive]
         self._active: dict[int, list] = {}  # spawn-only handle -> [first state batch t, recent state batch times]
+        self._first_seen: dict[int, float] = {}  # handle -> datagram time of its creation record / first state batch
+        self._moved: set[int] = set()  # handles that sent a movement-bearing state batch after ``MOVE_GRACE_S`` (they moved)
+        self._first_packet_t: float | None = None  # datagram time of the first inbound packet of this connection
         self._stale: set[int] = set()  # creatures taken off the map because they were active but only had a spawn point
         self.filtered_corpses = 0  # state batches skipped because the actor is a carcass
         self.stale_spawns = 0  # creatures taken off the map because they were active but only had a spawn point
@@ -564,6 +581,9 @@ class GamePeerSource:
         self._corpses.clear()
         self._timer.clear()
         self._active.clear()
+        self._first_seen.clear()
+        self._moved.clear()
+        self._first_packet_t = None
         self._stale.clear()
         self._hidden_cache = (-1e9, [])
         self._hidden_all = None
@@ -727,10 +747,33 @@ class GamePeerSource:
             row[1] = 0
             row[2] = True
 
+    def _note_movement(self, bits, batch, handle: int, t: float) -> None:
+        """Remember whether ``handle`` ever sent a movement-bearing state batch after its first ``MOVE_GRACE_S`` seconds."""
+        from .decode import ACTOR_STATE_HEADER_BITS
+
+        first = self._first_seen.get(handle)
+        if first is None:
+            if len(self._first_seen) >= self.PROFILE_MAX:
+                self._first_seen.clear()
+                self._moved.clear()
+            first = self._first_seen[handle] = t
+        if handle in self._moved or batch.data_bit_count < ACTOR_STATE_HEADER_BITS or t - first <= self.MOVE_GRACE_S:
+            return
+        header = bits.read(batch.data_bit_offset, ACTOR_STATE_HEADER_BITS)
+        if header & self.MOVE_HEADER_MASK == self.MOVE_HEADER_MASK:
+            self._moved.add(handle)
+
+    def _is_at_rest(self, handle: int, t: float) -> bool:
+        """A creature drawn only at its spawn point that has never sent a movement-bearing batch since ``REST_AFTER_S`` seconds
+        after it was first seen: it has not moved, so the creation record's position is where it is."""
+        first = self._first_seen.get(handle)
+        return first is not None and handle not in self._moved and t - first >= self.REST_AFTER_S
+
     def _spawn_is_stale(self, handle: int, t: float) -> bool:
-        """True when a creature drawn only at its spawn point has been sending state batches for ``ACTIVE_MIN_SPAN_S`` at
-        ``ACTIVE_MIN_BATCHES`` per ``ACTIVE_WINDOW_S``: it is moving about, so the spawn point is where it entered the
-        relevancy range, not where it is. A resting creature sends a batch now and then and keeps its dimmed spawn dot."""
+        """True when a creature drawn only at its spawn point has moved (it sent a movement-bearing state batch, see
+        ``MOVE_HEADER_MASK``) and has been sending state batches for ``ACTIVE_MIN_SPAN_S`` at ``ACTIVE_MIN_BATCHES`` per
+        ``ACTIVE_WINDOW_S``: the spawn point is where it entered the relevancy range, not where it is. A resting creature, or one
+        that stands still and only animates, keeps its spawn point (see ``_is_at_rest``)."""
         row = self._active.get(handle)
         if row is None:
             if len(self._active) >= self.PROFILE_MAX:
@@ -740,7 +783,7 @@ class GamePeerSource:
         times.append(t)
         while times and t - times[0] > self.ACTIVE_WINDOW_S:
             times.popleft()
-        return len(times) >= self.ACTIVE_MIN_BATCHES and t - row[0] >= self.ACTIVE_MIN_SPAN_S
+        return handle in self._moved and len(times) >= self.ACTIVE_MIN_BATCHES and t - row[0] >= self.ACTIVE_MIN_SPAN_S
 
     def _note_unplaced(self, handle: int, nbits: int, t: float) -> None:
         """Profile of a creature-like actor that sent a state batch but has no position on the map."""
@@ -829,7 +872,13 @@ class GamePeerSource:
     def late_start(self) -> bool:
         """The app attached after the join: this connection's class tables were (nearly) never seen. Whatever the server
         sent once, at the join, is missing: the creatures that were already there (and rest) have no position."""
-        return self.pipeline is not None and not self.error and self.packets >= self.LATE_JOIN_PACKETS and self.identity.tables_missed()
+        return (self.pipeline is not None and not self.error and self.packets >= self.LATE_JOIN_PACKETS
+                and self._tables_had_time() and self.identity.tables_missed())
+
+    def _tables_had_time(self) -> bool:
+        """The class tables arrive within the first seconds of a join: no claim about them before ``LATE_JOIN_GRACE_S`` seconds of
+        datagram time have passed since the first packet of this connection."""
+        return self._first_packet_t is not None and self._last_t - self._first_packet_t >= self.LATE_JOIN_GRACE_S
 
     def headline(self) -> str:
         """The few words the overlay can show (its status line is elided to about 30 characters): what the user
@@ -845,7 +894,7 @@ class GamePeerSource:
     def _raw_headline(self) -> str:
         if self.decode_errors and self._last_t - self._error_t < self.HEADLINE_HOLD_S * 5:
             return "Decode errors: see log"
-        if self.pipeline is None or self.error or self.packets < self.LATE_JOIN_PACKETS:
+        if self.pipeline is None or self.error or self.packets < self.LATE_JOIN_PACKETS or not self._tables_had_time():
             return ""
         peers = self.store.entities()
         unknown = sum(1 for p in peers if p.entity.kind == "unknown")
@@ -868,13 +917,15 @@ class GamePeerSource:
     def _emit(self, handle: int, x: float, y: float, z: float | None, kind: str, species: str, name: str,
               source: str = "") -> None:
         """``source``: "" for a decoded position, "spawn" for the creation record's spawn position (a guess about where the
-        creature is now). A spawn position never replaces a position that was followed."""
+        creature is now), "rest" for a spawn position of a creature that has not moved since (exact). A spawn position never
+        replaces a position that was followed or a rest."""
         if handle in self._corpses:
             return
         eid = str(handle)
         old = self.store.get(eid)
-        if source == "spawn" and old is not None and old.pos_source != "spawn":
-            return
+        if old is not None and (source == "spawn" and old.pos_source != "spawn"
+                                or source == "rest" and old.pos_source not in ("spawn", "rest")):
+            return  # neither a spawn point nor a creature at rest replaces a followed position (or a rest a spawn point's source)
         vit = self._vitals.get(handle)
         inferred = bool(species) and self.identity.is_inferred(handle)
         back = self._zombies.get(handle) if kind == "unknown" else None
@@ -985,6 +1036,8 @@ class GamePeerSource:
 
         self.packets += 1
         self._last_t = d.observed_at
+        if self._first_packet_t is None:
+            self._first_packet_t = d.observed_at
         if own_handle is not None and own_handle != self.own_handle:
             if self.own_handle is not None:
                 self._past_own.add(self.own_handle)  # died and respawned: the old pawn lingers as a body
@@ -1030,6 +1083,8 @@ class GamePeerSource:
             self._timer.pop(handle, None)
             self._active.pop(handle, None)
             self._stale.discard(handle)
+            self._first_seen[handle] = t
+            self._moved.discard(handle)
             self.locator.note_creation(handle, creation.location, t)
             path = self.identity.class_path(handle)
             if creation.location is not None and path and "CorpseSmell" in path:
@@ -1076,6 +1131,7 @@ class GamePeerSource:
             if kind == sp.KIND_UNKNOWN and self._animal_layout(handle, batch.data_bit_count):
                 kind = sp.KIND_AI
             self._note_shape(handle, batch.data_bit_count)
+            self._note_movement(bits, batch, handle, t)
             if kind != sp.KIND_AI and handle != self.own_handle and self._carcass_signature(handle, batch.data_bit_count):
                 self._mark_corpse(handle)
                 self.filtered_corpses += 1
@@ -1126,6 +1182,10 @@ class GamePeerSource:
                 if row is not None:
                     self._profile[handle] = [row[0], row[1], row[2], t, t]
                 self.stale_spawns += 1
+            elif old.pos_source == "spawn" and kind != sp.KIND_AI and self._is_at_rest(handle, t):
+                # It has sent no movement-bearing batch since it appeared: it stands where it was created. The spawn point is
+                # exact, so it is drawn like a followed position (solid, no "~").
+                self._emit(handle, old.x, old.y, old.z, kind, species, name, "rest")
             else:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
                 # on the map at its last position instead of letting the TTL remove it.
@@ -1230,7 +1290,7 @@ class GamePeerSource:
         """True when this connection's class tables were (nearly) never seen (many packets, no class path from them) and
         actors on the map are still unidentified. Classes recovered from the saved class cache do not clear it for
         the actors that stay unknown: the server will not resend the tables until a rejoin."""
-        return (self.packets >= self.LATE_JOIN_PACKETS and self.identity.tables_missed()
+        return (self.packets >= self.LATE_JOIN_PACKETS and self._tables_had_time() and self.identity.tables_missed()
                 and any(p.entity.kind == "unknown" for p in self.store.entities()))
 
     def identity_resolved(self) -> int:
@@ -1316,7 +1376,7 @@ class GamePeerSource:
         fish = sum(1 for e in ents if e.kind == "ai" and math.hypot(e.x - own[0], e.y - own[1]) / 100.0 <= self.NEARBY_BANDS_M[0])
         if rows:
             d, e = rows[0]
-            nearest = f"nearest {d:.0f}m {e.kind} {e.species or '?'}" + (" (spawn-only)" if e.pos_source == "spawn" else "")
+            nearest = f"nearest {d:.0f}m {e.kind} {e.species or '?'}" + (" (spawn-only)" if e.pos_source == "spawn" else " (at rest)" if e.pos_source == "rest" else "")
         else:
             nearest = "no creature placed"
         return (f"nearby: own ({own[0] / 100:.0f}, {own[1] / 100:.0f}) m | creatures placed " + ", ".join(bands)

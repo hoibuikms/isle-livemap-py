@@ -221,6 +221,7 @@ def test_hint_says_what_is_left_after_the_cache_names_some_actors(join_packets):
     g.identity._record_exports = lambda section: None
     feed_source(g, join_packets)
     g.packets = g.LATE_JOIN_PACKETS
+    g._first_packet_t = -1000.0  # noqa: SLF001 - old enough for the class tables to have arrived
     g.store.update(Entity("999999", "unknown", "Unknown #999999", "", 1.0, 2.0))  # created before the app started
     assert g.late_join()
     status = g.snapshot().status

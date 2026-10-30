@@ -880,6 +880,13 @@ _PS_REF_MARKER = 0b10100011  # bits in stream order 1,1,0,0,0,1,0,1
 _PS_REF_MARKER_BITS = 8
 _PS_REF_MARKER_GAP = 36  # bits from the start of the marker to the byte-count field
 _PS_REF_MAX_BYTES = 4
+# One recorded pawn (a Giganotosaurus whose player reference is a 2-byte handle) had 139 (1,1,0,1,0,0,0,1) where every other
+# of 40+ references has 163 (1,1,0,0,0,1,0,1): two of the eight bits are not constant. The variant marker (those two bits
+# ignored) only counts when the strict rule found no known PlayerState, for a 2 or 3 byte handle inside the window where
+# references were recorded (608..956 bits), and again only when exactly one candidate is a known PlayerState.
+_PS_REF_MARKER_LOOSE_MASK = 0xD7  # ignores stream bits 3 and 5
+_PS_REF_LOOSE_WINDOW = (400, 1100)
+_PS_REF_LOOSE_BYTES = (2, 3)
 _UNLEARNED_MAX = 4096
 _HANDLE_ASSETS_MAX = 8192  # actors whose dinosaur assets are counted (a long connection creates and destroys many)
 _HANDLE_ASSET_MIN = 1  # batches of one actor that must name its species folder before the species is believed (see handle_species)
@@ -928,6 +935,7 @@ class ActorInfo:
     player_state: int | None = None  # handle of the PlayerState the record references (pawns)
     name: str | None = None  # PlayerState records only: the player name
     ref_candidates: tuple[int, ...] = ()  # pawns: handles that look like a PlayerState reference (resolved when known)
+    ref_candidates_loose: tuple[int, ...] = ()  # the same behind the variant marker (used when no strict candidate is known)
     creation_bits: int = 0  # size of the creation batch: a pawn's is thousands of bits, a burrow's a few hundred
 
 
@@ -1149,9 +1157,32 @@ class IdentityTracker:
                 found.append(handle)
         return tuple(found)
 
+    def _loose_reference_candidates(self, bits: Bits, batch: IrisBatch, strict: tuple[int, ...]) -> tuple[int, ...]:
+        """Packed 2 / 3 byte handles behind the variant marker (see ``_PS_REF_MARKER_LOOSE_MASK``), not already strict candidates."""
+        base, n = batch.data_bit_offset, batch.data_bit_count
+        found: list[int] = []
+        target = _PS_REF_MARKER & _PS_REF_MARKER_LOOSE_MASK
+        lo, hi = _PS_REF_LOOSE_WINDOW
+        for o in range(max(lo, _PS_REF_MARKER_GAP), min(hi, n - 11)):
+            marker = bits.read(base + o - _PS_REF_MARKER_GAP, _PS_REF_MARKER_BITS)
+            if marker == _PS_REF_MARKER or marker & _PS_REF_MARKER_LOOSE_MASK != target:
+                continue
+            size = bits.read(base + o, 3)
+            if size + 1 not in _PS_REF_LOOSE_BYTES or o + 3 + (size + 1) * 8 > n:
+                continue
+            handle = bits.read(base + o + 3, (size + 1) * 8)
+            if handle >> (size * 8) and handle not in found and handle not in strict:
+                found.append(handle)
+        return tuple(found)
+
     def _resolve_player_state(self, info: ActorInfo) -> None:
-        """Link ``info`` to the one known PlayerState among its reference candidates (none or several: no link)."""
-        known = {h for h in info.ref_candidates if h in self.player_names or h in self._retired_names}
+        """Link ``info`` to the one known PlayerState among its reference candidates (none or several: no link). The candidates
+        behind the variant marker are only looked at when no strict candidate is a known PlayerState."""
+        def known_of(candidates):
+            return {h for h in candidates if h in self.player_names or h in self._retired_names}
+        known = known_of(info.ref_candidates)
+        if not known:
+            known = known_of(info.ref_candidates_loose)
         if len(known) == 1:
             info.player_state = next(iter(known))
             self._waiting.discard(info.handle)
@@ -1225,7 +1256,8 @@ class IdentityTracker:
                         self._resolve_player_state(waiting)
             elif folder_species(path) or info.asset_species or not path:
                 info.ref_candidates = self._reference_candidates(bits, b, creation.header_bits)
-                if info.ref_candidates:
+                info.ref_candidates_loose = self._loose_reference_candidates(bits, b, info.ref_candidates)
+                if info.ref_candidates or info.ref_candidates_loose:
                     self._waiting.add(info.handle)
                     self._resolve_player_state(info)
             out.append(creation)

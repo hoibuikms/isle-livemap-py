@@ -466,7 +466,8 @@ class Entity:
     max_src: str = ""  # where max_health came from: "block" (a full attribute block), "creation" (the creation record: may be a
     #                    little low for a creature that has grown since) or "" (unknown)
     max_t: float | None = None  # source clock time of that maximum
-    pos_source: str = ""  # "": a followed position (decoded fixes); "spawn": only the creation record's spawn position so far
+    pos_source: str = ""  # "": a followed position (decoded fixes); "spawn": only the creation record's spawn position so far;
+    #                       "rest": that spawn position of a creature that has sent no movement since (exact: drawn like a followed one)
     stage: str = ""  # growth stage an animation asset of this creature states (Hatchling / Juvenile / Subadult / Adult), "" = none stated
 
     def __post_init__(self) -> None:

@@ -413,6 +413,7 @@ def test_late_join_labels_actors_unidentified_and_hints_to_rejoin(b64):
     g.store.update(peers.Entity("999999", "unknown", "Unknown #999999", "", 1.0, 2.0, 3.0))  # a creature with no class
     assert not g.late_join() and "rejoin" not in g.snapshot().status.lower()  # too little traffic to say the tables were missed
     g.packets = g.LATE_JOIN_PACKETS  # many packets, still no export table, no player name, no class
+    g._first_packet_t = -1000.0  # noqa: SLF001 - old enough for the class tables to have arrived
     snap = g.snapshot()
     assert g.late_join() and "rejoin" in snap.status.lower() and peers.status_is_warning(snap.status)
     assert "LATE JOIN" in g.summary()
@@ -422,6 +423,7 @@ def test_late_join_hint_is_dropped_once_a_player_name_is_known(b64):
     g, _ = make()
     g.on_inbound(inbound(b64("SecondHeartbeat")), None)
     g.packets = g.LATE_JOIN_PACKETS
+    g._first_packet_t = -1000.0  # noqa: SLF001 - old enough for the class tables to have arrived
     g.identity.player_names[1] = "Someone"
     g.identity.table_classes = 1  # the export tables were seen: names can only come from them (or the class cache)
     assert not g.late_join() and "rejoin" not in g.snapshot().status.lower() and "LATE JOIN" not in g.summary()

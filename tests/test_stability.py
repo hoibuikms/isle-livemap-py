@@ -353,6 +353,7 @@ def test_a_decode_error_is_counted_shown_and_does_not_stop_the_stream(b64):
 def test_status_can_be_read_from_the_ui_thread_while_the_decoder_changes_its_tables():
     g = GamePeerSource(pipeline=type("P", (), {"add_observer": lambda *a: None})(), clock=SimClock())
     g.packets = g.LATE_JOIN_PACKETS
+    g._first_packet_t = -1000.0  # noqa: SLF001 - old enough for the class tables to have arrived
     g._last_t = 500.0
     stop = threading.Event()
     errors = []

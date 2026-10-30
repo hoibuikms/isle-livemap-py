@@ -509,11 +509,11 @@ def test_heartbeat_with_an_extra_slot_is_recognised_and_locks_the_own_handle(joi
 
 
 # ---------------------------------------------------------------- PlayerState reference variants
-def _ref_batch(handle, filler, nbytes=3, lead=100):
+def _ref_batch(handle, filler, nbytes=3, lead=100, marker=0b10100011):
     """A synthetic pawn record: noise, the reference marker, 28 filler bits, then byte count - 1 and the handle."""
     w = BitWriter()
     w.write(0, lead)
-    w.write(0b10100011, 8)
+    w.write(marker, 8)
     w.write(filler, 28)
     w.write(nbytes - 1, 3)
     w.write(handle, nbytes * 8)
@@ -555,3 +555,57 @@ def test_pawn_with_two_known_player_state_candidates_is_not_linked():
     info.ref_candidates = (100001, 100002)
     tr._resolve_player_state(info)  # noqa: SLF001
     assert info.player_state is None
+
+
+# ---------------------------------------------------------------- the variant marker (two of the eight bits are not constant)
+VARIANT = 0b10001011  # stream bits 1,1,0,1,0,0,0,1: recorded on a Giganotosaurus whose player reference is a 2-byte handle
+
+
+def test_the_variant_marker_gives_loose_candidates_inside_the_recorded_window_only():
+    tr = IdentityTracker()
+    bits, batch = _ref_batch(35744, 5, nbytes=2, lead=700, marker=VARIANT)
+    assert tr._reference_candidates(bits, batch, 0) == ()  # noqa: SLF001 - the strict marker is not there
+    assert tr._loose_reference_candidates(bits, batch, ()) == (35744,)  # noqa: SLF001
+    bits, batch = _ref_batch(35744, 5, nbytes=2, lead=100, marker=VARIANT)  # too early in the record
+    assert tr._loose_reference_candidates(bits, batch, ()) == ()  # noqa: SLF001
+    bits, batch = _ref_batch(35744, 5, nbytes=2, lead=1200, marker=VARIANT)  # too late
+    assert tr._loose_reference_candidates(bits, batch, ()) == ()  # noqa: SLF001
+
+
+def test_loose_candidates_take_two_or_three_byte_handles_and_skip_the_strict_marker():
+    tr = IdentityTracker()
+    assert tr._loose_reference_candidates(*_ref_batch(179074, 5, nbytes=3, lead=700, marker=VARIANT), ()) == (179074,)  # noqa: SLF001
+    assert tr._loose_reference_candidates(*_ref_batch(200, 5, nbytes=1, lead=700, marker=VARIANT), ()) == ()  # noqa: SLF001
+    bits, batch = _ref_batch(35744, 5, nbytes=2, lead=700)  # the strict marker: not a loose candidate
+    assert tr._reference_candidates(bits, batch, 0) == (35744,) and tr._loose_reference_candidates(bits, batch, (35744,)) == ()  # noqa: SLF001
+
+
+def test_a_loose_candidate_links_only_when_no_strict_candidate_is_a_known_player_state():
+    from isle_livemap.decode import ActorInfo
+    tr = IdentityTracker()
+    tr.player_names.update({35744: "pLoose", 100001: "pStrict"})
+    only_loose = ActorInfo(1, None, None, 0)
+    only_loose.ref_candidates, only_loose.ref_candidates_loose = (42,), (35744,)
+    tr._resolve_player_state(only_loose)  # noqa: SLF001
+    assert only_loose.player_state == 35744
+    both = ActorInfo(2, None, None, 0)
+    both.ref_candidates, both.ref_candidates_loose = (100001,), (35744,)
+    tr._resolve_player_state(both)  # noqa: SLF001
+    assert both.player_state == 100001  # the strict one wins; the loose one never overrides it
+    two_loose = ActorInfo(3, None, None, 0)
+    tr.player_names[35745] = "pOther"
+    two_loose.ref_candidates_loose = (35744, 35745)
+    tr._resolve_player_state(two_loose)  # noqa: SLF001
+    assert two_loose.player_state is None  # two known candidates: no link
+
+
+def test_a_pawn_record_with_the_variant_marker_is_linked_end_to_end():
+    from isle_livemap.decode import ActorInfo
+    tr = IdentityTracker()
+    tr.player_names[35744] = "pSynthetic"
+    info = tr.actors[900] = ActorInfo(900, None, None, 0)
+    bits, batch = _ref_batch(35744, 5, nbytes=2, lead=700, marker=VARIANT)
+    info.ref_candidates = tr._reference_candidates(bits, batch, 0)  # noqa: SLF001
+    info.ref_candidates_loose = tr._loose_reference_candidates(bits, batch, info.ref_candidates)  # noqa: SLF001
+    tr._resolve_player_state(info)  # noqa: SLF001
+    assert tr.name_of(900) == "pSynthetic"

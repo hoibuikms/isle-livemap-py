@@ -33,6 +33,7 @@ class Clock:
 def source(tables_seen: bool = False, packets: int | None = None) -> GamePeerSource:
     g = GamePeerSource(pipeline=FakePipeline(), clock=Clock())
     g.packets = g.LATE_JOIN_PACKETS if packets is None else packets
+    g._first_packet_t = -1000.0  # noqa: SLF001 - old enough for the class tables to have arrived
     g._last_t = 100.0
     if tables_seen:
         g.identity.creations = 20
@@ -221,3 +222,23 @@ def test_damaged_seed_entries_are_ignored(tmp_path, entry):
         assert load_seed(path).get(0xA) in (None, "/Game/A.B_C")
     except ValueError:  # pragma: no cover - load_seed must not raise
         pytest.fail("load_seed raised on a damaged entry")
+
+
+# ---------------------------------------------------------------- the class tables get time to arrive
+def test_no_late_start_claim_before_the_class_tables_had_time():
+    """Recorded: at every join the first 100 packets arrive within a second, before the tables are processed, and the banner
+    claimed "late start" for about 5 s. Nothing is claimed until LATE_JOIN_GRACE_S of datagram time have passed."""
+    g = source()
+    g.identity.creations = 400  # creation records seen, none with a class from the tables yet
+    g._first_packet_t = 100.0 - (g.LATE_JOIN_GRACE_S - 1.0)  # noqa: SLF001
+    assert not g.late_start() and g.headline() == ""
+    g.store.update(Entity("999999", "unknown", "Unknown #999999", "", 1.0, 2.0, 3.0))
+    assert not g.late_join()
+    g._first_packet_t = 100.0 - g.LATE_JOIN_GRACE_S  # noqa: SLF001
+    assert g.late_start() and g.late_join() and "Started late" in g.headline()
+
+
+def test_the_grace_starts_with_the_first_packet_of_a_connection_and_a_reset_restarts_it():
+    g = source()
+    g.on_reset()
+    assert g._first_packet_t is None and not g.late_start()  # noqa: SLF001

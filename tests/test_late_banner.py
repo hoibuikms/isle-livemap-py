@@ -90,6 +90,7 @@ class FakePipeline:
 def source(tables_seen: bool = False) -> GamePeerSource:
     g = GamePeerSource(pipeline=FakePipeline(), clock=Clock())
     g.packets = g.LATE_JOIN_PACKETS
+    g._first_packet_t = -1000.0  # noqa: SLF001 - old enough for the class tables to have arrived
     g._last_t = 100.0
     if tables_seen:
         g.identity.creations = 20
