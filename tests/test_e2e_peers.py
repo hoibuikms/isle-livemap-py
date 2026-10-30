@@ -31,7 +31,10 @@ from conftest import retimed  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 OWN_FIX = (442_020.33, -162_148.37)
-NEAR_IDS = {"104114", "84466", "105096", "89308", "94432"}  # actors 752..838 m from OWN_FIX in the recorded packets
+# actors within 1000 m of OWN_FIX in the three replayed packets: 233 and 357 m away, south of it (bearing 158-177 deg). The
+# recorded vectors are raw / 128 cm (decode.STATE_VECTOR_SCALE); read with the /100 of the move packets they were 752-838 m
+# away, NNW, which is the 650-850 m "ring" of every nearby creature in the live captures.
+NEAR_IDS = {"105810", "105148"}
 CYAN = (162, 77, 255)  # geo.ENTITY_STYLE["player"].color: the purple of another player's dinosaur (name kept from the cyan days)
 ORANGE = (143, 166, 179)  # geo.ENTITY_STYLE["ai"].color (muted grey-blue): the recorded actors only ever send the 155/158 bit animal state
 
@@ -149,9 +152,9 @@ def test_default_game_peers_through_real_main_draw_dots_at_their_decoded_positio
     near = {n.entity.id: n for n in app.view.nearby()}
     assert set(near) == NEAR_IDS
     for n in near.values():
-        assert 700 < n.distance_m < 1000 and 330 < n.bearing < 345  # all roughly NNW of the local player
+        assert 200 < n.distance_m < 400 and 150 < n.bearing < 185  # both just south of the local player
         assert n.entity.kind == "ai" and n.entity.name.startswith("Actor #")
-        assert n.entity.health_pct is None and n.entity.heading is None
+        assert n.entity.health_pct is None  # a server animal: no vitals (its heading may be derived from its movement)
 
     # rendering: a dot sits at the projected position of every in-view actor (same projection as the arrow)
     cx, cy = screen_of(app.view, pos.x, pos.y)
@@ -161,24 +164,26 @@ def test_default_game_peers_through_real_main_draw_dots_at_their_decoded_positio
         sx, sy = screen_of(app.view, n.x, n.y)
         if math.hypot(sx - cx, sy - cy) < app.view.width() / 2 - 8:
             drawn += near_color(img, sx, sy, ORANGE)
-    assert drawn >= 4, "actors inside the circle must be drawn at their projected positions"
+    assert drawn >= len(NEAR_IDS), "actors inside the circle must be drawn at their projected positions"
 
 
 def test_out_of_view_actor_in_radius_gets_an_edge_pointer_through_real_main(tmp_path, monkeypatch):
     from isle_livemap.geo import edge_anchor
 
     pcap = build_pcap(tmp_path / "real.pcap")
-    data = settings_dir(tmp_path, zoom=2.0)  # view edge ~556 m, radius still 1000 m -> the 750-840 m actors are off view
+    data = settings_dir(tmp_path, zoom=6.0)  # view edge ~185 m, radius still 1000 m -> the 233 and 357 m actors are off view
     app, img = run_main(monkeypatch, ["--replay", str(pcap), "--speed", "3", "--data-dir", str(data)], ready)
     pos = app.pipeline.latest.position
     cx, cy = screen_of(app.view, pos.x, pos.y)
-    hit = 0
+    hit = outside = 0
     for n in app.view.nearby():
         sx, sy = screen_of(app.view, n.x, n.y)
-        assert math.hypot(sx - cx, sy - cy) > app.view.width() / 2  # really outside the circle
+        if math.hypot(sx - cx, sy - cy) <= app.view.width() / 2:
+            continue  # inside the circle: drawn as a dot, not a pointer
+        outside += 1
         ax, ay = edge_anchor(cx, cy, sx, sy, app.view.width() / 2 - 7)
         hit += near_color(img, ax, ay, ORANGE, r=5)
-    assert hit == len(NEAR_IDS)
+    assert outside == len(NEAR_IDS) and hit == outside
 
 
 def test_actors_beyond_the_radius_are_not_drawn(tmp_path, monkeypatch):
@@ -301,4 +306,4 @@ def test_actor_positions_are_on_the_island_in_the_local_frame():
     as_is = sum(land(x, y) for x, y in pts.values()) / len(pts)
     x_flip = sum(land(-x, y) for x, y in pts.values()) / len(pts)
     both = sum(land(-x, -y) for x, y in pts.values()) / len(pts)
-    assert as_is > 0.75 and x_flip < 0.3 and both < 0.6
+    assert as_is > 0.9 and as_is - x_flip > 0.3 and as_is - both > 0.1  # the island, not its mirror images (the map is mostly land)

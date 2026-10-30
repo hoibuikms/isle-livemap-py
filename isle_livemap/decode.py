@@ -127,8 +127,20 @@ def _read_signed(bits: Bits, offset: int, count: int) -> int:
     return (value ^ sign) - sign
 
 
+# The client's own move packets quantise a location in hundredths of a cm (FVector_NetQuantize100: raw / 100 = cm). The
+# server's replicated state and creation vectors (Iris) use binary fixed point: raw / 128 = cm. Reading them with the /100
+# of the move packets made every other creature 1.28 times too far from the world origin in x, y and z, so a player standing
+# next to you was drawn 0.28 x your own distance from the origin away (650-850 m at 2.5-3 km from the origin), in the
+# direction away from it. Recorded evidence: in five captures on three servers the creatures drawn 650-850 m away land
+# 5-100 m from the own position when divided by 1.28 (rms 55 m, best fit 1.276-1.28), their heights match the own height
+# to 1-3 m (ratio 1.287..1.297 before the division), and the user's own report in one of them (about 110 m in the game,
+# 793 m on the map) comes out at 104 m.
+STATE_VECTOR_SCALE = 100.0 / 128.0
+
+
 def vector_to_cm(raw, scale: float = 1.0) -> tuple[float, float, float]:
-    """FVector_NetQuantize100 integers -> Unreal cm: the single place for the /100 (and the creation-record scale)."""
+    """Quantised vector integers -> Unreal cm: the single place for the /100 of the client's move packets. ``scale``
+    converts other fixed-point units (``STATE_VECTOR_SCALE``: replicated state, creation records)."""
     return (raw[0] / 100.0 * scale, raw[1] / 100.0 * scale, raw[2] / 100.0 * scale)
 
 
@@ -801,16 +813,16 @@ def batch_kind(bits: Bits, batch: IrisBatch) -> str:
 #            archetype's object handle, resolved to a path through the export sections (``IdentityTracker``)
 #    1 bit   persistent level; 0 would be followed by a level reference (not decoded: no location is read then)
 #    1 bit   has-location; then 1 valid bit and a quantised vector (7-bit header, bit 6 set | component bit count,
-#            then 3 signed components). Divided by 100 it is the world position in cm WITHOUT the factor
-#            ``CREATION_LOCATION_SCALE``: the same actor's later state vector (the layouts below, which are in the
-#            own-position frame) is exactly 16 times larger in x and y (raw 44992560 vs 2812035 for one fish; 15.99..16.00
-#            for five actors). Creation positions therefore land inside +-700 m of the world origin, while the
-#            world is +-8 km wide.
+#            then 3 signed components). Read like the state vectors (raw / 128 cm, ``STATE_VECTOR_SCALE``) it is the world
+#            position WITHOUT the factor 16: the same actor's later state vector is exactly 16 times larger in x and y
+#            (raw 44992560 vs 2812035 for one fish; 15.99..16.00 for five actors). Read with the old /100 the creation
+#            positions landed inside +-700 m of the world origin while the world is +-8 km wide; ``CREATION_LOCATION_SCALE``
+#            (16 / 1.28 = 12.5 relative to /100) puts them in the same frame as the state vectors and the own marker.
 #
 # The state payload after the header is class specific and is NOT decoded here.
 
 _CREATION_FLAGS_ARCHETYPE = 0b100  # LSB-first (0, 0, 1)
-CREATION_LOCATION_SCALE = 16.0
+CREATION_LOCATION_SCALE = 16.0 * STATE_VECTOR_SCALE  # 12.5: the creation vector is 1/16 of the state vector (same actor, exactly)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1392,7 +1404,7 @@ def _vector_at(bits: Bits, base: int, n: int, offset: int, min_comp: int,
     raw = [_read_signed(bits, start + comp * i, comp) for i in range(3)]
     if not _canonical(raw[0], raw[1], raw[2], comp):
         return None
-    x, y, z = vector_to_cm(raw)
+    x, y, z = vector_to_cm(raw, STATE_VECTOR_SCALE)
     return (comp, x, y, z) if _plausible_world(x, y, z if check_z else 0.0) else None
 
 
@@ -2003,7 +2015,12 @@ class PawnVitalsTracker:
             return v <= max_h * slack
 
         def plausible_stamina(v: float) -> bool:
-            return max_s is None or v <= max_s * 1.001
+            if max_s is not None:
+                return v <= max_s * 1.001
+            # No maxStamina (8-slot form, e.g. a Deinosuchus): the slot 66 bits after the health may be another attribute, in
+            # the gg capture the maxHealth that had just grown (stamina 997 -> 10644). Stamina regenerates slowly: it may
+            # at most double (or reach a tenth of maxHealth) between two batches.
+            return pawn.stamina is None or v <= max(2.0 * pawn.stamina, 0.1 * max_h)
 
         best = None  # (distance, rel, health, stamina | None)
         for rel, health in slots.items():

@@ -195,7 +195,7 @@ Evidence and method: "Identity, species and positions" (section 13) of `docs/trd
 | `kind` | `dino` (dinosaur class), `player` (dinosaur whose creation record references a PlayerState), `ai` (fish), `unknown` (no creation record captured). World objects (plants, fruit, gore, items, PlayerStates, level actors; 5307 of 5419 creations) are never drawn |
 | Species | `Pteranodon`, `Gallimimus`, `Longear`, `Rainbow Fish` in the capture. Any other class is shown under its cleaned asset name (`BP_Foo_C` -> `Foo`), never invented. The mapping is `species.py` (`CLASS_RULES`, `DISPLAY_NAMES`) |
 | Player name | decoded for pawns whose creation record references their PlayerState (name from the PlayerState creation record: 382 of 388 PlayerStates in the capture). A creature whose PlayerState was created before the capture, or an AI animal, has no name |
-| Position x, y, z | decoded: creation position (16 x the raw/100 value, see TRD 13.4), two fixed state layouts (BP_Longear, BP_Fish_RainbowFish: x and y only), and layouts learned from creation anchor + continuity (pteranodon pawns). Most pawn state batches carry no position at all |
+| Position x, y, z | decoded: creation position (12.5 x the raw/100 value = 16 x the state scale, see TRD 13.4 and "Replicated positions are raw / 128"), two fixed state layouts (BP_Longear, BP_Fish_RainbowFish: x and y only), and layouts learned from creation anchor + continuity (pteranodon pawns). Most pawn state batches carry no position at all |
 | Health, stamina | decoded for other creatures from the full attribute block (9 slots: health, maxHealth, stamina, maxStamina, then maxHealth repeated three times and half of it twice; or 8 slots without maxStamina when that did not change), then **followed** between blocks: a pawn that regenerates sends the pair health + stamina (66 bits apart) in small state batches every second or so (`decode.PawnVitalsTracker`). A slot is the health when it is close to the last health (or sits at an offset confirmed twice for that batch header, which then also takes a bite). A percentage needs the maxima. maxHealth is also in the **creation record** (see below), so a creature created while the app runs gets its health percentage from the first confirmed health + stamina pair, without waiting for a block (`PawnVitalsTracker.note_creation`, `_bootstrap`: the pair must be seen twice at the same place of the same batch layout, health inside 2-105 % of the maximum). maxStamina is in no creation record: such a pawn has HP but no stamina percentage. A creature created before the app started still waits for its first block (in the hhh capture 26 % of the dino-seconds had HP, 17 % had stamina: the block comes rarely and the 8-slot form has no maxStamina). Label: `HP 2275/2620  ST 626/–` (the points the game sent; `~` before a maximum that is only the creation record's) |
 | Growth, hunger, thirst | NOT replicated to other clients as far as the data shows (see "Why other players' data is less complete than yours"): at every growth tick of the own pawn the growth slot travels with the new maxHealth (57 of 60 full blocks of growing own pawns), at the same event of a growing other pawn it never does (0 of 16 blocks, 5 of them growth ticks); the own pawn's hunger / thirst heartbeat reaches it about once a second, other pawns' batches never hold it. Not printed, not even `?` |
 | Despawn | destruction records (layout fixed, see TRD 13.3); TTL is the fallback |
@@ -730,7 +730,46 @@ What was added so that the next log can answer the question without a replay:
 * Ground truth that would settle it: stand still next to ONE named player for 60 s (the others far away), press the
   button, and write down the clock time and the player's name.
 
+## Replicated positions are raw / 128, not raw / 100 (the 650-850 m ring)
+
+**Symptom** (reported in six recordings): another player standing right next to the user was drawn 650-850 m away, always in the
+same direction (away from the world origin), and "the server only sends creatures at 700-850 m" looked like a property of the game.
+
+**Cause.** The client's own move packets quantise a location in hundredths of a cm (raw / 100 = cm; confirmed by the server's own
+float64 copy of the own location, which agrees to 0.1 m). The server's replicated state and creation vectors (Iris) are binary fixed
+point: **raw / 128 = cm**. They were read with the /100 of the move packets, so every other creature was 1.28 x too far from the
+world origin in x, y and z (the factor 16 between the creation vector and the state vector of one actor is unchanged). A creature
+at the user's side was therefore drawn 0.28 x the user's distance from the origin away, in the direction away from the
+origin: 700-870 m for a user 2.5-3.1 km from it. That is the "ring", and why a flight near the origin looked accurate.
+
+**Evidence** (all independent of each other):
+* The `gg` recording: three Deinosuchus players and a Diabloceratops, drawn 787-860 m away at a height 64-66 m above the user, are
+  at 1.277-1.30 times the user's x, y and z (the vector from the origin is the user's, times 1.28 +- 0.01 in all three coordinates).
+  Divided by 1.28 they are 19, 21 and 29 m from the user's final position (a fourth, who walked off, 153 m) and 1-3 m from the user's height.
+* Five recordings on three servers, 43 non-animal creatures: divided by 1.28, those drawn 650-850 m away are 3-100 m from the
+  user (median 40 m, rms 55 m over the 28 nearest); a least-squares fit of the scale over them has its minimum at 1.276-1.280.
+* The user's own numbers in the `mm` recording: "about 110 m in the game, 793 m on the map". The only creature in that stream
+  within 1 km, divided by 1.28, is 104 m from the user.
+* The 65 land animals of the recorded join fixture: 78.5 % on land with the /100 reading, 100 % with /128.
+* Heights: the replicated z of creatures in the user's lake was 1.18-1.30 x the user's z in every recording; divided by 1.28 it
+  matches to 1-3 m.
+
+**Fix.** `decode.STATE_VECTOR_SCALE` = 100 / 128, used by `_vector_at` (every state vector: fixed layouts, learned layouts,
+bootstrap) and by `decode_creation` (`CREATION_LOCATION_SCALE` = 16 x that = 12.5). The own move packets (`decode_movement`) and
+the server's float64 own-location copy are unchanged. After the fix, in `gg` the three players and the Diabloceratops are 18-29 m
+from the user's final position (the one who walked off 150 m) and 1-2 m from his height.
+
+**Earlier checks that could not see it.** The creation-vs-state comparison (scale 1.0003 / 0.9997) and the invariance test
+compare positions of other creatures with each other, so a common factor cancels; the own-vs-server check compares the own
+marker with the server's copy of the own location, which is in the move-packet scale. The fish / water-mask test was
+inconclusive (few distinct positions, hidden swamp water); it is not evidence either way.
+
 ## The far group is real players, and the server only replicates a ring of about 700-850 m
+
+> **Superseded.** The "ring of 700-850 m" below is not a property of the server: it is the scale error described in
+> "Replicated positions are raw / 128, not raw / 100" (every other creature was drawn 1.28 x too far from the world origin, so
+> a creature next to the user at 2.5-3.1 km from the origin appeared 0.28 x that distance away, 700-870 m). The conclusion "the server does not
+> replicate a player's dinosaur farther than 700-850 m" is wrong; the H-A / H-B results (real players, one flow) stand.
 
 Two hypotheses for "nothing next to me, 500-800 m away yes" were tested on the recordings (neutral labels as above; `C6` is
 the recording with the most complete tables).

@@ -7,6 +7,8 @@ health + stamina 66 bits apart (health 2192.47 -> 2274.58 in steps of ~0.56 over
 
 from __future__ import annotations
 
+from isle_livemap.decode import _bits_needed
+
 import struct
 
 import pytest
@@ -103,6 +105,16 @@ def test_the_pair_is_followed_by_continuity():
     assert t.followed == 1
 
 
+def test_without_a_stamina_maximum_a_slot_that_jumps_tenfold_is_not_taken_as_stamina():
+    """gg capture, Deinosuchus: stamina 997 became 10644, the maxHealth (10608) that had just grown."""
+    t = PawnVitalsTracker()
+    assert t.update(*attribute_batch(block8(100, 5400.0, 10608.0, 997.0))) is not None
+    v = t.update(*pair(47, 5613.0, 10644.0))
+    assert v.health == pytest.approx(5613.0, abs=0.1) and v.stamina == pytest.approx(997.0, abs=0.1)
+    v = t.update(*pair(47, 5620.0, 1050.0))  # a normal regeneration step is still followed
+    assert v.stamina == pytest.approx(1050.0, abs=0.1)
+
+
 def test_a_lone_health_slot_close_to_the_last_value_is_followed():
     t = seeded()
     v = t.update(*pair(296, 2195.29, None, total=362))
@@ -143,11 +155,12 @@ def test_forget_and_reset():
 # ---------------------------------------------------------------- position of a creature without an anchor
 def vector_batch(vec, offset=94, comp=26, total=200, handle=5):
     w = BitWriter()
+    comp = max(_bits_needed(round(v * 128)) for v in vec)  # the decoder believes only the canonical width
     w.write(HDR, ACTOR_STATE_HEADER_BITS)
     w.write(0xA5A5A5A5A5 & ((1 << (offset - ACTOR_STATE_HEADER_BITS)) - 1), offset - ACTOR_STATE_HEADER_BITS)
     w.write(comp | 64, 7)
     for v in vec:
-        w.write(round(v * 100), comp)
+        w.write(round(v * 128), comp)  # replicated vectors are raw / 128 cm
     w.write(0, total - w.nbits)
     return Bits(w.to_bytes()), IrisBatch(handle, 0, w.nbits, True, False)
 
@@ -156,7 +169,7 @@ def auto_batch(vec, **kw):
     """``vector_batch`` with the component width the vector needs (the decoder only believes a canonical width)."""
     from isle_livemap.decode import _bits_needed
 
-    return vector_batch(vec, comp=max(_bits_needed(round(v * 100)) for v in vec), **kw)
+    return vector_batch(vec, comp=max(_bits_needed(round(v * 128)) for v in vec), **kw)
 
 
 ME = (130_000.0, -320_000.0, 36_000.0)

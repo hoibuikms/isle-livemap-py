@@ -1,6 +1,7 @@
 """The arrow icon points the way the creature faces: orientation of the polygon for every compass direction (yours and
 other creatures'), the rotation byte that comes with a creature's position, and the fallbacks when it is missing."""
 
+from isle_livemap.decode import _bits_needed
 import math
 import os
 
@@ -103,13 +104,14 @@ def test_a_drawn_peer_arrow_points_the_way_it_is_headed(tmp_path, name, deg):
 HDR = 0x0C0000348
 
 
-def state_batch(vec, yaw_deg, offset=94, comp=26, total=260, handle=5, pad_bits=None):
+def state_batch(vec, yaw_deg, offset=94, comp=None, total=260, handle=5, pad_bits=None):
     w = BitWriter()
+    comp = comp or max(_bits_needed(round(v * 128)) for v in vec)  # the decoder believes only the canonical width
     w.write(HDR, 33)
     w.write(0xA5A5A5A5A5 & ((1 << (offset - 33)) - 1), offset - 33)
     w.write(comp | 64, 7)
     for v in vec:
-        w.write(round(v * 100), comp)
+        w.write(round(v * 128), comp)  # replicated vectors are raw / 128 cm (decode.STATE_VECTOR_SCALE)
     w.write(0b101, YAW_GAP_BITS)
     if yaw_deg is not None:
         w.write(round(yaw_deg / 360.0 * (1 << YAW_BITS)) % (1 << YAW_BITS), YAW_BITS)

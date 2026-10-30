@@ -9,6 +9,8 @@ Synthetic data only (the batch shapes come from the recorded sessions); the real
 
 from __future__ import annotations
 
+from isle_livemap.decode import _bits_needed
+
 import types
 
 import pytest
@@ -28,9 +30,10 @@ def state_payload(vec, handle: int, offset: int = 94, comp: int = 26, total: int
     w = BitWriter()
     w.write(HDR, ACTOR_STATE_HEADER_BITS)
     w.write(0xA5A5A5A5A5 & ((1 << (offset - ACTOR_STATE_HEADER_BITS)) - 1), offset - ACTOR_STATE_HEADER_BITS)
+    comp = max(_bits_needed(round(v * 128)) for v in vec)  # the decoder believes only the canonical width
     w.write(comp | 64, 7)
     for v in vec:
-        w.write(round(v * 100), comp)
+        w.write(round(v * 128), comp)  # replicated vectors are raw / 128 cm
     w.write(0, total - w.nbits)
     return w.to_bytes(), IrisBatch(handle, 0, w.nbits, True, False)
 

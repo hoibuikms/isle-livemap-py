@@ -9,6 +9,8 @@ Synthetic batches are built with the repo's own ``replay.BitWriter``."""
 
 from __future__ import annotations
 
+from isle_livemap.decode import STATE_VECTOR_SCALE, _bits_needed
+
 import math
 from collections import Counter
 
@@ -150,7 +152,7 @@ def test_creation_record_fields_on_a_real_batch(join_packets):
     assert batch_kind(bits, batch) == KIND_CREATION
     c = decode_creation(bits, batch)
     assert (c.net_ref_handle, c.archetype_handle) == (61004, 4279)
-    assert c.location == pytest.approx((449_925.6, -178_420.8, 38_290.88), abs=0.01)
+    assert c.location == pytest.approx((449_925.6 * STATE_VECTOR_SCALE, -178_420.8 * STATE_VECTOR_SCALE, 38_290.88 * STATE_VECTOR_SCALE), abs=0.01)
     later = one(join_packets, 824)["payload"]
     lbits = Bits(later)
     kinds = [batch_kind(lbits, b) for b in parse_iris_packet(later).batches]
@@ -162,12 +164,12 @@ def test_creation_record_fields_on_a_real_batch(join_packets):
 def test_longear_state_positions_equal_creation_position_scaled(join_packets):
     """BP_Longear: 193 later state vectors (the verified 0x20E822A8 layout) have x and y equal to 16 x the creation
     vector, to the last digit; z bobs by +-1 m around the same 16 x value."""
-    assert CREATION_LOCATION_SCALE == 16.0
+    assert CREATION_LOCATION_SCALE == 16.0 * STATE_VECTOR_SCALE  # 12.5: the state vector is 16 x the creation vector
     g = replay(group(join_packets, "rainbow_class") + group(join_packets, "longear"))
     e = g.store.get("61004")
     assert e is not None and e.kind == "ai" and e.species == "Longear"
-    assert (e.x, e.y) == pytest.approx((449_925.6, -178_420.8), abs=0.01)
-    assert e.z == pytest.approx(38_290.88, abs=300)  # creation z; the state z moves about +-1 m
+    assert (e.x, e.y) == pytest.approx((449_925.6 * STATE_VECTOR_SCALE, -178_420.8 * STATE_VECTOR_SCALE), abs=0.01)
+    assert e.z == pytest.approx(38_290.88 * STATE_VECTOR_SCALE, abs=300)  # creation z; the state z moves about +-1 m
     assert g.locator.fixed >= 4 and g.locator.learned == 0
 
 
@@ -327,11 +329,12 @@ def test_learned_layout_tracks_a_pteranodon_with_continuity(join_packets):
 
 def synthetic_state_batch(header: int, vec: tuple[float, float, float], offset: int, comp: int = 26, total: int = 200, handle: int = 5):
     w = BitWriter()
+    comp = max(_bits_needed(round(v * 128)) for v in vec)  # the decoder believes only the canonical width
     w.write(header, 33)
     w.write(0xA5A5A5A5A5 & ((1 << (offset - 33)) - 1), offset - 33)
     w.write(comp | 64, 7)
     for v in vec:
-        w.write(round(v * 100), comp)
+        w.write(round(v * 128), comp)  # replicated vectors are raw / 128 cm
     w.write(0, total - w.nbits)
     return Bits(w.to_bytes()), IrisBatch(handle, 0, w.nbits, True, False)
 
@@ -389,13 +392,13 @@ def test_fixed_layout_synthetic_second_layout_round_trips():
     w.write(layout.header, 33)
     w.write(0x12345, layout.offset - 33)
     w.write(26 | 64, 7)
-    for v in (124_086.5, -335_433.5, 25_629.0):
-        w.write(round(v * 100), 26)
+    for v in (124_086.5, -255_433.5, 25_629.0):
+        w.write(round(v * 128), 26)
     w.write(0x2AAAAAAAA, layout.tail_bits)
     bits, batch = Bits(w.to_bytes()), IrisBatch(9, 0, w.nbits, True, False)
     assert batch.data_bit_count == 192
     loc = decode_actor_location(bits, batch)
-    assert loc is not None and (loc.x, loc.y, loc.z) == pytest.approx((124_086.5, -335_433.5, 25_629.0)) and not loc.z_reliable
+    assert loc is not None and (loc.x, loc.y, loc.z) == pytest.approx((124_086.5, -255_433.5, 25_629.0)) and not loc.z_reliable
     assert decode_actor_location(bits, IrisBatch(9, 0, 193, True, False)) is None  # size equation broken
 
 

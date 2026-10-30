@@ -13,6 +13,7 @@ import pytest
 
 from isle_livemap import peers
 from isle_livemap.capture import INBOUND, OUTBOUND, SERVER_SWITCH_DATAGRAMS, Datagram, TelemetryPipeline
+from isle_livemap.decode import STATE_VECTOR_SCALE as S100
 from isle_livemap.decode import (
     ACTOR_STATE_HEADER, ACTOR_STATE_HEADER_BITS, ACTOR_STATE_TAIL_BITS, Bits, IrisBatch, PacketCounts, batch_kind,
     count_batches, decode_actor_location, decode_actor_locations, parse_iris_packet,
@@ -43,7 +44,7 @@ def outbound(at: float = T0) -> Datagram:
 
 def actor_batch(x: float, y: float, z: float, handle: int = 7, header: int = ACTOR_STATE_HEADER, comp: int | None = None):
     """A batch in the recorded location layout, built with the repo's BitWriter."""
-    raw = [round(v * 100) for v in (x, y, z)]
+    raw = [round(v * 128) for v in (x, y, z)]  # replicated vectors are raw / 128 cm
     comp = comp or max(_needed(r) for r in raw)
     w = BitWriter()
     w.write(header, ACTOR_STATE_HEADER_BITS)
@@ -59,9 +60,9 @@ def test_recorded_packet_yields_other_actor_positions(b64):
     locs = {l.net_ref_handle: l for l in decode_actor_locations(b64("SecondHeartbeat"))}
     assert len(locs) == 15 and OWN not in locs  # the own pawn has no such batch
     a = locs[93_362]  # 155-bit batch, 26-bit components
-    assert (a.x, a.y, a.z, a.component_bit_count) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88), 26)
+    assert (a.x, a.y, a.z, a.component_bit_count) == (pytest.approx(201_852.74 * S100), pytest.approx(-249_768.68 * S100), pytest.approx(30_398.88 * S100), 26)
     b = locs[84_466]  # 158-bit batch, 27-bit components (|y|... a component beyond 335 544 cm)
-    assert b.component_bit_count == 27 and b.x == pytest.approx(413_642.88)
+    assert b.component_bit_count == 27 and b.x == pytest.approx(413_642.88 * S100)
 
 
 def test_every_recorded_location_batch_is_a_canonical_world_position(b64, recorded):
@@ -140,7 +141,7 @@ def test_peers_come_from_inbound_batches_with_unknown_fields_none(b64):
     # these fixtures hold no creation record for the handle, and every state batch is the animal size (155/158 bits):
     # a server animal ("ai"), neither a player nor a dino, from its very first batch
     assert (e.kind, e.name, e.species) == ("ai", "Actor #93362", "")
-    assert (e.x, e.y, e.z) == (pytest.approx(201_852.74), pytest.approx(-249_768.68), pytest.approx(30_398.88))
+    assert (e.x, e.y, e.z) == (pytest.approx(201_852.74 * S100), pytest.approx(-249_768.68 * S100), pytest.approx(30_398.88 * S100))
     assert (e.health_pct, e.growth_pct, e.stamina_pct, e.hunger_pct, e.thirst_pct, e.heading) == (None,) * 6
     assert "not available" in snap.status and not peers.status_is_warning(snap.status)
 
