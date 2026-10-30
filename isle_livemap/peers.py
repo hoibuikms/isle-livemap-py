@@ -383,7 +383,7 @@ class GamePeerSource:
     # Silence limit before a peer is dropped when no destruction record came. Creatures rest for minutes without
     # a single report (captured gaps of 100-300 s), so they stay until the server destroys them; the limit only
     # guards against a missed destruction record. Server animals (fish) are numerous and uninteresting: shorter.
-    TTL_S = 600.0  # players and dinosaurs: the server's destruction record removes them; this only guards against a missed one
+    TTL_S = 3600.0  # players and dinosaurs: the server's destruction record removes them (a resting one stays however long it is silent); this only guards against a missed one
     TTL_AI_S = GAME_PEER_TTL_S
     stale_s, ttl_s = STALE_S, TTL_S
     # A creature the server destroyed leaves the map this long afterwards (not 30 s: a dot of something that is gone
@@ -519,9 +519,9 @@ class GamePeerSource:
         self._first_seen: dict[int, float] = {}  # handle -> datagram time of its creation record / first state batch
         self._moved: set[int] = set()  # handles that sent a movement-bearing state batch after ``MOVE_GRACE_S`` (they moved)
         self._first_packet_t: float | None = None  # datagram time of the first inbound packet of this connection
-        self._stale: set[int] = set()  # creatures taken off the map because they were active but only had a spawn point
+        self._stale: set[int] = set()  # creatures drawn at a spawn point only although they were active (they stay on the map)
         self.filtered_corpses = 0  # state batches skipped because the actor is a carcass
-        self.stale_spawns = 0  # creatures taken off the map because they were active but only had a spawn point
+        self.stale_spawns = 0  # creatures drawn at a spawn point only although they were active (they stay on the map)
         self.packets = 0  # inbound datagrams seen
         self.decode_errors = 0  # datagrams whose decoding raised (the rest of the stream is still decoded)
         self._error_t = -1e9  # datagram time of the newest decode error
@@ -1189,22 +1189,19 @@ class GamePeerSource:
             elif (old := self.store.get(str(handle))) is None:
                 if kind != sp.KIND_AI:
                     self._note_unplaced(handle, batch.data_bit_count, t)
-            elif old.pos_source == "spawn" and kind != sp.KIND_AI and self._spawn_is_stale(handle, t):
-                # Drawn only at its spawn point but active for a while: it is no longer there. Not drawn; listed as
-                # "position unknown" (``unplaced_creatures``) until a decoded position puts it back on the map.
-                self._hide(handle)
-                self._stale.add(handle)
-                row = self._shape.get(handle)
-                if row is not None:
-                    self._profile[handle] = [row[0], row[1], row[2], t, t]
-                self.stale_spawns += 1
             elif old.pos_source == "spawn" and kind != sp.KIND_AI and self._is_at_rest(handle, t):
                 # It has sent no movement-bearing batch since it appeared: it stands where it was created. The spawn point is
                 # exact, so it is drawn like a followed position (solid, no "~").
                 self._emit(handle, old.x, old.y, old.z, kind, species, name, "rest")
             else:
                 # Still replicated (no destruction record) but this update carries no position: keep the creature
-                # on the map at its last position instead of letting the TTL remove it.
+                # on the map at its last position instead of letting the TTL remove it. That includes a creature that has
+                # moved since it appeared but whose position is not decoded: it stays at its spawn point (dimmed, "~" before
+                # the distance) until a decoded position replaces it or the server destroys it. Better a known last place
+                # than an arrow that comes and goes.
+                if old.pos_source == "spawn" and kind != sp.KIND_AI and self._spawn_is_stale(handle, t) and handle not in self._stale:
+                    self._stale.add(handle)  # counted once; ``hidden_players`` skips it while it is on the map
+                    self.stale_spawns += 1
                 upd = old
                 upd = self._upgrade_identity(upd, handle, kind, name)
                 inferred = bool(species) and self.identity.is_inferred(handle)

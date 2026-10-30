@@ -129,7 +129,7 @@ def test_a_creature_that_moved_needs_a_long_run_of_timer_batches_before_it_is_ca
 
 
 # ---------------------------------------------------------------- stale spawn point
-def test_a_creature_drawn_only_at_its_spawn_point_that_moved_and_keeps_sending_state_is_taken_off_the_map_and_listed(source, monkeypatch):
+def test_a_creature_drawn_only_at_its_spawn_point_that_moved_and_keeps_sending_state_stays_on_the_map_at_its_spawn_point(source, monkeypatch):
     g = source
     g._last_t = 5.0  # noqa: SLF001
     g._creatures.add(9200)  # noqa: SLF001 - its creation record carried a maxHealth
@@ -138,10 +138,11 @@ def test_a_creature_drawn_only_at_its_spawn_point_that_moved_and_keeps_sending_s
         feed_bits(g, monkeypatch, 9200, 220, 10.0 + i, MOVING)  # 1 Hz, the movement member dirty: its initial state (grace)
     assert g.store.get("9200") is not None and g.stale_spawns == 0  # inside the grace the header says nothing
     feed_bits(g, monkeypatch, 9200, 220, 26.0, MOVING)  # 16 s after it appeared: this one is movement
-    assert g.store.get("9200") is None and g.stale_spawns == 1
+    e = g.store.get("9200")
+    assert e is not None and e.pos_source == "spawn" and g.stale_spawns == 1  # still drawn (dimmed, "~"): the last place known
     feed_bits(g, monkeypatch, 9200, 220, 27.0, MOVING)
-    rows = {r["handle"]: r for r in g.unplaced_creatures()}
-    assert 9200 in rows and rows[9200]["batches"] >= 10  # listed as "position unknown": the Nearby table shows "?"
+    assert g.stale_spawns == 1 and g.store.get("9200") is not None  # counted once
+    assert 9200 not in {r["handle"] for r in g.hidden_players()}  # on the map, so not "hidden"
 
 
 def test_a_pawn_that_stands_still_and_only_animates_stays_where_it_was_created(source, monkeypatch):
@@ -204,14 +205,14 @@ def test_a_resting_creature_that_sends_a_batch_now_and_then_keeps_its_spawn_dot_
     assert e is not None and e.pos_source == "rest" and g.stale_spawns == 0
 
 
-def test_a_decoded_position_puts_a_taken_off_creature_back_on_the_map(source, monkeypatch):
+def test_a_decoded_position_replaces_the_spawn_point_of_a_creature_that_moved(source, monkeypatch):
     g = source
     g._last_t = 5.0  # noqa: SLF001
     g._creatures.add(9202)  # noqa: SLF001
     g._emit(9202, *east(750.0), "unknown", "", "", "spawn")  # noqa: SLF001
     for i in range(20):
         feed_bits(g, monkeypatch, 9202, 220, 10.0 + i, MOVING)
-    assert g.store.get("9202") is None
+    assert g.store.get("9202").pos_source == "spawn"  # kept at the spawn point meanwhile
     g.locator.note_creation(9202, east(750.0), 31.0)
     feed(g, monkeypatch, 9202, east(752.0), 32.0)  # a position at last: where it really is
     e = g.store.get("9202")
