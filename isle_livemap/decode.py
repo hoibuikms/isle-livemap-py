@@ -892,6 +892,13 @@ _PS_REF_MARKER = 0b10100011  # bits in stream order 1,1,0,0,0,1,0,1
 _PS_REF_MARKER_BITS = 8
 _PS_REF_MARKER_GAP = 36  # bits from the start of the marker to the byte-count field
 _PS_REF_MAX_BYTES = 4
+# A newer server build (recorded 2026-10-31, "jj") writes the same reference (3-bit byte count - 1, then the handle) behind a
+# different marker that sits only 26 bits before the count: 0 0 0 1 1 0 0 0 (value 0b00011000). Found before 3 of 5 pawn records
+# of that capture, each time as a pair of consecutive handles (X, X + 2) of which X was a known PlayerState; none of the
+# 13 other pawn records of the older captures has it as a known PlayerState, and no world object or fish record has it in any
+# of the four recordings. Like the first marker it only counts once a candidate equals the handle of a known PlayerState.
+_PS_REF_MARKER_V2 = 0b00011000
+_PS_REF_MARKER_GAP_V2 = 26
 # One recorded pawn (a Giganotosaurus whose player reference is a 2-byte handle) had 139 (1,1,0,1,0,0,0,1) where every other
 # of 40+ references has 163 (1,1,0,0,0,1,0,1): two of the eight bits are not constant. The variant marker (those two bits
 # ignored) only counts when the strict rule found no known PlayerState, for a 2 or 3 byte handle inside the window where
@@ -1166,6 +1173,17 @@ class IdentityTracker:
                 continue
             handle = bits.read(base + o + 3, (size + 1) * 8)
             if handle >> (size * 8) and handle not in found:  # top byte non-zero: the shortest encoding
+                found.append(handle)
+        if n < self.OBJECT_RECORD_BITS:
+            return tuple(found)  # a small record is an object an actor owns (burrow, marker), not a pawn: no creature to name
+        for o in range(max(start, _PS_REF_MARKER_GAP_V2), n - 11):  # the newer build's marker (see _PS_REF_MARKER_V2)
+            if bits.read(base + o - _PS_REF_MARKER_GAP_V2, _PS_REF_MARKER_BITS) != _PS_REF_MARKER_V2:
+                continue
+            size = bits.read(base + o, 3)
+            if size >= _PS_REF_MAX_BYTES or o + 3 + (size + 1) * 8 > n:
+                continue
+            handle = bits.read(base + o + 3, (size + 1) * 8)
+            if handle >> (size * 8) and handle not in found:
                 found.append(handle)
         return tuple(found)
 
@@ -1527,6 +1545,14 @@ class ActorLocationTracker:
         self._last.pop(handle, None)
         self._boot.pop(handle, None)
         self._boot_run.pop(handle, None)
+
+    def reject_bootstrap(self, handle: int) -> None:
+        """Take back the position ``bootstrap`` just gave ``handle``: it is not an anchor (the actor stays without one and is
+        searched for again from the next batch)."""
+        self._last.pop(handle, None)
+        self._boot.pop(handle, None)
+        self._boot_run.pop(handle, None)
+        self.bootstrapped = max(self.bootstrapped - 1, 0)
 
     def _moved_like_a_creature(self, a, b) -> bool:
         """The step from vector ``b`` to ``a`` (comp, x, y, z) is a creature's: at least ``BOOT_MOVE_CM`` in x and y, and in both

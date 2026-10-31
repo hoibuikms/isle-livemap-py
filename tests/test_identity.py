@@ -528,7 +528,7 @@ def _ref_batch(handle, filler, nbytes=3, lead=100, marker=0b10100011):
 def test_player_state_reference_does_not_depend_on_the_bits_before_the_count(filler):
     tr = IdentityTracker()
     bits, batch = _ref_batch(179074, filler)
-    assert tr._reference_candidates(bits, batch, 0) == (179074,)  # noqa: SLF001
+    assert tr._reference_candidates(bits, batch, 0)[0] == 179074  # noqa: SLF001 - first; the newer marker may add noise, which only counts once it is a known PlayerState
 
 
 def test_player_state_reference_two_byte_handle_and_non_canonical_width_rejected():
@@ -612,3 +612,46 @@ def test_a_pawn_record_with_the_variant_marker_is_linked_end_to_end():
     info.ref_candidates_loose = tr._loose_reference_candidates(bits, batch, info.ref_candidates)  # noqa: SLF001
     tr._resolve_player_state(info)  # noqa: SLF001
     assert tr.name_of(900) == "pSynthetic"
+
+
+def _ref_batch_v2(handle, nbytes=2, lead=1100):
+    """A pawn record of the newer server build: noise, the 8-bit marker 0b00011000, 18 filler bits, count - 1, the handle."""
+    w = BitWriter()
+    w.write(0, lead)
+    w.write(0b00011000, 8)
+    w.write(0x2A5, 18)
+    w.write(nbytes - 1, 3)
+    w.write(handle, nbytes * 8)
+    w.write(0, 40)
+    return Bits(w.to_bytes()), IrisBatch(1, 0, w.nbits, False, False)
+
+
+def test_a_pawn_record_of_the_newer_build_is_linked_to_its_player_state():
+    """jj capture: the reference sat behind another marker, 26 bits before the count; no pawn of that session got a name."""
+    from isle_livemap.decode import ActorInfo
+
+    tr = IdentityTracker()
+    tr.player_names[24160] = "pSynthetic"
+    info = tr.actors[24756] = ActorInfo(24756, None, None, 0)
+    bits, batch = _ref_batch_v2(24160)
+    info.ref_candidates = tr._reference_candidates(bits, batch, 0)  # noqa: SLF001
+    assert info.ref_candidates == (24160,)
+    tr._resolve_player_state(info)  # noqa: SLF001
+    assert tr.name_of(24756) == "pSynthetic"
+    assert tr._reference_candidates(*_ref_batch(36450, 5, nbytes=2), 0) == (36450,)  # noqa: SLF001 - the older marker still works
+
+
+def test_a_small_owned_object_record_is_not_named_after_its_owner_by_the_newer_marker():
+    """jj: 769-bit records (an object a player owns, not a pawn) carry the owner's PlayerState; the player was drawn at the object
+    3.8 km away. Only pawn-sized records (>= OBJECT_RECORD_BITS) take the newer marker."""
+    tr = IdentityTracker()
+    big = _ref_batch_v2(24160)  # pawn-sized: well over 1000 bits
+    assert tr._reference_candidates(*big, 0) == (24160,)  # noqa: SLF001
+    w = BitWriter()
+    w.write(0, 200)
+    w.write(0b00011000, 8)
+    w.write(0x2A5, 18)
+    w.write(1, 3)
+    w.write(24160, 16)
+    w.write(0, 40)  # 285 bits in all
+    assert tr._reference_candidates(Bits(w.to_bytes()), IrisBatch(1, 0, w.nbits, False, False), 0) == ()  # noqa: SLF001

@@ -521,6 +521,7 @@ class GamePeerSource:
         self._first_packet_t: float | None = None  # datagram time of the first inbound packet of this connection
         self._stale: set[int] = set()  # creatures drawn at a spawn point only although they were active (they stay on the map)
         self.filtered_corpses = 0  # state batches skipped because the actor is a carcass
+        self.rejected_far_locks = 0  # unanchored "sparse" locks thrown away for being far from the own position
         self.stale_spawns = 0  # creatures drawn at a spawn point only although they were active (they stay on the map)
         self.packets = 0  # inbound datagrams seen
         self.decode_errors = 0  # datagrams whose decoding raised (the rest of the stream is still decoded)
@@ -640,6 +641,12 @@ class GamePeerSource:
         self._anchors[handle] = (x, y)
         return bearing_deg(*anchor, x, y) if moved <= self.HEADING_MAX_STEP_CM else None
 
+    # A pawn that a player controls has a creation record of 3 698 - 4 851 bits (13 linked pawns in three recordings on three servers);
+    # the six pawns that never linked to any player (Diabloceratops, Stegosaurus, Triceratops) had 1 835 - 3 093. A record below
+    # this size with no PlayerState reference is a server-controlled animal: it has no player name, and is said to be an "AI".
+    AI_PAWN_MAX_BITS = 3400
+    AI_NAME = "AI"
+
     def _identity(self, handle: int) -> tuple[str, str, str]:
         """(kind, species, name) of an actor from what its creation record and the export tables say."""
         from . import species as sp
@@ -654,7 +661,10 @@ class GamePeerSource:
         kind, species = sp.describe(path, self.identity.species_hint(handle), info.player_state is not None)
         if kind == sp.KIND_DINO and not species and info.asset_species:
             species = sp.display_name(info.asset_species[0])
-        return kind, species, self.identity.name_of(handle) or ""
+        name = self.identity.name_of(handle) or ""
+        if not name and kind == sp.KIND_DINO and info.player_state is None and 0 < info.creation_bits < self.AI_PAWN_MAX_BITS:
+            name = self.AI_NAME  # no player behind it: a server animal (its record has no player data and is much smaller)
+        return kind, species, name
 
     def _animal_layout(self, handle: int, bits: int) -> bool:
         """Count one state batch of an actor without class information; True while it looks like a server animal."""
@@ -925,6 +935,12 @@ class GamePeerSource:
             self._empty_since = self._last_t
         return "No other players nearby" if self._last_t - self._empty_since >= self.NOBODY_GRACE_S else ""
 
+    SPARSE_MAX_OWN_M = 1000.0  # a "sparse" bootstrap lock further than this from the own position is rejected (see _on_inbound)
+
+    def _far_from_own(self, x: float, y: float) -> bool:
+        own = self._own_position()
+        return own is not None and math.hypot(x - own[0], y - own[1]) / 100.0 > self.SPARSE_MAX_OWN_M
+
     def _own_position(self) -> tuple[float, float, float] | None:
         latest = getattr(self.pipeline, "latest", None)
         pos = getattr(latest, "position", None)
@@ -1171,6 +1187,13 @@ class GamePeerSource:
                 # as soon as the same vector offset continues twice (ActorLocationTracker.bootstrap)
                 if self.store.get(str(handle)) is None or creature:
                     loc = self.locator.bootstrap(bits, batch, t)
+                    if loc is not None and self.locator.last_rule == "sparse" and self._far_from_own(loc.x, loc.y):
+                        # The "sparse" rule (two batches seconds apart, one or two map positions each) locked onto a constant
+                        # point 5.5 km (ee) and 7.6 km (jj) from the player twice in the recordings, both times a false lock:
+                        # the creature was a few metres from the player when its creation record came. Not a position.
+                        self.locator.reject_bootstrap(handle)
+                        self.rejected_far_locks += 1
+                        loc = None
                     if loc is not None and kind == sp.KIND_UNKNOWN:
                         # It moved like a creature in consecutive batches: it is followed from now on. Without
                         # this an actor of the pawn size band (no creation record seen) was placed once and then ignored for

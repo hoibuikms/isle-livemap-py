@@ -253,3 +253,29 @@ def test_a_rest_is_drawn_solid_and_its_distance_has_no_tilde_while_a_spawn_point
     assert nearby("spawn").stale and not nearby("rest").stale and not nearby("").stale
     assert "~" in entity_label_lines(nearby("spawn"))[0]
     assert "~" not in entity_label_lines(nearby("rest"))[0] and "480 m" in entity_label_lines(nearby("rest"))[0]
+
+
+# ---------------------------------------------------------------- a false "sparse" lock far from the player
+def test_a_sparse_bootstrap_lock_far_from_the_player_is_thrown_away_but_a_near_one_is_kept(source, monkeypatch):
+    """ee / jj: two creatures without an anchor were locked onto a constant point 5.5 km and 7.6 km away by the sparse rule; both were
+    a few metres from the player. Chain locks (three moving samples) are not touched."""
+    g = source
+    g._creatures.add(9300)  # noqa: SLF001
+    g._creatures.add(9301)  # noqa: SLF001
+    rule = {"r": "sparse"}
+
+    def fake(bits, batch, t):
+        g.locator.last_rule = rule["r"]
+        far = batch.net_ref_handle == 9300
+        x, y = (east(7_586.0)[0], east(7_586.0)[1]) if far else (east(40.0)[0], east(40.0)[1])
+        g.locator._last[batch.net_ref_handle] = (t, x, y, 0.0)  # noqa: SLF001
+        return decode.ActorLocation(batch.net_ref_handle, x, y, 20_000.0, 26)
+
+    monkeypatch.setattr(g.locator, "bootstrap", fake)
+    feed_bits(g, monkeypatch, 9300, 220, 10.0)
+    feed_bits(g, monkeypatch, 9301, 220, 10.0)
+    assert g.store.get("9300") is None and g.rejected_far_locks == 1 and 9300 not in g.locator._last  # noqa: SLF001
+    assert g.store.get("9301") is not None  # 40 m from the player: kept
+    rule["r"] = "chain"
+    feed_bits(g, monkeypatch, 9300, 220, 11.0)
+    assert g.store.get("9300") is not None  # the same far position by the chain rule is not judged here

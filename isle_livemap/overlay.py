@@ -570,6 +570,24 @@ class MapView(QWidget):
                 r_ = least_overlap(ordered, hard, bounds, in_circle, cores)
             if r_ is None:
                 r_ = least_overlap(ordered, [], bounds, None)
+            if r_ is not None and len(lines) > 1:
+                # Nothing is free and this spot still covers part of another label: the one-line form (name, species, distance)
+                # may cover less of it. The name matters more than the second line.
+                def covered(r):
+                    return sum(max(0.0, min(r[0] + r[2], o[0] + o[2]) - max(r[0], o[0])) * max(0.0, min(r[1] + r[3], o[1] + o[3]) - max(r[1], o[1]))
+                               for o in placed)
+
+                if covered(r_) > 0.0:
+                    short = lines[:1]
+                    w1, h1 = size(short)
+                    alt = least_overlap([*label_slots(ax, ay, w1, h1, bounds, below), *more(w1, h1)], placed, bounds, in_circle, cores)
+                    clear_of_hard = alt is not None and not any(
+                        alt[0] < h[0] + h[2] and h[0] < alt[0] + alt[2] and alt[1] < h[1] + h[3] and h[1] < alt[1] + alt[3] for h in hard)
+                    if alt is not None and clear_of_hard and covered(alt) < covered(r_):
+                        self._compact_until[eid] = now + COMPACT_HOLD_S
+                        forced_now[eid] = now
+                        slot[0] = 0
+                        return alt, short
             if r_ is not None:
                 slot[0] = order[ordered.index(r_)]
                 forced_now[eid] = now
