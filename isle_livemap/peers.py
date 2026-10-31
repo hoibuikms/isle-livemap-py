@@ -511,6 +511,7 @@ class GamePeerSource:
         self._banner_kind = ""  # what the minimap banner shows: "" | "late" | "unknown" (see _track_banner)
         self._banner_logged: tuple[str, float] = ("", -1e9)  # (kind last written to the session log, datagram time)
         self._headline: tuple[float, str] = (-1e9, "")  # (datagram time it was chosen, text)
+        self._unnamed_since: dict[str, float] = {}  # entity id -> datagram time it was first seen on the map without a name
         self._empty_since: float | None = None  # datagram time from which no player / dinosaur has been on the map
         self._smells: dict[tuple[int, int], list[tuple[float, float]]] = {}  # 1 m grid cell -> TICorpseSmell positions (cm)
         self._corpses: set[int] = set()  # handles recognised as carcasses: never drawn
@@ -595,6 +596,7 @@ class GamePeerSource:
         self._hidden_all = None
         self._headline = (-1e9, "")
         self._empty_since = None
+        self._unnamed_since.clear()
         self._track_banner(force="")  # a new connection: the banner of the old one is gone
 
     def _sync_owned(self) -> None:
@@ -907,6 +909,23 @@ class GamePeerSource:
             return raw
         return shown
 
+    UNNAMED_GRACE_S = 20.0  # a creature has to be on the map this long without a name before it counts (a name can arrive a moment later)
+
+    def unnamed_players(self) -> int:
+        """How many player-controlled creatures on the map have been without a name for ``UNNAMED_GRACE_S`` (datagram time). A name is
+        sent once, with the creature's creation record: a creature that was already in range when the app started has none, and
+        gets one when it leaves the ~150 m range and comes back (or after a rejoin). Server animals ("AI") are not counted."""
+        now, since = self._last_t, self._unnamed_since
+        current = {
+            p.entity.id for p in self.store.entities()
+            if p.entity.kind in ("dino", "player") and is_placeholder_name(p.entity.name) and p.entity.name != self.AI_NAME
+        }
+        for gone in [h for h in since if h not in current]:
+            del since[gone]
+        for h in current:
+            since.setdefault(h, now)
+        return sum(1 for h in current if now - since[h] >= self.UNNAMED_GRACE_S)
+
     def _raw_headline(self) -> str:
         if self.decode_errors and self._last_t - self._error_t < self.HEADLINE_HOLD_S * 5:
             return "Decode errors: see log"
@@ -917,6 +936,9 @@ class GamePeerSource:
         hidden = self.hidden_creatures()
         if hidden or self.identity.tables_missed():
             self._empty_since = None  # creatures are there (or may be): the map is not known to be empty
+        unnamed = self.unnamed_players()
+        if unnamed:
+            return f"{unnamed} unnamed: walk 200 m & back"  # they get their name again when they re-enter the ~150 m range
         if self.identity.tables_missed():
             # One constant message for as long as this lasts. It used to say "Rejoin server: N hidden" / "to identify" /
             # "Started late" depending on a count that flipped between 0 and 1 every few seconds.

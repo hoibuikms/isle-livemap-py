@@ -274,3 +274,34 @@ def test_the_grace_starts_with_the_first_packet_of_a_connection_and_a_reset_rest
     g = source()
     g.on_reset()
     assert g._first_packet_t is None and not g.late_start()  # noqa: SLF001
+
+
+# ---------------------------------------------------------------- creatures without a name: how to get it
+def test_headline_tells_how_to_name_creatures_that_stay_unnamed():
+    g = source(tables_seen=True)
+    g.store.update(Entity("9", "dino", "", "Deinosuchus", 1.0, 2.0))  # a player's creature whose name never came
+    assert g.unnamed_players() == 0  # a name can still arrive: not yet
+    g._last_t += g.UNNAMED_GRACE_S  # noqa: SLF001
+    assert g.unnamed_players() == 1
+    assert g.headline() == "1 unnamed: walk 200 m & back"
+    assert len(g.headline()) <= 32
+    g.store.update(Entity("9", "player", "Rex Fan", "Deinosuchus", 1.0, 2.0))  # the name arrived
+    assert g.unnamed_players() == 0
+
+
+def test_server_animals_and_unknown_actors_do_not_count_as_unnamed():
+    g = source(tables_seen=True)
+    g.store.update(Entity("1", "dino", g.AI_NAME, "Stegosaurus", 1.0, 2.0))  # no player behind it
+    g.store.update(Entity("2", "ai", "", "Longear", 1.0, 2.0))
+    g.store.update(Entity("3", "unknown", "", "", 1.0, 2.0))
+    g._last_t += g.UNNAMED_GRACE_S + 1  # noqa: SLF001
+    assert g.unnamed_players() == 0
+
+
+def test_the_unnamed_hint_replaces_the_rejoin_message_of_a_late_start():
+    g = source()  # tables missed
+    g.store.update(Entity("9", "dino", "", "Deinosuchus", 1.0, 2.0))
+    feed(g, 171102, PAWN)
+    assert g.headline() == "Started late: rejoin to see all"  # the overlay polls the headline all the time: this starts the clock
+    g._last_t += g.UNNAMED_GRACE_S + g.HEADLINE_HOLD_S  # noqa: SLF001
+    assert g.headline() == "1 unnamed: walk 200 m & back"
